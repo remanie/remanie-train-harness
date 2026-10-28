@@ -28,7 +28,7 @@ CATALOG = json.loads((CRATE / "assets/tools.json").read_text())
 
 
 class UnconfirmedShutdownAgent(RemanieAgent):
-    async def _stop_runtime(self, environment, process, execution):
+    async def _stop_runtime(self, environment, identity, execution):
         await super()._stop_runtime(environment, None, execution)
 
 
@@ -139,8 +139,13 @@ def model_server(model):
                 assert self.headers.get("Authorization") == f"Bearer {FAKE_KEY}"
                 size = int(self.headers["Content-Length"])
                 assert 0 < size <= 16 * 1024 * 1024
-                response = model.sample(json.loads(self.rfile.read(size)))
-                status = 200
+                request = json.loads(self.rfile.read(size))
+                if model.mode == "infrastructure":
+                    model.requests.append(request)
+                    response, status = {"error": "scripted credential rejection"}, 401
+                else:
+                    response = model.sample(request)
+                    status = 200
             except Exception as error:
                 model.errors.append(repr(error))
                 response, status = {"error": "scripted fixture assertion failed"}, 500
@@ -161,7 +166,7 @@ def model_server(model):
 
 
 async def check(mode, runtime_dir, output_dir):
-    model = ScriptedModel("completed" if mode == "cleanup_error" else mode)
+    model = ScriptedModel("timeout" if mode == "cleanup_error" else mode)
     server, thread = model_server(model)
     try:
         config = TrialConfig(
@@ -173,7 +178,7 @@ async def check(mode, runtime_dir, output_dir):
                 model_name="openrouter/x-ai/grok-4.7",
                 base_url=f"http://host.docker.internal:{server.server_port}/v1",
                 env={"OPENROUTER_API_KEY": FAKE_KEY},
-                override_timeout_sec=8 if mode == "timeout" else 60,
+                override_timeout_sec=8 if mode in ("timeout", "cleanup_error") else 60,
                 override_setup_timeout_sec=120,
                 kwargs={
                     "runtime_dir": str(runtime_dir), "max_turns": 4,
@@ -194,9 +199,14 @@ async def check(mode, runtime_dir, output_dir):
         thread.join(timeout=2)
         (output_dir / f"{mode}-model-requests.json").write_text(json.dumps(model.requests, indent=2) + "\n")
     assert not model.errors, model.errors
-    if mode in ("cleanup_error", "crash"):
-        assert result.exception_info and result.exception_info.exception_type == "RuntimeError"
+    metadata = result.agent_result.metadata["remanie"]
+    assert len(metadata["bundle_sha256"]) == 64, metadata
+    if mode in ("cleanup_error", "crash", "infrastructure"):
+        expected = "RemanieInfrastructureError" if mode == "infrastructure" else "RuntimeError"
+        assert result.exception_info and result.exception_info.exception_type == expected, result.exception_info
         assert result.verifier_result is None and result.verifier is None
+        if mode == "infrastructure":
+            assert metadata["exit_code"] == 70 and metadata["result"], metadata
         assert not (output_dir / mode / "verifier/reward.txt").exists()
         return {"mode": mode, "reward": None, "verification_skipped": True}
     assert result.verifier_result and result.verifier_result.rewards == {"reward": 1.0}, (
@@ -225,7 +235,7 @@ async def main():
     args = parser.parse_args()
     output = (args.output_dir or Path(tempfile.mkdtemp(prefix="remanie-harbor-check-"))).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    modes = ("completed", "timeout", "cleanup_error", "crash")
+    modes = ("completed", "timeout", "cleanup_error", "crash", "infrastructure")
     assert not any((output / mode).exists() for mode in modes), "Use a fresh output directory"
     os.environ["OPENROUTER_API_KEY"] = FAKE_KEY
     print(f"Harbor integration logs: {output}", flush=True)
