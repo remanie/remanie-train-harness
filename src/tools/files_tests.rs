@@ -174,7 +174,12 @@ async fn reads_bound_the_returned_window_and_reject_non_text() {
         .call("read_file", &json!({"target_file":"many.txt","limit":2000}))
         .await
         .unwrap();
-    assert_eq!(text.lines().count(), MAX_LINES);
+    let (window, marker) = text.rsplit_once('\n').unwrap();
+    assert_eq!(window.lines().count(), MAX_LINES);
+    assert_eq!(
+        marker,
+        "[lines 1-1000 shown; file continues, use offset=1001]"
+    );
     let crlf = format!(
         "{}\r\n{}",
         "x".repeat(108),
@@ -823,4 +828,39 @@ async fn overlapping_matches_are_ambiguous_unless_replace_all() {
         tokio::fs::read_to_string(&path).await.unwrap(),
         "done\nend\n"
     );
+}
+
+#[tokio::test]
+async fn a_full_window_says_where_the_file_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let text = (1..=1500)
+        .map(|n| format!("line {n}\n"))
+        .collect::<String>();
+    tokio::fs::write(dir.path().join("long.txt"), text)
+        .await
+        .unwrap();
+    let first = tools
+        .call("read_file", &json!({"target_file":"long.txt"}))
+        .await
+        .unwrap();
+    assert!(
+        first.contains("1000→line 1000\n[lines 1-1000 shown; file continues, use offset=1001]")
+    );
+    let rest = tools
+        .call(
+            "read_file",
+            &json!({"target_file":"long.txt","offset":1001}),
+        )
+        .await
+        .unwrap();
+    assert!(rest.starts_with("1001→line 1001") && rest.ends_with("1500→line 1500\n"));
+    let chosen = tools
+        .call(
+            "read_file",
+            &json!({"target_file":"long.txt","offset":10,"limit":2}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chosen, "10→line 10\nline 11");
 }

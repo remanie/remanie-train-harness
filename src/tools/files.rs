@@ -113,6 +113,7 @@ impl FileTools {
         let mut saw_bytes = false;
         let mut last_newline = false;
         let mut trailing_empty = false;
+        let mut more = false;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let chunk = reader.fill_buf().await?;
@@ -138,6 +139,7 @@ impl FileTools {
                 }
                 reader.consume(consumed);
                 if line_number >= end {
+                    more = !reader.fill_buf().await?.is_empty();
                     break;
                 }
             }
@@ -170,6 +172,13 @@ impl FileTools {
             output.len() <= READ_MAX_BYTES,
             "file content exceeds 25000 tokens; use offset and limit to read a shorter range"
         );
+        if more && input.limit.is_none_or(|limit| limit >= MAX_LINES) {
+            write!(
+                output,
+                "\n[lines {start}-{} shown; file continues, use offset={end}]",
+                end - 1
+            )?;
+        }
         Ok(output)
     }
 
