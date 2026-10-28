@@ -895,6 +895,7 @@ async fn a_connection_lost_after_send_is_not_retried() {
     f.config["base_url"] = json!(format!("http://{address}/v1"));
     let result = f.run().await;
     assert_eq!(result["cause"]["kind"], "connection_lost");
+    assert_eq!(f.events("endpoint_error")[0]["failure"], "lost");
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
 

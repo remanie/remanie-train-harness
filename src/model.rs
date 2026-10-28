@@ -73,12 +73,10 @@ struct Body<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "failure", rename_all = "snake_case")]
 pub enum Failure {
-    Connect {
-        detail: String,
-    },
-    Lost {
-        detail: String,
-    },
+    #[serde(rename = "connect")]
+    NotSent { detail: String },
+    #[serde(rename = "lost")]
+    LostAfterSend { detail: String },
     Status {
         status: u16,
         body_excerpt: String,
@@ -93,7 +91,7 @@ pub enum Failure {
 impl Failure {
     fn retry_in(&self, attempt: u32, remaining: Duration) -> Option<Duration> {
         let at_least = match self {
-            Failure::Connect { .. } => Duration::ZERO,
+            Failure::NotSent { .. } => Duration::ZERO,
             Failure::Status {
                 status: 429 | 503,
                 retry_after_ms,
@@ -106,7 +104,7 @@ impl Failure {
 
     fn into_outcome(self, attempts: u32) -> Outcome {
         Outcome::Infrastructure(match self {
-            Failure::Connect { detail } => Cause::EndpointUnavailable {
+            Failure::NotSent { detail } => Cause::EndpointUnavailable {
                 attempts,
                 status: None,
                 detail,
@@ -138,7 +136,7 @@ impl Failure {
                 status,
                 body_excerpt,
             },
-            Failure::Lost { detail } => Cause::ConnectionLost { detail },
+            Failure::LostAfterSend { detail } => Cause::LostAfterSend { detail },
             Failure::Response { detail, .. } => Cause::EndpointResponse { detail },
         })
     }
@@ -333,9 +331,9 @@ async fn exchange(request: reqwest::RequestBuilder) -> Result<Vec<u8>, Failure> 
     let mut response = request.send().await.map_err(|error| {
         let detail = error_chain(&error);
         if error.is_connect() {
-            Failure::Connect { detail }
+            Failure::NotSent { detail }
         } else {
-            Failure::Lost { detail }
+            Failure::LostAfterSend { detail }
         }
     })?;
     let status = response.status();
@@ -359,9 +357,13 @@ async fn exchange(request: reqwest::RequestBuilder) -> Result<Vec<u8>, Failure> 
         });
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| Failure::Lost {
-        detail: error_chain(&error),
-    })? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| Failure::LostAfterSend {
+            detail: error_chain(&error),
+        })?
+    {
         if body.len() + chunk.len() > MAX_BODY_BYTES {
             return Err(Failure::Response {
                 detail: "response exceeds 16 MiB".into(),
@@ -439,14 +441,14 @@ mod tests {
     #[test]
     fn only_requests_the_endpoint_did_not_process_are_retried() {
         let hour = Duration::from_secs(3600);
-        let lost = Failure::Lost {
+        let lost = Failure::LostAfterSend {
             detail: "reset".into(),
         };
         let response = Failure::Response {
             detail: "not JSON".into(),
             body_excerpt: String::new(),
         };
-        let refused = Failure::Connect {
+        let refused = Failure::NotSent {
             detail: "refused".into(),
         };
         for retried in [&refused, &status(429, ""), &status(503, "")] {
@@ -503,13 +505,13 @@ mod tests {
             json!({"outcome": "infrastructure", "cause": {"kind": "endpoint_unavailable", "attempts": 3, "status": 503, "detail": "UpstreamGenerationAbortedError"}})
         );
         assert_eq!(
-            as_json(Failure::Lost {
+            as_json(Failure::LostAfterSend {
                 detail: "reset".into()
             })["cause"]["kind"],
             "connection_lost"
         );
         assert_eq!(
-            as_json(Failure::Connect {
+            as_json(Failure::NotSent {
                 detail: "refused".into()
             })["cause"],
             json!({"kind": "endpoint_unavailable", "attempts": 3, "status": null, "detail": "refused"})

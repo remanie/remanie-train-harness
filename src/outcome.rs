@@ -67,7 +67,8 @@ pub enum Cause {
         status: u16,
         body_excerpt: String,
     },
-    ConnectionLost {
+    #[serde(rename = "connection_lost")]
+    LostAfterSend {
         detail: String,
     },
     EndpointResponse {
@@ -242,7 +243,7 @@ mod tests {
                 status: 500,
                 body_excerpt: text(),
             }),
-            Outcome::Infrastructure(Cause::ConnectionLost { detail: text() }),
+            Outcome::Infrastructure(Cause::LostAfterSend { detail: text() }),
             Outcome::Infrastructure(Cause::EndpointResponse { detail: text() }),
             Outcome::Infrastructure(Cause::ToolRuntime {
                 tool: text(),
@@ -274,7 +275,7 @@ mod tests {
                     Cause::Config { .. }
                     | Cause::EndpointUnavailable { .. }
                     | Cause::EndpointStatus { .. }
-                    | Cause::ConnectionLost { .. }
+                    | Cause::LostAfterSend { .. }
                     | Cause::EndpointResponse { .. }
                     | Cause::ToolRuntime { .. }
                     | Cause::Internal { .. },
