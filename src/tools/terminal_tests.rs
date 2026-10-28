@@ -208,7 +208,7 @@ async fn previews_and_polls_mark_where_they_cut_the_log() {
 }
 
 #[tokio::test]
-async fn output_past_the_log_cap_runs_to_completion() {
+async fn the_log_keeps_every_byte_and_the_reply_shows_its_ends() {
     let (_dir, terminal) = fixture().await;
     let (output, id) = run(
         &terminal,
@@ -217,18 +217,11 @@ async fn output_past_the_log_cap_runs_to_completion() {
     )
     .await;
     assert!(output.starts_with("Exit code: 0"), "{}", &output[..100]);
-    assert!(
-        output.contains("finished\n```"),
-        "{}",
-        &output[output.len() - 400..]
-    );
+    assert!(output.len() < PREVIEW_BYTES + 1500);
+    assert!(output.contains(TRUNCATED) && output.contains("finished\n```"));
     let log = std::fs::read(terminal.log_dir.join(format!("{id}.log"))).unwrap();
-    assert!(log.len() as u64 <= MAX_LOG_BYTES, "{}", log.len());
-    assert!(
-        log.windows(TRUNCATED.len())
-            .any(|window| window == TRUNCATED.as_bytes())
-    );
-    assert!(log.ends_with(b"finished"));
+    assert_eq!(log.len(), 17_000_008);
+    assert!(log.ends_with(b"xfinished"));
     terminal.kill_all().await;
 }
 

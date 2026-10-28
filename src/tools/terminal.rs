@@ -19,7 +19,6 @@ use super::internal;
 
 const PREVIEW_BYTES: usize = 20_000;
 const POLL_BYTES: usize = 40_000;
-const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const TRUNCATED: &str = "\n[... output truncated ...]\n";
@@ -176,7 +175,7 @@ impl TerminalSession {
             finished: watch::channel(false).0,
         });
         lock(&self.state).tasks.insert(id, task.clone());
-        tokio::spawn(drive(child, task.clone(), log));
+        tokio::spawn(drive(child, task.clone()));
         let mut abort = AbortOnDrop(Some(task.clone()));
         let finished = block > 0
             && tokio::time::timeout_at(started + Duration::from_millis(block), task.wait())
@@ -259,7 +258,7 @@ impl TerminalSession {
                 "description": task.description, "start_time": task.started,
                 "end_time": state.ended, "output_file": task.log,
                 "output_total_bytes": std::fs::metadata(&task.log).map_or(0, |metadata| metadata.len()),
-                "truncated": state.truncated, "exit_code": state.exit_code, "signal": state.signal,
+                "exit_code": state.exit_code, "signal": state.signal,
                 "completed": state.completed, "kind": "bash", "is_backgrounded": true,
                 "explicitly_killed": state.explicitly_killed,
             }))
@@ -320,7 +319,6 @@ struct TaskState {
     background: bool,
     completed: bool,
     explicitly_killed: bool,
-    truncated: bool,
     ended: Option<SystemTime>,
     stop_deadline: Option<Instant>,
     exit_code: Option<i32>,
@@ -412,7 +410,7 @@ impl Task {
             });
         }
         text.push_str(&output);
-        if total > POLL_BYTES as u64 || state.truncated {
+        if total > POLL_BYTES as u64 {
             text.push_str("\n[truncated - use read_file on output_file for full content]");
         }
         Ok(text)
@@ -479,11 +477,7 @@ fn fresh_dir(root: &Path) -> io::Result<PathBuf> {
 
 fn create_log(dir: &Path, path: &Path) -> io::Result<File> {
     std::fs::create_dir_all(dir)?;
-    File::options()
-        .read(true)
-        .append(true)
-        .create_new(true)
-        .open(path)
+    File::options().append(true).create_new(true).open(path)
 }
 
 fn read_log(path: &Path, limit: usize) -> io::Result<(String, u64)> {
@@ -500,38 +494,6 @@ fn read_log(path: &Path, limit: usize) -> io::Result<(String, u64)> {
         file.take(half as u64).read_to_end(&mut bytes)?;
     }
     Ok((strip_ansi(&String::from_utf8_lossy(&bytes)), total))
-}
-
-fn cap_log(log: &File, path: &Path, kept: &mut Option<u64>) -> io::Result<bool> {
-    use std::os::unix::fs::FileExt;
-    let mut end = log.metadata()?.len();
-    if end <= MAX_LOG_BYTES {
-        return Ok(false);
-    }
-    // Positional writes need a descriptor without O_APPEND, which Linux applies to pwrite too.
-    let writer = File::options().write(true).open(path)?;
-    let mut to = match *kept {
-        Some(head) => head,
-        None => {
-            writer.write_all_at(TRUNCATED.as_bytes(), MAX_LOG_BYTES / 2)?;
-            MAX_LOG_BYTES / 2 + TRUNCATED.len() as u64
-        }
-    };
-    *kept = Some(to);
-    let mut from = end - MAX_LOG_BYTES / 4;
-    for _ in 0..100 {
-        let mut chunk = vec![0; (end - from) as usize];
-        log.read_exact_at(&mut chunk, from)?;
-        writer.write_all_at(&chunk, to)?;
-        to += chunk.len() as u64;
-        from = end;
-        end = log.metadata()?.len();
-        if end == from {
-            break;
-        }
-    }
-    writer.set_len(to)?;
-    Ok(true)
 }
 
 fn spawn_tracked(command: &mut Command) -> io::Result<(Child, libc::pid_t)> {
@@ -667,10 +629,9 @@ async fn sweep_orphans() {
     reap_orphans();
 }
 
-async fn drive(mut child: Child, task: Arc<Task>, log: File) {
+async fn drive(mut child: Child, task: Arc<Task>) {
     let deadline = Instant::now() + MAX_RUNTIME;
     let mut tick = tokio::time::interval(Duration::from_millis(10));
-    let mut kept = None;
     loop {
         tick.tick().await;
         if Instant::now() >= deadline {
@@ -694,10 +655,6 @@ async fn drive(mut child: Child, task: Arc<Task>, log: File) {
                 Some(Err(format!("observe command exit: {error}")))
             }
         };
-        match cap_log(&log, &task.log, &mut kept) {
-            Ok(cut) => state.truncated |= cut,
-            Err(error) => state.error = Some(format!("truncate command output log: {error}")),
-        }
         let Some(exit) = exit else {
             continue;
         };
