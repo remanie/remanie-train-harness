@@ -39,8 +39,8 @@ SCRIPT = [
             tool_call("call-write", "search_replace", {"file_path": "hello.txt", "old_string": "", "new_string": "hello\n"}),
             tool_call("call-read", "read_file", {"target_file": "hello.txt"}),
         ],
-    }, "tool_calls", 9000, 40, 0)),
-    (200, reply({"content": "<summary>Wrote hello.txt and read it back.</summary>"}, "stop", 9200, 20, 8000)),
+    }, "tool_calls", 17000, 40, 0)),
+    (200, reply({"content": "<summary>Wrote hello.txt and read it back.</summary>"}, "stop", 17200, 20, 8000)),
     (200, reply({"content": "hello.txt contains hello."}, "stop", 600, 10, 0)),
 ]
 
@@ -87,7 +87,7 @@ def main():
             "sampling_params": {"max_tokens": 512, "temperature": 1.0},
             "max_turns": 4,
             "deadline_secs": 60,
-            "context_window_tokens": 10000,
+            "context_window_tokens": 20000,
             "compaction": {"max_tokens": 256},
         }
         run = subprocess.run([str(args.runner.resolve())], input=json.dumps(job).encode(), capture_output=True, timeout=120)

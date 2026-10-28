@@ -636,8 +636,8 @@ async fn compaction_at_85_percent_replaces_the_history_with_the_summary_and_remi
     );
     let summary = "<summary>\n1. Primary Request and Intent: create result.txt\n9. Optional Next Step: verify it\n</summary>";
     let mut f = fixture(vec![
-        tool_reply(vec![todos, server], 8_000),
-        tool_reply(vec![list_dir("second")], 8_490),
+        tool_reply(vec![todos, server], 32_000),
+        tool_reply(vec![list_dir("second")], 33_990),
         reply(
             json!({"role": "assistant", "content": summary}),
             "stop",
@@ -646,7 +646,7 @@ async fn compaction_at_85_percent_replaces_the_history_with_the_summary_and_remi
         final_reply(),
     ])
     .await;
-    f.config["context_window_tokens"] = json!(10_000);
+    f.config["context_window_tokens"] = json!(40_000);
     f.config["sampling_params"]["max_tokens"] = json!(1000);
     f.config["compaction"] = json!({"max_tokens": 1024});
     let result = f.run().await;
@@ -737,7 +737,7 @@ async fn compaction_runs_before_a_turn_that_would_not_fit() {
 async fn after_compaction_the_budget_never_exceeds_the_new_segment_bytes() {
     let mut f = fixture(vec![
         tool_reply(vec![list_dir("first")], 100),
-        tool_reply(vec![list_dir("second")], 57_000),
+        tool_reply(vec![list_dir("second")], 50_000),
         reply(
             json!({"role": "assistant", "content": "<summary>Listed the workspace twice.</summary>"}),
             "stop",
@@ -819,6 +819,57 @@ async fn a_summary_cut_off_at_max_tokens_is_kept() {
             .ends_with("\n1. Primary Request and Intent: create result.txt\n8. Current Work: wri"),
         "{continuation}"
     );
+}
+
+async fn compaction_at_32k(tokens: u64, compaction_max_tokens: u64) -> Fixture {
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("first")], tokens),
+        reply(
+            json!({"role": "assistant", "content": "<summary>Listed the workspace.</summary>"}),
+            "stop",
+            100,
+        ),
+        final_reply(),
+    ])
+    .await;
+    f.config["context_window_tokens"] = json!(32_768);
+    f.config["compaction"] = json!({"max_tokens": compaction_max_tokens});
+    f
+}
+
+#[tokio::test]
+async fn the_summary_request_is_sized_to_fit_the_window() {
+    let f = compaction_at_32k(28_000, 4096).await;
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    let summary_request = &f.requests().await[1];
+    let appended: usize = summary_request["messages"].as_array().unwrap()[3..]
+        .iter()
+        .map(|message| serde_json::to_vec(message).unwrap().len())
+        .sum();
+    let estimate = 28_010 + appended as u64 / 4;
+    assert_eq!(
+        summary_request["max_tokens"],
+        32_768 - 32_768 / 20 - estimate
+    );
+}
+
+#[tokio::test]
+async fn compaction_leaves_room_for_the_summary_request() {
+    let f = compaction_at_32k(24_000, 8192).await;
+    let result = f.run().await;
+    assert_eq!(result["compactions"], 1, "{result}");
+    assert_eq!(f.requests().await[1]["tool_choice"], "none");
+}
+
+#[tokio::test]
+async fn a_summary_request_that_cannot_fit_is_never_sent() {
+    let f = compaction_at_32k(31_000, 4096).await;
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "context_overflow", "{result}");
+    assert_eq!(result["cause"]["kind"], "context_window");
+    assert_eq!(result["cause"]["max_tokens"], 4096);
+    assert_eq!(f.requests().await.len(), 1);
 }
 
 #[tokio::test]

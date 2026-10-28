@@ -98,6 +98,7 @@ async fn attempt(
     .map_err(|error| config(format!("invalid base_url: {error}")))?;
     let http = crate::model::http_client()?;
     let initial = initial_messages(&input.user_query)?;
+    let summary_prompt = json!({"role": "user", "content": render("compaction", include_str!("../assets/compaction.jinja2"), json!({}))?});
     let trace = trace.insert(
         Trace::create(&input.session_dir, MAX_TRACE_BYTES)
             .map_err(|error| internal(format!("create trace.jsonl: {error}")))?,
@@ -127,6 +128,7 @@ async fn attempt(
         trace,
         budget: ContextBudget::default(),
         initial,
+        summary_prompt,
         tally,
         compact_next: false,
     };
@@ -243,7 +245,7 @@ async fn interrupted() {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct ContextBudget {
     counted: u64,
     appended_bytes: u64,
@@ -267,6 +269,11 @@ impl ContextBudget {
     fn estimate(&self) -> u64 {
         self.counted + self.appended_bytes / BYTES_PER_TOKEN
     }
+
+    fn estimate_with(mut self, message: &Value) -> u64 {
+        self.append(message);
+        self.estimate()
+    }
 }
 
 struct Attempt<'a> {
@@ -276,6 +283,7 @@ struct Attempt<'a> {
     trace: &'a mut Trace,
     segment: Segment,
     initial: Vec<Value>,
+    summary_prompt: Value,
     budget: ContextBudget,
     tally: &'a mut Tally,
     compact_next: bool,
@@ -439,7 +447,8 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
             (None, Some(window)) => estimate * 100 >= window * COMPACT_AT_PERCENT,
             (None, None) => false,
         };
-        reached || window.is_some_and(|window| estimate + max_tokens > window)
+        let summary = cx.budget.estimate_with(&cx.summary_prompt) + compaction.max_tokens;
+        reached || window.is_some_and(|window| (estimate + max_tokens).max(summary) > window)
     });
     ControlFlow::Continue(())
 }
@@ -448,14 +457,20 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let Some(compaction) = &cx.input.compaction else {
         return Ok(());
     };
-    let prompt = render(
-        "compaction",
-        include_str!("../assets/compaction.jinja2"),
-        json!({}),
-    )
-    .map_err(Outcome::Infrastructure)?;
-    cx.segment
-        .push(json!({"role": "user", "content": prompt}), cx.trace);
+    let mut max_tokens = compaction.max_tokens;
+    if let Some(window) = cx.input.context_window_tokens {
+        let estimated = cx.budget.estimate_with(&cx.summary_prompt);
+        let room = window.saturating_sub(estimated + window / 20);
+        if room == 0 {
+            return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
+                estimated_prompt_tokens: estimated,
+                max_tokens,
+                context_window_tokens: window,
+            }));
+        }
+        max_tokens = max_tokens.min(room);
+    }
+    cx.segment.push(cx.summary_prompt.clone(), cx.trace);
     let sampled = cx
         .model
         .sample(
@@ -464,7 +479,7 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
                 turn: cx.tally.turns,
                 prompt: cx.segment.range(),
                 messages: cx.segment.messages(),
-                max_tokens_override: Some(compaction.max_tokens),
+                max_tokens_override: Some(max_tokens),
             },
             cx.trace,
         )
