@@ -233,12 +233,22 @@ impl ContextBudget {
     }
 
     fn append(&mut self, message: &Value) {
-        self.appended_bytes += serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64);
+        self.appended_bytes += bytes(message);
+    }
+
+    fn at_most(&mut self, tokens: u64) {
+        if tokens < self.estimate() {
+            self.counted(tokens);
+        }
     }
 
     fn estimate(&self) -> u64 {
         self.counted + self.appended_bytes
     }
+}
+
+fn bytes(message: &Value) -> u64 {
+    serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64)
 }
 
 struct Attempt<'a> {
@@ -416,13 +426,20 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         summary_call: cx.model.calls(),
         kept_messages: kept.len(),
     });
+    let continuation = json!({"role": "user", "content": continuation});
+    let counted = sampled
+        .context_tokens
+        .map(|tokens| tokens + bytes(&continuation));
     let mut messages = cx.initial.clone();
-    messages.push(json!({"role": "user", "content": continuation}));
+    messages.push(continuation);
     messages.extend(kept);
     cx.segment = Segment::new(from + 1, messages, cx.trace);
     cx.budget = ContextBudget::default();
     for message in cx.segment.messages() {
         cx.budget.append(message);
+    }
+    if let Some(tokens) = counted {
+        cx.budget.at_most(tokens);
     }
     cx.tally.compactions += 1;
     Ok(())

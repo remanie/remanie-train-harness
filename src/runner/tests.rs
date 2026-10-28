@@ -638,6 +638,64 @@ async fn compaction_keeps_the_last_two_turns_and_the_todo_list_after_the_summary
 }
 
 #[tokio::test]
+async fn after_compaction_the_budget_starts_from_the_endpoint_count_not_bytes() {
+    let read = |id| call(id, "read_file", json!({"target_file": "big.txt"}));
+    let mut f = fixture(vec![
+        tool_reply(vec![read("r1")], 4_900),
+        tool_reply(vec![read("r2")], 12_900),
+        tool_reply(vec![read("r3")], 20_900),
+        reply(
+            json!({"role": "assistant", "content": "<summary>Read big.txt three times.</summary>"}),
+            "stop",
+            21_500,
+        ),
+        final_reply(),
+    ])
+    .await;
+    let lines: String = (0..600)
+        .map(|i| format!("line {i:04} {}\n", "x".repeat(39)))
+        .collect();
+    std::fs::write(f.workspace().join("big.txt"), lines).unwrap();
+    f.config["context_window_tokens"] = json!(60_000);
+    f.config["sampling_params"]["max_tokens"] = json!(1000);
+    f.config["compaction"] = json!({"threshold_tokens": 50_000, "max_tokens": 2048});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+    let requests = f.requests().await;
+    let after = requests.last().unwrap()["messages"].as_array().unwrap();
+    let kept_bytes: usize = after
+        .iter()
+        .map(|message| serde_json::to_vec(message).unwrap().len())
+        .sum();
+    assert!(
+        kept_bytes as u64 + 1000 > 60_000,
+        "the kept turns alone must exceed the window in bytes"
+    );
+}
+
+#[tokio::test]
+async fn after_compaction_the_budget_never_exceeds_the_new_segment_bytes() {
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("first")], 100),
+        tool_reply(vec![list_dir("second")], 57_000),
+        reply(
+            json!({"role": "assistant", "content": "<summary>Listed the workspace twice.</summary>"}),
+            "stop",
+            59_000,
+        ),
+        final_reply(),
+    ])
+    .await;
+    f.config["context_window_tokens"] = json!(60_000);
+    f.config["sampling_params"]["max_tokens"] = json!(1000);
+    f.config["compaction"] = json!({"threshold_tokens": 50_000, "max_tokens": 2048});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+}
+
+#[tokio::test]
 async fn an_unusable_summary_ends_the_attempt_and_keeps_the_transcript() {
     for (summary, finish) in [
         (
