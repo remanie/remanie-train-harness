@@ -838,6 +838,31 @@ async fn a_full_context_window_ends_the_attempt_before_sending() {
 }
 
 #[tokio::test]
+async fn an_overflow_before_the_first_reply_is_a_config_error() {
+    let mut f = fixture(vec![final_reply()]).await;
+    f.config["context_window_tokens"] = json!(8192);
+    f.config["sampling_params"]["max_tokens"] = json!(16_384);
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "infrastructure", "{result}");
+    assert_eq!(result["cause"]["kind"], "config");
+    assert!(
+        result["cause"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("context_window")
+    );
+    assert!(f.requests().await.is_empty());
+
+    let body =
+        "This model's maximum context length is 8192 tokens. However, you requested 16384 tokens.";
+    let f = fixture(vec![ResponseTemplate::new(400).set_body_string(body)]).await;
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "infrastructure", "{result}");
+    assert_eq!(result["cause"]["kind"], "config");
+    assert!(result["cause"]["detail"].as_str().unwrap().contains(body));
+}
+
+#[tokio::test]
 async fn budgeting_without_usage_is_an_endpoint_fault() {
     let mut f = fixture(vec![
         ResponseTemplate::new(200).set_body_json(json!({

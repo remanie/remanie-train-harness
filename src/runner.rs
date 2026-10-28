@@ -267,10 +267,19 @@ struct Attempt<'a> {
 }
 
 async fn execute(cx: &mut Attempt<'_>) -> Outcome {
-    loop {
+    let outcome = loop {
         if let Err(outcome) = turn(cx).await {
-            return outcome;
+            break outcome;
         }
+    };
+    match outcome {
+        Outcome::ContextOverflow(overflow) if cx.tally.turns == 0 => {
+            Outcome::Infrastructure(config(format!(
+                "the first request does not fit: {}",
+                serde_json::to_value(&overflow).unwrap_or_default()
+            )))
+        }
+        outcome => outcome,
     }
 }
 
