@@ -172,7 +172,7 @@ def model_server(model):
     return server, thread
 
 
-async def check(mode, runtime_dir, output_dir):
+async def check(mode, runtime_dir, output_dir, model_host):
     model = ScriptedModel("timeout" if mode == "cleanup_error" else mode)
     server, thread = model_server(model)
     try:
@@ -184,7 +184,7 @@ async def check(mode, runtime_dir, output_dir):
                 import_path="check_harbor:UnconfirmedShutdownAgent" if mode == "cleanup_error" else "remanie_agent:RemanieAgent",
                 model_name="openrouter/x-ai/grok-4.7",
                 model_api_key_name="OPENROUTER_API_KEY",
-                base_url=f"http://host.docker.internal:{server.server_port}/v1",
+                base_url=f"http://{model_host}:{server.server_port}/v1",
                 env={"OPENROUTER_API_KEY": FAKE_KEY},
                 override_timeout_sec=8 if mode in ("timeout", "cleanup_error") else 60,
                 override_setup_timeout_sec=120,
@@ -235,6 +235,7 @@ async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-dir", type=Path, default=CRATE / "runtime")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--model-host", default="host.docker.internal", help="the host's address as the container sees it")
     args = parser.parse_args()
     output = (args.output_dir or Path(tempfile.mkdtemp(prefix="remanie-harbor-check-"))).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -242,7 +243,7 @@ async def main():
     assert not any((output / mode).exists() for mode in modes), "Use a fresh output directory"
     os.environ["OPENROUTER_API_KEY"] = FAKE_KEY
     print(f"Harbor integration logs: {output}", flush=True)
-    checks = [await check(mode, args.runtime_dir.resolve(), output) for mode in modes]
+    checks = [await check(mode, args.runtime_dir.resolve(), output, args.model_host) for mode in modes]
     summary = {"fixture_only": True, "paid_api_calls": 0, "checks": checks}
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
