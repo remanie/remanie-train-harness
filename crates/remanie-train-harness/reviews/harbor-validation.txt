@@ -59,9 +59,10 @@ crates/remanie-train-harness/eval-results/remanie-tb21-install-check/.
 Runtime bundles and evaluation results are gitignored. No test containers
 remain running after these checks.
 
-Not run: live OpenRouter inference, a scored Terminal-Bench attempt, the full
-89-task suite, native AMD64 timing or performance comparisons. No provider
-credential was available. No paid API calls were made.
+At preparation time, no live inference or scored task had run and no paid API
+calls had been made. The subsequent live evaluation is recorded separately
+in terminal-bench-2.1-smoke-2026-10-27.txt. The full 89-task suite and native
+AMD64 timing or performance comparisons remain unchecked.
 
 Limits: this adapter targets local Docker with host.docker.internal routing.
 The host retains the provider key; a scoped per-attempt proxy token is visible

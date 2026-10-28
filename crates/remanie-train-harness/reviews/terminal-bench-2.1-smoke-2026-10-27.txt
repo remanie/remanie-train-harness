@@ -1,0 +1,90 @@
+Terminal-Bench 2.1 smoke evaluation, 2026-10-27 America/Los_Angeles
+
+All three selected tasks have a passing verifier result across four attempts.
+The original run passed two tasks. An HTTP 502 interrupted the third task;
+one fresh attempt at that task passed. This is not a full benchmark score.
+
+Configuration
+
+Harness: remanie-train-harness, revision 30964012
+Model: x-ai/grok-4.7 through OpenRouter; responses reported provider xAI
+Reasoning effort: high
+Harbor: 0.25.0
+Dataset: terminal-bench/terminal-bench-2-1, revision 6, 89 tasks
+Dataset digest: sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a
+Limits: 100 turns, 32768 response tokens, 400000-token compaction threshold,
+4096 compaction output tokens, original 900-second task deadlines.
+Trials ran sequentially. Automatic retries were disabled.
+
+Results
+
+Task                         Attempt       Reward   Turns   Agent time   USD
+openssl-selfsigned-cert       Initial       1.0      6       47.77 s      0.067860
+log-summary-date-ranges       Initial       1.0      6       25.92 s      0.056998
+cancel-async-tasks            Initial       0.0      22      266.42 s     0.495504
+cancel-async-tasks            Fresh retry   1.0      34      636.21 s     1.250906
+
+Total API-reported cost: USD 1.871268. Failed HTTP requests may not report
+usage or cost. This total has not been reconciled against account billing.
+Agent time excludes environment setup and verification.
+
+The interrupted attempt recorded NonZeroAgentExitCodeError and
+"model endpoint returned HTTP 502 Bad Gateway". Its unfinished submission
+received reward 0. The available error does not distinguish an upstream 502
+from a host relay failure, so the underlying cause remains unconfirmed.
+
+The retry used a fresh sandbox and conversation with identical prompt, tools,
+model settings and harness revision. No verifier feedback was supplied to it.
+Keep both cancellation attempts when analyzing reliability and cost.
+
+Observed behavior
+
+The live attempts used run_terminal_cmd, read_file, list_dir, grep and
+search_replace. They did not call todo_write, get_terminal_command_output or
+kill_terminal_command. Earlier scripted integration fixtures exercised all
+eight tools. No live attempt triggered compaction; a scripted fixture tested
+compaction and retention of todo state and a background command.
+
+During the cancellation retry, the model searched for grader/test filenames
+and inspected /opt/remanie-train-harness before completing the task. The run
+continued without human coaching or changes to the task environment. This
+behavior should be reviewed before treating the traces as training examples.
+
+Credential handling and cleanup
+
+The temporary provider key stayed on the host. The task received a scoped
+per-attempt proxy token. The launcher scanned both job directories and host
+logs for the exact provider key and found no matches. No credential file was
+created. Both launchers exited, and docker ps showed no running containers
+after completion. The temporary key can be revoked; it has not been revoked
+by this evaluation.
+
+Evidence
+
+All paths below are relative to this crate unless otherwise stated.
+
+Initial job:
+eval-results/remanie-grok47-tb21-smoke-20261027-175004/
+  openssl-selfsigned-cert__xQMrgDm/result.json
+  log-summary-date-ranges__xU7NYpj/result.json
+  cancel-async-tasks__yef8Z5V/result.json
+
+Fresh retry:
+eval-results/remanie-grok47-tb21-cancel-retry-20261027-175848/
+  cancel-async-tasks__mXCq6ug/result.json
+
+Each trial directory contains its agent output and recorded model/tool trace.
+Raw results are gitignored and remain in this local checkout.
+
+Host summary and logs:
+/Users/p/.codex/artifacts/grok-rl-build-tools/remanie-live-summary.json
+/Users/p/.codex/artifacts/grok-rl-build-tools/remanie-grok47-tb21-smoke-20261027-175004.log
+/Users/p/.codex/artifacts/grok-rl-build-tools/remanie-grok47-tb21-cancel-retry-20261027-175848.log
+
+Limits
+
+Only three of 89 tasks were selected. These results establish that the runner
+can complete and grade these tasks through OpenRouter. They do not establish
+full-suite accuracy, production reliability or a working RL model update.
+The Rust runtime ran natively on ARM64; AMD64 task programs ran under QEMU.
+Do not compare these timings to native AMD64 benchmark runs.
