@@ -1041,11 +1041,36 @@ async fn command_logs_stay_in_the_sandbox_temp_dir_outside_the_session_dir() {
     unsafe { libc::kill(left["pid"].as_i64().unwrap() as i32, libc::SIGKILL) };
     let log = PathBuf::from(left["output_file"].as_str().unwrap());
     assert!(
-        log.starts_with(std::env::temp_dir().join("remanie-terminal")),
+        log.starts_with(std::env::temp_dir().join(".remanie-terminal")),
         "{log:?}"
     );
     assert!(log.exists());
     assert!(!f.session().join("terminal").exists());
+}
+
+#[tokio::test]
+async fn command_logs_leave_a_workspace_that_is_the_temp_dir() {
+    let mut f = fixture(vec![
+        tool_reply(
+            vec![call(
+                "server",
+                "run_terminal_cmd",
+                json!({
+                    "command": "exec sleep 60", "description": "start a server", "block_until_ms": 0
+                }),
+            )],
+            10,
+        ),
+        final_reply(),
+    ])
+    .await;
+    f.config["workspace"] = json!(std::env::temp_dir());
+    let result = f.run().await;
+    let left = &result["background_tasks_left_running"][0];
+    unsafe { libc::kill(left["pid"].as_i64().unwrap() as i32, libc::SIGKILL) };
+    let log = PathBuf::from(left["output_file"].as_str().unwrap());
+    assert!(log.starts_with("/var/tmp/.remanie-terminal"), "{log:?}");
+    assert!(log.exists());
 }
 
 #[tokio::test]

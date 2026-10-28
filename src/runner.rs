@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::header::HeaderValue;
@@ -99,15 +99,12 @@ async fn attempt(
         Trace::create(&input.session_dir, MAX_TRACE_BYTES)
             .map_err(|error| internal(format!("create trace.jsonl: {error}")))?,
     );
-    let tools = ToolSession::new(
-        input.workspace.clone(),
-        std::env::temp_dir().join("remanie-terminal"),
-    )
-    .await
-    .map_err(|error| Cause::ToolRuntime {
-        tool: "session".into(),
-        detail: format!("{error:#}"),
-    })?;
+    let tools = ToolSession::new(input.workspace.clone(), log_root(&input.workspace))
+        .await
+        .map_err(|error| Cause::ToolRuntime {
+            tool: "session".into(),
+            detail: format!("{error:#}"),
+        })?;
     let definitions = tools.definitions();
     trace.header(raw, &definitions);
     let deadline = Instant::now() + Duration::from_secs(input.deadline_secs);
@@ -148,6 +145,17 @@ async fn attempt(
         tools.kill_all().await;
     }
     Ok(outcome)
+}
+
+fn log_root(workspace: &Path) -> PathBuf {
+    let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let temp = std::env::temp_dir();
+    let root = if real(&temp).starts_with(real(workspace)) {
+        Path::new("/var/tmp")
+    } else {
+        &temp
+    };
+    root.join(".remanie-terminal")
 }
 
 fn config(detail: impl Into<String>) -> Cause {
