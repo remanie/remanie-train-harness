@@ -437,6 +437,27 @@ async fn malformed_replies_end_the_attempt_without_dispatch() {
 }
 
 #[tokio::test]
+async fn an_aborted_generation_is_infrastructure_and_not_retried() {
+    let f = fixture(vec![
+        tool_reply(vec![list_dir("list")], 10),
+        reply(
+            json!({"role": "assistant", "content": "partial answ"}),
+            "abort",
+            10,
+        ),
+        final_reply(),
+    ])
+    .await;
+    let (result, exit) = f.launch(None).await;
+    assert_eq!(
+        (result["outcome"].as_str(), exit),
+        (Some("infrastructure"), 70)
+    );
+    assert_eq!(result["cause"]["kind"], "endpoint_response");
+    assert_eq!(f.requests().await.len(), 2);
+}
+
+#[tokio::test]
 async fn duplicate_ids_in_one_reply_reject_the_batch_before_writing() {
     let edits = ["first.txt", "second.txt"]
         .into_iter()

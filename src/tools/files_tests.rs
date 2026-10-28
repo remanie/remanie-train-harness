@@ -947,3 +947,30 @@ async fn a_missing_ripgrep_is_internal_and_a_bad_pattern_is_not() {
         .unwrap_err();
     assert!(error.downcast_ref::<InternalError>().is_none(), "{error:#}");
 }
+
+#[tokio::test]
+async fn grep_returns_its_matches_when_some_file_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "needle here\n").unwrap();
+    let locked = dir.path().join("b.txt");
+    std::fs::write(&locked, "needle too\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        eprintln!("skipping: this user can read a mode-000 file");
+        return;
+    }
+    let output = file_tools(dir.path())
+        .call("grep", &json!({"pattern":"needle"}))
+        .await
+        .unwrap();
+    let (matches, note) = output.split_once("\n\n").unwrap();
+    assert!(
+        matches.contains("a.txt") && matches.contains("needle here"),
+        "{output}"
+    );
+    assert!(
+        note.starts_with("rg: ") && note.contains("b.txt"),
+        "{output}"
+    );
+}

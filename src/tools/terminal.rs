@@ -694,7 +694,7 @@ pub async fn capture(
     cwd: &Path,
     timeout: Duration,
     max_bytes: usize,
-) -> io::Result<(i32, String)> {
+) -> io::Result<(i32, String, String)> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -715,7 +715,7 @@ pub async fn capture(
     })
     .await;
     let mut timed_out = drained.is_err();
-    let mut truncated = matches!(drained, Ok(Ok((true, _) | (_, true))));
+    let truncated = matches!(drained, Ok(Ok((true, _))));
     if let Ok(Err(error)) = drained {
         return Err(error);
     }
@@ -731,9 +731,6 @@ pub async fn capture(
     }
     let status = child.wait().await?;
     lock(&CHILDREN_WITH_HANDLES).remove(&pid);
-    output.extend_from_slice(&errors);
-    truncated |= output.len() > max_bytes;
-    output.truncate(max_bytes);
     let mut text = String::from_utf8_lossy(&output).into_owned();
     if truncated {
         text.push_str("\n[output truncated]");
@@ -741,7 +738,11 @@ pub async fn capture(
     if timed_out {
         text.push_str("\n[command ended: timeout]");
     }
-    Ok((status.code().unwrap_or(-1), text))
+    Ok((
+        status.code().unwrap_or(-1),
+        text,
+        String::from_utf8_lossy(&errors).into_owned(),
+    ))
 }
 
 async fn drain(

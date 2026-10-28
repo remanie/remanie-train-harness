@@ -228,7 +228,7 @@ async fn the_log_keeps_every_byte_and_the_reply_shows_its_ends() {
 #[tokio::test]
 async fn capture_bounds_timeout_and_cancellation_reap() {
     let dir = tempfile::tempdir().unwrap();
-    let (code, output) = capture(
+    let (code, output, errors) = capture(
         Path::new("/bin/bash"),
         &[
             "-c".into(),
@@ -240,9 +240,9 @@ async fn capture_bounds_timeout_and_cancellation_reap() {
     )
     .await
     .unwrap();
-    assert_eq!(code, 0);
+    assert_eq!((code, errors.as_str()), (0, "error"));
     assert!(output.starts_with("beginning") && output.contains("truncated") && output.len() < 150);
-    let (code, output) = capture(
+    let (code, output, _) = capture(
         Path::new("/bin/bash"),
         &["-c".into(), "printf partial; exec sleep 60".into()],
         dir.path(),

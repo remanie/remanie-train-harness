@@ -383,7 +383,7 @@ impl FileTools {
             "--".into(),
             root.to_string_lossy().into_owned(),
         ]);
-        let (code, output) = capture(
+        let (code, output, errors) = capture(
             &self.ripgrep,
             &args,
             &self.cwd,
@@ -397,7 +397,12 @@ impl FileTools {
                 self.ripgrep.display()
             ))
         })?;
-        ensure!(matches!(code, 0 | 1), "grep failed (exit {code}): {output}");
+        // rg exits 2 when it could not read some file, even after printing matches.
+        let unread = code == 2 && !output.is_empty();
+        ensure!(
+            matches!(code, 0 | 1) || unread,
+            "grep failed (exit {code}): {output}{errors}"
+        );
         if code == 1 || output.is_empty() {
             return Ok("No matches found".into());
         }
@@ -406,12 +411,16 @@ impl FileTools {
         if lines.next().is_some() {
             text.push_str("\n... [output truncated. Narrow the path or pattern.] ...");
         }
+        if unread {
+            text.push_str("\n\n");
+            text.push_str(errors.trim_end());
+        }
         Ok(text)
     }
 
     async fn pdf(&self, path: &Path, spec: Option<&str>) -> Result<String> {
         let path = path.to_str().context("PDF path is not UTF-8")?.to_owned();
-        let (code, info) = capture(
+        let (code, info, errors) = capture(
             Path::new("pdfinfo"),
             std::slice::from_ref(&path),
             &self.cwd,
@@ -420,7 +429,7 @@ impl FileTools {
         )
         .await
         .context("reading a PDF requires the Poppler utilities pdfinfo and pdftotext")?;
-        ensure!(code == 0, "pdfinfo failed (exit {code}): {info}");
+        ensure!(code == 0, "pdfinfo failed (exit {code}): {info}{errors}");
         ensure!(
             !info.ends_with("\n[output truncated]"),
             "pdfinfo output exceeded the limit"
@@ -454,7 +463,7 @@ impl FileTools {
                 path.clone(),
                 "-".into(),
             ];
-            let (code, text) = capture(
+            let (code, text, errors) = capture(
                 Path::new("pdftotext"),
                 &args,
                 &self.cwd,
@@ -463,7 +472,7 @@ impl FileTools {
             )
             .await
             .context("reading a PDF requires the Poppler utilities pdfinfo and pdftotext")?;
-            ensure!(code == 0, "pdftotext failed (exit {code}): {text}");
+            ensure!(code == 0, "pdftotext failed (exit {code}): {text}{errors}");
             ensure!(
                 !text.ends_with("\n[output truncated]"),
                 "PDF text exceeds 100000 bytes. Select fewer pages"
