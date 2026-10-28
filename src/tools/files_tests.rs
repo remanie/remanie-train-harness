@@ -739,7 +739,10 @@ async fn pdfs_are_read_as_text_and_page_ranges_are_bounded() {
         .await
         .unwrap();
     let error = tools
-        .call("read_file", &json!({"target_file":"document.pdf"}))
+        .call(
+            "read_file",
+            &json!({"target_file":"document.pdf","format":"text"}),
+        )
         .await
         .unwrap_err()
         .to_string();

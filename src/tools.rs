@@ -62,6 +62,21 @@ fn internal(error: impl fmt::Display) -> anyhow::Error {
     anyhow::Error::new(InternalError(error.to_string()))
 }
 
+#[derive(Debug)]
+struct InvalidArgument(String);
+
+impl fmt::Display for InvalidArgument {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidArgument {}
+
+fn invalid(message: impl fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(InvalidArgument(message.to_string()))
+}
+
 impl ToolOutput {
     fn failed(kind: ToolErrorKind, message: impl fmt::Display) -> Self {
         Self {
@@ -137,7 +152,9 @@ impl ToolSession {
                 format!("invalid {name} arguments: {error}"),
             ));
         }
-        integral_floats_as_integers(&mut args);
+        if let Err(error) = whole_numbers(&mut args) {
+            return Ok(ToolOutput::failed(ToolErrorKind::InvalidArguments, error));
+        }
         let mut task_id = None;
         let result = match name {
             "run_terminal_cmd" => self.terminal.run(&args).await.map(|(content, id)| {
@@ -157,7 +174,11 @@ impl ToolSession {
             Err(error) => match error.downcast::<InternalError>() {
                 Ok(InternalError(detail)) => Err(InternalError(format!("{name}: {detail}"))),
                 Err(error) => Ok(ToolOutput::failed(
-                    ToolErrorKind::Failed,
+                    if error.is::<InvalidArgument>() {
+                        ToolErrorKind::InvalidArguments
+                    } else {
+                        ToolErrorKind::Failed
+                    },
                     format!("{error:#}"),
                 )),
             },
@@ -180,21 +201,18 @@ impl ToolSession {
     }
 }
 
-// JSON Schema's "integer" accepts 1000.0, which as_u64 and serde's usize reject.
-fn integral_floats_as_integers(args: &mut Value) {
-    for value in args
-        .as_object_mut()
-        .into_iter()
-        .flat_map(|args| args.values_mut())
-    {
-        if value.is_f64()
-            && let Some(number) = value.as_f64()
-            && number.fract() == 0.0
-            && number >= 0.0
-        {
-            *value = json!(number as u64);
+// JSON Schema's "integer" accepts 1000.0 and -1, which as_u64 and serde's usize reject.
+fn whole_numbers(args: &mut Value) -> Result<(), String> {
+    for (key, value) in args.as_object_mut().into_iter().flatten() {
+        match value.as_f64() {
+            Some(number) if number < 0.0 => return Err(format!("{key} must not be negative")),
+            Some(number) if value.is_f64() && number.fract() == 0.0 => {
+                *value = json!(number as u64);
+            }
+            _ => {}
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

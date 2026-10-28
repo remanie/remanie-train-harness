@@ -483,7 +483,7 @@ async fn tool_contract_errors_return_to_the_model_without_side_effects() {
         call(
             "bad-args",
             "search_replace",
-            json!({"file_path": "result.txt", "old_string": "", "new_string": "must not exist", "extra": true}),
+            json!({"file_path": "result.txt", "old_string": "", "new_string": "must not exist", "replace_all": "yes"}),
         ),
         json!({"id": "bad-json", "type": "function", "function": {"name": "list_dir", "arguments": "{"}}),
     ];
@@ -980,6 +980,24 @@ async fn a_deadline_during_a_request_is_always_a_graded_deadline() {
         assert_eq!(result["cause"], json!({"request_in_flight": true}));
         assert_eq!(exit, 0);
     }
+}
+
+#[tokio::test]
+async fn a_wait_past_the_deadline_ends_the_attempt_at_the_deadline() {
+    let mut f = fixture(vec![tool_reply(
+        vec![call(
+            "wait",
+            "run_terminal_cmd",
+            json!({"command": "sleep 60", "description": "wait", "block_until_ms": 36_000_000}),
+        )],
+        10,
+    )])
+    .await;
+    f.config["deadline_secs"] = json!(1);
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "deadline");
+    assert_eq!(result["cause"], json!({"request_in_flight": false}));
+    assert!(result["wall_time_ms"].as_u64().unwrap() < 3_000, "{result}");
 }
 
 #[tokio::test]

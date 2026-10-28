@@ -63,12 +63,7 @@ async fn files_catalog_and_validation() {
         ),
         (
             "run_terminal_cmd",
-            r#"{"command":"true", "description":"test", "timeout":1}"#,
-            ToolErrorKind::InvalidArguments,
-        ),
-        (
-            "run_terminal_cmd",
-            r#"{"command":"true", "description":"test", "block_until_ms":300001}"#,
+            r#"{"command":"true", "description":"test", "block_until_ms":-1}"#,
             ToolErrorKind::InvalidArguments,
         ),
         (
@@ -87,8 +82,23 @@ async fn files_catalog_and_validation() {
             ToolErrorKind::InvalidArguments,
         ),
         (
+            "get_terminal_command_output",
+            "{}",
+            ToolErrorKind::InvalidArguments,
+        ),
+        (
+            "get_terminal_command_output",
+            r#"{"task_ids":["task-1"], "timeout_ms":3600001}"#,
+            ToolErrorKind::InvalidArguments,
+        ),
+        (
             "grep",
-            r#"{"pattern":"test", "output_mode":"content"}"#,
+            r#"{"pattern":"test", "head_limit":0}"#,
+            ToolErrorKind::InvalidArguments,
+        ),
+        (
+            "read_file",
+            r#"{"target_file":"missing.txt", "offset":0}"#,
             ToolErrorKind::InvalidArguments,
         ),
         (
@@ -368,7 +378,7 @@ async fn the_trained_schema_keeps_its_tool_and_parameter_names() {
                 "multiline",
             ],
         ),
-        ("todo_write", &["todos", "merge"]),
+        ("todo_write", &["merge", "todos"]),
     ]
     .map(|(name, parameters)| {
         let parameters = parameters.iter().map(|p| p.to_string()).collect::<Vec<_>>();
@@ -378,19 +388,27 @@ async fn the_trained_schema_keeps_its_tool_and_parameter_names() {
     tokio::fs::write(dir.path().join("notes.txt"), "text\n")
         .await
         .unwrap();
-    let image = call(
-        &tools,
-        "read_file",
-        json!({"target_file":"notes.txt", "format":"image"}),
-    )
-    .await;
-    assert_eq!(image.error, Some(ToolErrorKind::InvalidArguments));
-    let text = call(
-        &tools,
-        "read_file",
-        json!({"target_file":"notes.txt", "format":"text"}),
-    )
-    .await;
-    assert_eq!(text.content, "1→text\n");
+    for format in ["image", "text"] {
+        let text = call(
+            &tools,
+            "read_file",
+            json!({"target_file":"notes.txt", "format":format}),
+        )
+        .await;
+        assert_eq!(text.content, "1→text\n");
+    }
+    tokio::fs::write(dir.path().join("paper.pdf"), "%PDF-1.4\n")
+        .await
+        .unwrap();
+    for args in [
+        json!({"target_file":"paper.pdf"}),
+        json!({"target_file":"paper.pdf", "format":"image"}),
+    ] {
+        let pdf = call(&tools, "read_file", args).await;
+        assert_eq!(
+            (pdf.error, pdf.content.as_str()),
+            (None, "Vision is not available in this environment.")
+        );
+    }
     tools.kill_all().await;
 }

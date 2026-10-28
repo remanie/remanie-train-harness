@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
-use super::internal;
+use super::{internal, invalid};
 
 const PREVIEW_BYTES: usize = 20_000;
 const POLL_BYTES: usize = 40_000;
@@ -131,8 +131,10 @@ impl TerminalSession {
         let description = args["description"]
             .as_str()
             .context("missing description")?;
-        let block = args["block_until_ms"].as_u64().unwrap_or(30_000);
-        ensure!(block <= 300_000, "block_until_ms exceeds 300000");
+        let block = args["block_until_ms"]
+            .as_u64()
+            .unwrap_or(30_000)
+            .min(MAX_RUNTIME.as_millis() as u64);
         ensure!(
             !unwaited_background(command),
             "To run a command in the background, pass block_until_ms=0 instead of using &."
@@ -201,13 +203,16 @@ impl TerminalSession {
     }
 
     pub async fn output(&self, args: &Value) -> Result<String> {
-        let ids = args["task_ids"].as_array().context("missing task_ids")?;
+        let ids = args["task_ids"].as_array().map_or(&[][..], Vec::as_slice);
         ensure!(
-            !ids.is_empty() && ids.len() <= 20,
-            "task_ids must have 1 to 20 entries"
+            !ids.is_empty(),
+            invalid("Provide a non-empty task_ids list.")
+        );
+        ensure!(
+            ids.len() <= 20,
+            invalid("task_ids exceeds maximum of 20 entries.")
         );
         let timeout = args["timeout_ms"].as_u64().unwrap_or(0);
-        ensure!(timeout <= 300_000, "timeout_ms exceeds 300000");
         let tasks = ids
             .iter()
             .map(|id| {

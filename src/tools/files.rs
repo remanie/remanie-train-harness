@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::Mutex;
 
-use super::{internal, list_dir, terminal::capture};
+use super::{internal, invalid, list_dir, terminal::capture};
 
 const READ_MAX_BYTES: usize = 100_003;
 const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
@@ -73,6 +73,10 @@ impl FileTools {
     }
 
     async fn read(&self, input: ReadInput) -> Result<String> {
+        let start = input.offset.unwrap_or(1);
+        ensure!(start > 0, invalid("offset must be at least 1"));
+        let limit = input.limit.unwrap_or(MAX_LINES).min(MAX_LINES);
+        ensure!(limit > 0, invalid("limit must be at least 1"));
         let path = resolve_file(self.path(&input.target_file)?).await;
         let file = tokio::fs::OpenOptions::new()
             .read(true)
@@ -90,6 +94,9 @@ impl FileTools {
             .to_ascii_lowercase();
         let sample = reader.fill_buf().await?;
         if extension == "pdf" || sample.starts_with(b"%PDF-") {
+            if input.format.as_deref() != Some("text") {
+                return Ok("Vision is not available in this environment.".into());
+            }
             ensure!(
                 metadata.len() <= MAX_DOCUMENT_BYTES,
                 "PDF exceeds the 50 MB limit"
@@ -105,10 +112,6 @@ impl FileTools {
             extension != "pptx" && !is_binary(&extension, sample),
             "cannot read a non-text file"
         );
-        let start = input.offset.unwrap_or(1);
-        ensure!(start > 0, "offset must be at least 1");
-        let limit = input.limit.unwrap_or(MAX_LINES).min(MAX_LINES);
-        ensure!(limit > 0, "limit must be at least 1");
         let mut raw = Vec::new();
         let mut line_number = 1usize;
         let end = start.saturating_add(limit);
@@ -334,6 +337,8 @@ impl FileTools {
     }
 
     async fn grep(&self, input: GrepInput) -> Result<String> {
+        let limit = input.head_limit.unwrap_or(200).min(2_000);
+        ensure!(limit > 0, invalid("head_limit must be at least 1"));
         let root = self.path(input.path.as_deref().unwrap_or(""))?;
         let mut args: Vec<String> = [
             "--heading",
@@ -391,7 +396,6 @@ impl FileTools {
         if code == 1 || output.is_empty() {
             return Ok("No matches found".into());
         }
-        let limit = input.head_limit.unwrap_or(200).min(2_000);
         let mut lines = output.lines();
         let mut text = lines.by_ref().take(limit).collect::<Vec<_>>().join("\n");
         if lines.next().is_some() {
@@ -568,6 +572,7 @@ struct ReadInput {
     offset: Option<usize>,
     limit: Option<usize>,
     pages: Option<String>,
+    format: Option<String>,
 }
 
 #[derive(Deserialize)]
