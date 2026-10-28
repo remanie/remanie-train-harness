@@ -98,7 +98,7 @@ class ScriptedModel:
         if self.turn == 1:
             return reply(calls=[
                 call("todo_write", {"todos": [{"id": "verify", "content": "Verify result.txt", "status": "in_progress"}]}, "todo-start"),
-                shell("printf 'before\\n' > result.txt; env > child-env.txt; cat /proc/$PPID/environ > parent-env.bin", "initialize"),
+                shell("printf 'before\\n' > result.txt; env > child-env.txt", "initialize"),
                 shell("printf '%s' $$ > background.pid; printf background-ready; exec sleep 300", "background"),
             ], tokens=30_000)
         if self.turn == 2:
@@ -154,7 +154,7 @@ def model_server(model):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
@@ -171,7 +171,7 @@ async def check(mode, runtime_dir, output_dir):
             agent=AgentConfig(
                 import_path="check_harbor:UnconfirmedShutdownAgent" if mode == "cleanup_error" else "remanie_agent:RemanieAgent",
                 model_name="openrouter/x-ai/grok-4.7",
-                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                base_url=f"http://host.docker.internal:{server.server_port}/v1",
                 env={"OPENROUTER_API_KEY": FAKE_KEY},
                 override_timeout_sec=8 if mode == "timeout" else 60,
                 override_setup_timeout_sec=120,

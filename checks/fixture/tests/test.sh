@@ -3,7 +3,7 @@ set -eu
 
 mkdir -p /logs/verifier
 printf '0\n' > /logs/verifier/reward.txt
-cd /app
+cd /tmp
 
 assert_stopped() {
     local pid
@@ -19,7 +19,6 @@ case "$REMANIE_CHECK_MODE" in
     completed)
         test "$(cat result.txt)" = after
         ! grep -q OPENROUTER_API_KEY child-env.txt
-        ! grep -a -q remanie-local-fixture-key parent-env.bin
         assert_stopped background.pid
         assert_stopped cleanup.pid
         ;;

@@ -1,8 +1,8 @@
 Local Harbor integration check
 
-Use Harbor 0.25, Docker with AMD64 emulation when needed, host.docker.internal
-resolving to the host, and the bundled Linux runtime in ../runtime. From the
-repository root:
+Use Harbor 0.25, Docker, host.docker.internal resolving to the host, and the
+bundled Linux runtime in ../runtime. The runtime and Docker worker must use the
+same CPU architecture. From the repository root:
 
   python checks/check_harbor.py
 
@@ -12,9 +12,11 @@ By default, evidence is retained under the operating system's temporary folder.
 
 This runs the actual Harbor AgentFactory, Trial, Docker environment, adapter,
 Rust tools, compaction, and Harbor verifier against a scripted local HTTP server.
-It uses a fixed fake API key, never a paid model endpoint. The official
-openssl-selfsigned-cert image supplies the OS only; its task and tests are not
-used or modified. Docker may download that image if it is not already cached.
+The sandbox calls that server directly through host.docker.internal. This
+address belongs to the local fixture, not the agent adapter. The server listens
+on the host's network interfaces and accepts only a fixed fake API key. No paid
+model endpoint is used. A pinned multi-architecture Debian image supplies the
+OS. Docker may download that image if it is not already cached.
 
 The completed trial exercises all eight tools, forces one compaction, checks
 that the todo and live background task survive it, then verifies the edited

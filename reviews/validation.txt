@@ -1,4 +1,42 @@
-Standalone harness validation, 2026-10-27 America/Los_Angeles
+Model connection validation, 2026-10-27 America/Los_Angeles
+
+What this change does: RemanieAgent uses Harbor's resolved endpoint and
+credential. The local proxy and Docker-only check are removed. Completed
+commands can supply the process identity when live output is unavailable.
+
+Checks passed after this change:
+
+- 16 adapter tests, including custom endpoints, scoped credentials, buffered
+  output under the Azure provider name, missing configuration and cancellation.
+- The packaging/license regression test and Python compilation.
+- Four real Harbor/Docker trials on native ARM64 Debian: completion with all
+  eight tools and one compaction; graceful timeout; missing identity; and a
+  crashed runner. The last two skip grading and require teardown.
+- All 23 existing runtime files match their manifest hashes. Rust source,
+  dependencies and the five prompt/catalog assets are unchanged.
+- Changed-file credential scan and git diff --check.
+
+The original fixture mixed an ARM64 runner with emulated AMD64 commands. A
+timeout run reported a different process start time after exec, so cleanup
+refused to signal it. The fixture now uses pinned Debian on the worker's native
+architecture. The process identity check is unchanged.
+
+Ponytail Review covered the diff, Harbor's connection resolver and execution
+helpers, the Azure provider's buffered command output, tests and documentation.
+Expected load: one sequential model loop per disposable sandbox, with separate
+sandboxes for concurrent attempts. Looks good. Ship. No remaining findings.
+
+Evidence under /Users/p/.codex/artifacts/grok-rl-build-tools/:
+  standard-connection-unit.log
+  standard-connection-native-final.log
+  standard-connection-native-final/summary.json
+
+Not checked: live Azure, paid inference or the full benchmark. Credentials are
+now available inside the task sandbox. A timeout without live process identity
+skips grading and relies on environment teardown. These checks made no paid
+model calls.
+
+Prior extraction validation at 8ac3890c, 2026-10-27 America/Los_Angeles
 
 The repository contains one Rust package, the eight agreed tool contracts,
 prompt assets, execution loop, compaction, traces, Linux packaging and Harbor

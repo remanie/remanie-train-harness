@@ -30,24 +30,27 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
             executable.chmod(0o755)
         self.logs = self.root / "logs"
         self.logs.mkdir()
-        self.env = patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-only-secret"})
+        self.env = patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-only-secret"}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
 
-    def agent(self, **kwargs):
+    def agent(self, *, base_url=None, model_api_key_name=None, env=None, **kwargs):
         return AgentFactory.create_agent_from_config(
             AgentConfig(
                 import_path="remanie_agent:RemanieAgent",
                 model_name="openrouter/x-ai/grok-4.7",
+                base_url=base_url,
+                model_api_key_name=model_api_key_name,
+                env=env or {},
                 kwargs={"runtime_dir": str(self.runtime), **kwargs},
             ),
             logs_dir=self.logs,
         )
 
-    def environment(self):
+    def environment(self, kind="docker"):
         environment = AsyncMock(spec=BaseEnvironment)
         environment.default_user = None
-        environment.type.return_value = "docker"
+        environment.type.return_value = kind
 
         @contextmanager
         def output_callback(callback):
@@ -91,9 +94,9 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["sampling_params"], {"reasoning": {"effort": "high"}})
         self.assertEqual(config["deadline_secs"], 86400)
         self.assertTrue(context.is_empty())
-        self.assertTrue(config["base_url"].startswith("http://host.docker.internal:"))
+        self.assertEqual(config["base_url"], "https://openrouter.ai/api/v1")
         run_call = next(call.kwargs for call in environment.exec.await_args_list if call.kwargs.get("env"))
-        self.assertNotEqual(run_call["env"]["OPENROUTER_API_KEY"], "test-only-secret")
+        self.assertEqual(run_call["env"]["OPENROUTER_API_KEY"], "test-only-secret")
         self.assertIn("exec /opt/remanie-train-harness/remanie-train-harness", run_call["command"])
         self.assertNotIn("test-only-secret", json.dumps(uploaded))
         for call in environment.exec.await_args_list:
@@ -104,6 +107,40 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"${20}" = 456', cleanup)
         self.assertNotIn("runtime.pid", cleanup)
 
+    async def test_custom_endpoint_and_scoped_key_work_across_environment_types(self):
+        for kind in ("docker", "azure-sandbox"):
+            with self.subTest(environment=kind):
+                agent = self.agent(
+                    base_url="https://inference.example.test/v1",
+                    model_api_key_name="TRIAL_MODEL_KEY",
+                    env={"TRIAL_MODEL_KEY": "scoped-test-secret"},
+                )
+                environment = self.environment(kind)
+
+                async def execute(**kwargs):
+                    if "exec setsid" in kwargs["command"]:
+                        if kind == "docker":
+                            await environment.output_callback("REMANIE_PROCESS=123:456\n", "stdout")
+                        return ExecResult(stdout="REMANIE_PROCESS=123:456\n", return_code=0)
+                    return ExecResult(stdout="/task\n", return_code=0)
+
+                environment.exec.side_effect = execute
+                await agent.setup(environment)
+                with patch.object(agent, "_upload_config_text", new_callable=AsyncMock) as upload:
+                    await agent.run("task", environment, AgentContext())
+                config_text = upload.call_args.kwargs["content"]
+                config = json.loads(config_text)
+                self.assertEqual(config["base_url"], "https://inference.example.test/v1")
+                self.assertEqual(config["api_key_env"], "OPENROUTER_API_KEY")
+                self.assertEqual(config["model"], "x-ai/grok-4.7")
+                run_call = next(call.kwargs for call in environment.exec.await_args_list if call.kwargs.get("env"))
+                self.assertEqual(run_call["env"], dict(agent.model_connection.env))
+                self.assertEqual(run_call["env"][config["api_key_env"]], "scoped-test-secret")
+                self.assertNotIn("scoped-test-secret", config_text)
+                self.assertIn("pid=123", environment.exec.await_args_list[-1].kwargs["command"])
+                for call in environment.exec.await_args_list:
+                    self.assertNotIn("scoped-test-secret", call.kwargs["command"])
+
     async def test_missing_key_fails_before_execution(self):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}):
             agent = self.agent()
@@ -112,6 +149,15 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
                 await agent.run("task", environment, AgentContext())
             environment.exec.assert_not_awaited()
 
+    async def test_unparsed_model_requires_explicit_endpoint(self):
+        agent = RemanieAgent(
+            logs_dir=self.logs, runtime_dir=str(self.runtime), skip_model_parsing=True,
+        )
+        environment = self.environment()
+        with self.assertRaisesRegex(ValueError, "base_url"):
+            await agent.run("task", environment, AgentContext())
+        environment.exec.assert_not_awaited()
+
     def test_scoped_credential_precedes_host_and_options_are_validated(self):
         agent = RemanieAgent(
             logs_dir=self.logs,
@@ -119,12 +165,12 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
             extra_env={"OPENROUTER_API_KEY": "scoped-test-secret"},
         )
         self.assertEqual(agent.model_connection.env["OPENROUTER_API_KEY"], "scoped-test-secret")
-        self.assertEqual(agent.extra_env, {})
+        self.assertEqual(agent.extra_env, {"OPENROUTER_API_KEY": "scoped-test-secret"})
         for options in ({"max_turns": 0}, {"runtime_dir": str(self.root)}, {"prompt_template_path": "wrapper.jinja2"}, {"unknown": True}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.agent(**options)
 
-    async def test_cancellation_stops_runtime_before_proxy_closes(self):
+    async def test_cancellation_stops_runtime_before_returning(self):
         agent = self.agent()
         environment = self.environment()
         started = asyncio.Event()
@@ -164,6 +210,24 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "shutdown was not confirmed") as raised:
             await agent.run("task", environment, AgentContext())
         self.assertNotIsInstance(raised.exception, NonZeroAgentExitCodeError)
+
+    async def test_cancellation_without_live_output_requires_teardown(self):
+        agent = self.agent()
+        environment = self.environment("azure-sandbox")
+        started = asyncio.Event()
+
+        async def execute(**kwargs):
+            if "exec setsid" in kwargs["command"]:
+                started.set()
+                await asyncio.Event().wait()
+            return ExecResult(stdout="/task\n", return_code=0)
+
+        environment.exec.side_effect = execute
+        task = asyncio.create_task(agent.run("task", environment, AgentContext()))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with self.assertRaisesRegex(RuntimeError, "identity was not captured"):
+            await task
 
     async def test_cancelled_attempt_still_checks_the_runtime_exit_status(self):
         agent = self.agent()

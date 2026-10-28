@@ -1,6 +1,6 @@
 # remanie-train-harness
 
-A small Rust program that lets a model work on a coding task using eight tools. It can summarize long conversations and saves an execution trace. Harbor runs each task in a disposable Docker environment and grades the result.
+A small Rust program that lets a model work on a coding task using eight tools. It can summarize long conversations and saves an execution trace. Harbor runs each task in a disposable environment and grades the result.
 
 The tools are `run_terminal_cmd`, `get_terminal_command_output`, `kill_terminal_command`, `read_file`, `search_replace`, `list_dir`, `grep`, and `todo_write`. Their names and argument definitions match the agreed Grok Build tool set. Each tool description keeps its original first sentence.
 
@@ -16,7 +16,7 @@ cargo clippy --all-targets --locked -- -D warnings
 
 `rg` must be on PATH, or `RG_BIN_PATH` must name its absolute location. PDF text extraction additionally needs `pdfinfo` and `pdftotext`, usually supplied by Poppler. Image output, rendered documents and PPTX extraction are not supported.
 
-See [Harbor setup](harbor/README.md) for a Docker runtime bundle and the pinned Terminal-Bench configuration. [The integration check](checks/README.txt) tests all eight tools, compaction and timeout cleanup without paid inference.
+See [Harbor setup](harbor/README.md) for a Linux runtime bundle and the pinned Terminal-Bench configuration. [The integration check](checks/README.txt) tests all eight tools, compaction and timeout cleanup without paid inference.
 
 ## One attempt
 
@@ -67,9 +67,9 @@ The result includes `status`, `final_answer`, `turns` and `compactions`, plus `e
 
 ## Isolation and limits
 
-Run one attempt per disposable sandbox. Keep provider credentials and private grading material outside the task. The Harbor adapter retains the provider key on the host and exposes a scoped temporary relay token. Direct runs remove the configured credential from the child environment, but that is not operating-system isolation.
+Run one attempt per disposable sandbox. Keep private grading material outside the task. The Harbor adapter passes the selected model credential into the runner's environment. The runner removes it before starting tools, but code inside the sandbox may still recover it from process memory or operating-system interfaces. Use a restricted evaluation credential or a reachable gateway with a limited token. Credential and spending limits belong to the provider or gateway.
 
-Each model request/response is capped at 16 MiB, each command log at 16 MiB, and the trace at 256 MiB. The launcher owns CPU, memory, disk and network limits. The current Harbor adapter supports local Docker; it does not enforce per-task disk quotas.
+Each model request/response is capped at 16 MiB, each command log at 16 MiB, and the trace at 256 MiB. The launcher owns CPU, memory, disk and network limits. Harbor's selected environment provider must enforce those limits. The local Docker backend does not enforce per-task disk quotas.
 
 This project derives from Grok Build. [NOTICE](NOTICE) identifies the original source and retained code. The source tree contains one Rust package, the Harbor adapter, runtime packaging and their checks.
 

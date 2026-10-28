@@ -17,7 +17,7 @@ python3 package_linux.py \
 
 The output directory must be new. Packaging copies the executable, ripgrep, their Linux loader and shared libraries. It requires the Debian copyright notices and any common license texts they reference. It records the bundled files' hashes in `manifest.json`. Harbor installs this bundle under `/opt/remanie-train-harness`. The bundled loader avoids requiring a particular glibc version in each task image.
 
-Use an AMD64 build and worker for comparable benchmark results. Local validation on this Mac uses a native ARM64 runner and emulated AMD64 task commands. This tests the integration but changes task execution speed.
+Use an AMD64 build and worker for comparable benchmark results. The local integration fixture uses a native ARM64 runner and Debian image on this Mac. Match the runner and task-image architectures. Mixing architectures under emulation can change the reported process identity and prevent confirmed shutdown.
 
 ## Install Harbor and run
 
@@ -45,11 +45,17 @@ For a preflight that makes no model calls:
   --dry-run --skip-credential-checks
 ```
 
-The adapter keeps the provider key in the host process. A temporary proxy gives each task a separate credential, restricts it to the configured model and token limits, and closes when the attempt ends.
+The adapter uses Harbor's resolved model connection. It puts the selected endpoint in the runner's JSON configuration and passes the selected credential through the execution environment. Harbor's `base_url` and `model_api_key_name` agent settings select a custom endpoint and credential. The endpoint must support OpenAI Chat Completions under a `/v1` URL and be reachable from the task sandbox.
 
-Timeout cleanup uses the process identity captured by the host before the model runs. The host must also confirm that the runner exited with code zero. A crash or unconfirmed shutdown makes Harbor skip grading and tear down the task.
+The credential is available inside the sandbox. The runner removes it from its environment before starting tools, but this does not protect it from code in the same sandbox. Use a restricted evaluation credential or a reachable gateway with a limited token. The adapter no longer runs a local proxy or enforces its former request and credential limits.
 
-This adapter currently targets local Docker; the container must be able to reach `host.docker.internal`.
+Cleanup uses the process identity emitted before the runner starts. The host must also confirm that the runner exited with code zero. A crash or unconfirmed shutdown makes Harbor skip grading and tear down the task.
+
+Choose Docker or your Azure environment adapter in Harbor's environment configuration. Remanie uses Harbor's file-transfer and command-execution methods without checking the provider name. The environment must run Linux, provide Bash and `setsid`, and match the runtime bundle's CPU architecture. The model endpoint must be permitted by the task's network policy.
+
+Remanie reads the process identity from live output when available, or from the completed command result. Graceful timeout cleanup needs live output and a second command to stop the process. Without a captured identity, an interrupted run skips grading and requires sandbox teardown.
+
+Unit tests cover live and buffered output through a mocked Harbor environment, including the Azure provider name. The integration fixtures run on real Docker. Live Azure execution has not been verified.
 
 ## What the smoke configuration measures
 

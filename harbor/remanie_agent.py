@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import Field
 
-from harbor.agents.agent_auth_resolution import ModelConnectionSpec, ProviderAccess
+from harbor.agents.agent_auth_resolution import ModelConnectionSpec, ProviderAccess, require_model_api_key
 from harbor.agents.capabilities import AgentCapabilities
 from harbor.agents.installed.base import BaseInstalledAgent
 from harbor.agents.options import InstalledAgentOptions
@@ -19,7 +19,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.model_api_format import ModelApiFormat
 
-from model_proxy import MAX_BODY, model_proxy
+MAX_BODY = 16 * 1024 * 1024
 
 
 @contextmanager
@@ -79,21 +79,10 @@ class RemanieAgent(BaseInstalledAgent):
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 raise ValueError(f"runtime_dir must contain an executable {name}")
         self.run_dir = self.environment_logs_dir / "remanie"
-        catalog = json.loads((Path(__file__).resolve().parents[1] / "assets/tools.json").read_text())
-        self.tools = [{"type": "function", "function": {"name": name, **definition}} for name, definition in catalog.items()]
 
     @staticmethod
     def name() -> str:
         return "remanie-train-harness"
-
-    @property
-    def extra_env(self) -> dict[str, str]:
-        connection = self.model_connection
-        return {
-            name: value for name, value in super().extra_env.items()
-            if name not in {"OPENROUTER_API_KEY", connection.api_key_source_name}
-            and value != connection.api_key
-        }
 
     async def install(self, environment: BaseEnvironment) -> None:
         await self.exec_as_root(
@@ -113,10 +102,9 @@ class RemanieAgent(BaseInstalledAgent):
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
         connection = self.model_connection
-        if not connection.env.get("OPENROUTER_API_KEY"):
-            raise ValueError("Set OPENROUTER_API_KEY in the host environment")
-        if environment.type() != "docker":
-            raise ValueError("Remanie's credential proxy requires local Docker and host.docker.internal")
+        require_model_api_key(connection, self.name())
+        if not connection.execution_base_url:
+            raise ValueError("Set Harbor's base_url to an OpenAI-compatible /v1 endpoint")
         cwd = await self.exec_as_agent(environment, "pwd -P")
         workspace = (cwd.stdout or "").rstrip("\n")
         if not PurePosixPath(workspace).is_absolute():
@@ -126,7 +114,8 @@ class RemanieAgent(BaseInstalledAgent):
         )
         config = {
             "model": self._parsed_model_name,
-            "api_key_env": "OPENROUTER_API_KEY",
+            "base_url": connection.execution_base_url,
+            "api_key_env": connection.api_key_destination_name,
             "user_query": instruction,
             "workspace": workspace,
             "session_dir": str(self.run_dir),
@@ -146,46 +135,41 @@ class RemanieAgent(BaseInstalledAgent):
             f"> {shlex.quote(str(result_path))} "
             f"2> {shlex.quote(str(stderr_path))}"
         )
-        async with model_proxy(
-            connection.candidate_base_url, connection.api_key, self._parsed_model_name,
-            max(self.options.max_response_tokens, self.options.compaction_max_tokens),
-            2 * self.options.max_turns, self.options.deadline_secs,
-            self.options.sampling_params, self.tools,
-        ) as (base_url, token):
-            config["base_url"] = base_url
-            await self._upload_config_text(
-                environment,
-                content=json.dumps(config, allow_nan=False),
-                remote_path=str(config_path),
-                filename="input.json",
-            )
-            process = None
+        await self._upload_config_text(
+            environment,
+            content=json.dumps(config, allow_nan=False),
+            remote_path=str(config_path),
+            filename="input.json",
+        )
+        process = None
 
-            async def capture_process(text, stream):
-                nonlocal process
-                match = re.fullmatch(r"REMANIE_PROCESS=([1-9][0-9]*):([0-9]+)\n?", text)
-                if process is None and stream == "stdout" and match:
-                    process = match.groups()
+        async def capture_process(text, stream):
+            nonlocal process
+            match = re.fullmatch(r"REMANIE_PROCESS=([1-9][0-9]*):([0-9]+)\n?", text)
+            if process is None and stream == "stdout" and match:
+                process = match.groups()
 
+        try:
+            with environment.scoped_output_callback(capture_process):
+                execution = asyncio.create_task(self.exec_as_agent(
+                    environment,
+                    f"exec setsid --wait bash -c {shlex.quote(script)}",
+                    env=dict(connection.env),
+                ))
+                result = await asyncio.shield(execution)
+                if process is None:
+                    await capture_process(result.stdout or "", "stdout")
+        finally:
+            cleanup = asyncio.create_task(self._stop_runtime(environment, process, execution))
             try:
-                with environment.scoped_output_callback(capture_process):
-                    execution = asyncio.create_task(self.exec_as_agent(
-                        environment,
-                        f"exec setsid --wait bash -c {shlex.quote(script)}",
-                        env={"OPENROUTER_API_KEY": token},
-                    ))
-                    await asyncio.shield(execution)
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+                raise
             finally:
-                cleanup = asyncio.create_task(self._stop_runtime(environment, process, execution))
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    await cleanup
-                    raise
-                finally:
-                    if not execution.done():
-                        execution.cancel()
-                    await asyncio.gather(execution, return_exceptions=True)
+                if not execution.done():
+                    execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
 
     async def _stop_runtime(self, environment, process, execution):
         if process is None:
