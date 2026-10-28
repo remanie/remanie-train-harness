@@ -1,5 +1,5 @@
 [package]
-name = "rl-harness"
+name = "remanie-train-harness"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true

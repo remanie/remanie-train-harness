@@ -49,6 +49,7 @@ async fn fixture(responses: Vec<ResponseTemplate>) -> (TempDir, MockServer, Conf
         .await;
     let config = Config {
         base_url: format!("{}/v1", server.uri()),
+        api_key_env: None,
         model: "local-test-model".into(),
         user_query: "Create result.txt and verify the result.".into(),
         workspace,
@@ -85,16 +86,51 @@ fn trace(dir: &TempDir) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn bearer_auth_and_reasoning_reach_all_requests_without_entering_tools_or_traces() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (dir, server, mut config) = fixture(vec![
+            tool_reply(vec![call("environment", "run_terminal_cmd", json!({
+                "command":"env > inherited-env.txt", "description":"inspect inherited environment", "block_until_ms":1000
+            }))], 30_000),
+            reply(json!({"role":"assistant", "content":"<summary>Inspected the environment.</summary>"}), "stop", 10),
+            final_reply(),
+        ]).await;
+        config.api_key_env = Some("OPENROUTER_API_KEY".into());
+        config.sampling_params = json!({"reasoning":{"effort":"high"}});
+        config.compaction_threshold_tokens = 20_000;
+        let secret = "test-auth-private-key";
+        let result = run(config, Some(crate::bearer_header(secret).unwrap())).await.unwrap();
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.compactions, 1);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert_eq!(request.headers[AUTHORIZATION], format!("Bearer {secret}"));
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["reasoning"], json!({"effort":"high"}));
+            assert!(body.get("api_key_env").is_none());
+            assert!(!String::from_utf8_lossy(&request.body).contains(secret));
+        }
+        let environment = std::fs::read_to_string(dir.path().join("workspace/inherited-env.txt")).unwrap();
+        assert!(!environment.contains("OPENROUTER_API_KEY"));
+        assert!(!environment.contains(secret));
+        assert!(!std::fs::read_to_string(dir.path().join("attempt/trace.jsonl")).unwrap().contains(secret));
+    }).await;
+}
+
+#[tokio::test]
 async fn exact_prompt_catalog_and_assistant_replay_edit_a_real_file() {
     tokio::task::LocalSet::new().run_until(async {
         let arguments = "{\n  \"file_path\": \"result.txt\", \"old_string\": \"\",\n  \"new_string\": \"changed\\n\"\n}";
         let assistant = json!({
             "role":"assistant", "content":null, "reasoning_content":"Keep this field unchanged.",
             "reasoning":"Keep this other provider field too.", "refusal":null,
+            "reasoning_details":[{"type":"reasoning.text", "text":"Preserve OpenRouter reasoning details.", "index":0}],
             "tool_calls":[{"id":"edit", "type":"function", "function":{"name":"search_replace", "arguments":arguments}}]
         });
         let (dir, server, config) = fixture(vec![reply(assistant.clone(), "tool_calls", 100), final_reply()]).await;
-        let result = run(config).await.unwrap();
+        let result = run(config, None).await.unwrap();
+        assert!(server.received_requests().await.unwrap().iter().all(|request| !request.headers.contains_key(AUTHORIZATION)));
         assert_eq!(result.status, "completed");
         assert_eq!(result.final_answer, "done");
         assert_eq!(std::fs::read_to_string(dir.path().join("workspace/result.txt")).unwrap(), "changed\n");
@@ -141,7 +177,7 @@ async fn forced_compaction_keeps_original_query_todos_and_background_tasks() {
             final_reply(),
         ]).await;
         config.compaction_threshold_tokens = 20_000;
-        let result = run(config).await.unwrap();
+        let result = run(config, None).await.unwrap();
         assert_eq!(result.status, "completed");
         assert_eq!(result.compactions, 1);
         let requests = requests(&server).await;
@@ -188,7 +224,7 @@ async fn malformed_tool_call_shapes_stop_without_dispatch() {
                 (json!({"role":"assistant", "content":[]}), "stop"),
             ] {
                 let (dir, server, config) = fixture(vec![reply(message, finish, 10)]).await;
-                assert_eq!(run(config).await.unwrap().status, "invalid_response");
+                assert_eq!(run(config, None).await.unwrap().status, "invalid_response");
                 assert_eq!(requests(&server).await.len(), 1);
                 assert!(
                     !trace(&dir)
@@ -215,7 +251,7 @@ async fn duplicate_ids_reject_the_entire_batch_before_writing() {
                 })
                 .collect();
             let (dir, _server, config) = fixture(vec![tool_reply(edits, 10)]).await;
-            assert_eq!(run(config).await.unwrap().status, "invalid_response");
+            assert_eq!(run(config, None).await.unwrap().status, "invalid_response");
             assert!(!dir.path().join("workspace/first.txt").exists());
             assert!(!dir.path().join("workspace/second.txt").exists());
             assert!(
@@ -236,7 +272,7 @@ async fn tool_contract_errors_return_to_the_model_without_side_effects() {
             json!({"id":"bad-json", "type":"function", "function":{"name":"list_dir", "arguments":"{"}}),
         ];
         let (dir, server, config) = fixture(vec![tool_reply(errors, 10), final_reply()]).await;
-        assert_eq!(run(config).await.unwrap().status, "completed");
+        assert_eq!(run(config, None).await.unwrap().status, "completed");
         let requests = requests(&server).await;
         let messages = requests[1]["messages"].as_array().unwrap();
         let errors: Vec<_> = messages.iter().filter(|message| message["role"] == "tool").collect();
@@ -259,7 +295,7 @@ async fn invalid_compaction_preserves_original_transcript_and_runs_once() {
             let assistant = json!({"role":"assistant", "content":null, "tool_calls":[call("edit", "search_replace", json!({"file_path":"result.txt", "old_string":"", "new_string":"kept"}))]});
             let (dir, server, mut config) = fixture(vec![reply(assistant.clone(), "tool_calls", 30_000), reply(summary, finish, 10)]).await;
             config.compaction_threshold_tokens = 20_000;
-            let result = run(config).await.unwrap();
+            let result = run(config, None).await.unwrap();
             assert_eq!(result.status, "invalid_response");
             assert_eq!(result.compactions, 0);
             assert!(result.error.is_none());
@@ -301,7 +337,7 @@ async fn a_short_valid_summary_is_accepted_and_server_errors_remain_errors() {
                 ])
                 .await;
                 config.compaction_threshold_tokens = 20_000;
-                let result = run(config).await.unwrap();
+                let result = run(config, None).await.unwrap();
                 if fail {
                     assert_eq!(result.status, "error");
                     assert!(result.error.unwrap().contains("HTTP 503"));
@@ -338,13 +374,16 @@ async fn configuration_and_attempt_reuse_fail_before_model_calls() {
             config.sampling_params = json!({"input_ids":[1,2]});
             assert!(config.validate().is_err());
             config.sampling_params = json!({});
+            config.api_key_env = Some("invalid=name".into());
+            assert!(config.validate().is_err());
+            config.api_key_env = None;
             config.deadline_secs = 0;
             assert!(config.validate().is_err());
             config.deadline_secs = 10;
             std::fs::create_dir(&config.session_dir).unwrap();
             std::fs::write(config.session_dir.join("trace.jsonl"), "existing evidence").unwrap();
             let existing = config.session_dir.join("trace.jsonl");
-            assert!(run(config).await.is_err());
+            assert!(run(config, None).await.is_err());
             assert_eq!(
                 std::fs::read_to_string(existing).unwrap(),
                 "existing evidence"
@@ -362,7 +401,7 @@ async fn deadline_kills_native_background_processes() {
             final_reply().set_delay(Duration::from_secs(5)),
         ]).await;
         config.deadline_secs = 1;
-        let result = run(config).await.unwrap();
+        let result = run(config, None).await.unwrap();
         assert_eq!(result.status, "deadline");
         let pid = std::fs::read_to_string(dir.path().join("workspace/tracked.pid")).unwrap();
         let alive = tokio::process::Command::new("/bin/kill").args(["-0", &pid]).output().await.unwrap();

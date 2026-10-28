@@ -1,0 +1,33 @@
+{
+  "jobs_dir": "crates/remanie-train-harness/eval-results",
+  "n_attempts": 1,
+  "n_concurrent_trials": 1,
+  "retry": {"max_retries": 0},
+  "timeout_multiplier": 1.0,
+  "environment": {"type": "docker", "delete": true},
+  "agents": [
+    {
+      "import_path": "remanie_agent:RemanieAgent",
+      "model_name": "openrouter/x-ai/grok-4.7",
+      "kwargs": {
+        "runtime_dir": "crates/remanie-train-harness/runtime",
+        "max_turns": 100,
+        "max_response_tokens": 32768,
+        "compaction_threshold_tokens": 400000,
+        "compaction_max_tokens": 4096,
+        "sampling_params": {"reasoning": {"effort": "high"}}
+      }
+    }
+  ],
+  "datasets": [
+    {
+      "name": "terminal-bench/terminal-bench-2-1",
+      "ref": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+      "task_names": [
+        "terminal-bench/openssl-selfsigned-cert",
+        "terminal-bench/log-summary-date-ranges",
+        "terminal-bench/cancel-async-tasks"
+      ]
+    }
+  ]
+}

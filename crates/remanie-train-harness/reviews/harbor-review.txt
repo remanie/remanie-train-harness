@@ -1,0 +1,47 @@
+Harbor integration review, 2026-10-27
+
+Scope: the renamed Remanie runner, Linux runtime packaging, Harbor adapter,
+and local Docker evaluation configuration. Expected load is one smoke trial
+at a time, with a disposable environment for each trial. This was not a review
+of every upstream Grok Build crate.
+
+First review findings
+
+1. A provider key in a process's initial environment remained readable through
+   Linux /proc after environment removal. A host-side proxy now keeps the
+   provider key outside the task; the task receives a temporary limited token.
+
+2. Harbor cancellation did not stop docker exec. A timed-out runner could
+   continue writing during verification. The adapter now terminates the runtime
+   session before returning from cancellation. A real outer-timeout fixture
+   verifies that its background process is gone before grading begins.
+
+3. The host parsed task-writable logs without size limits. The adapter now
+   rejects symlinks and nonregular files, caps result and trace sizes, and
+   limits each trace-line read.
+
+Second review
+
+The proxy restricts the upstream endpoint, model, exact tool catalog, configured
+sampling values, output tokens and request count. It rejects parallel requests
+and extra routing/plugin fields. Unit tests exercise those limits.
+
+The reviewer also identified that a task-writable PID file was insufficient
+proof of shutdown. The wrapper now emits its PID and Linux start time before
+model execution. The host captures that identity over Harbor's output callback.
+Cleanup uses only the host-held identity. Missing identity, identity mismatch,
+failed cleanup, or forced termination raises an infrastructure error that
+skips verification and triggers teardown. Actual Docker trials passed both
+timeout cleanup with a forged PID file and skipped verification on missing
+identity. The last implementation and tests were completed by the primary
+agent after the two Astra reviewers hit their account usage limit.
+
+The prompt templates and eight-tool dictionary are byte-identical to the
+previous version. Native tool implementations are unchanged.
+
+Not checked: paid OpenRouter inference, a real Terminal-Bench score, full
+benchmark throughput, or native AMD64 execution. The local Docker backend
+does not enforce a per-task disk quota.
+
+Verdict: Ready for the credential-dependent live smoke run. No unresolved
+findings in the reviewed scope. This is not a benchmark result.

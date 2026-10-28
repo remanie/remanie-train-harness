@@ -1,0 +1,17 @@
+schema_version = "1.4"
+
+[metadata]
+name = "remanie-harbor-integration-fixture"
+description = "Scripted local integration check; not a benchmark result."
+
+[agent]
+timeout_sec = 60
+
+[verifier]
+timeout_sec = 15
+environment_mode = "shared"
+
+[environment]
+docker_image = "alexgshaw/openssl-selfsigned-cert:20251031"
+cpus = 2
+memory_mb = 2048

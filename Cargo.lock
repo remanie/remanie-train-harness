@@ -8813,6 +8813,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
 
 [[package]]
+name = "remanie-train-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jsonschema",
+ "minijinja",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wiremock",
+ "xai-grok-compaction",
+ "xai-grok-extra-ca",
+ "xai-grok-tools",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9023,24 +9041,6 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rl-harness"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "jsonschema",
- "minijinja",
- "reqwest 0.12.24",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "wiremock",
- "xai-grok-compaction",
- "xai-grok-extra-ca",
- "xai-grok-tools",
 ]
 
 [[package]]

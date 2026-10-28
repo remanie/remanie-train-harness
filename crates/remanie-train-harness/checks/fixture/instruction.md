@@ -1,0 +1,1 @@
+Create result.txt containing "after" followed by a newline. Exercise the available file, search, todo, and terminal tools. Preserve the todo and background task across compaction, then finish the todo and stop the background task. This is a local integration fixture, not a benchmark task.

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use xai_grok_compaction::format_compact_summary;
@@ -28,12 +29,16 @@ const SAMPLING_FIELDS: &[&str] = &[
     "stop_token_ids",
     "skip_special_tokens",
     "no_stop_trim",
+    "reasoning",
+    "reasoning_effort",
 ];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub base_url: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     pub model: String,
     pub user_query: String,
     pub workspace: PathBuf,
@@ -86,6 +91,17 @@ impl Config {
             url.path().trim_end_matches('/').ends_with("/v1"),
             "base_url must end with /v1"
         );
+        if let Some(name) = &self.api_key_env {
+            ensure!(
+                !name.is_empty()
+                    && name.bytes().enumerate().all(|(i, byte)| {
+                        byte == b'_'
+                            || byte.is_ascii_alphabetic()
+                            || (i > 0 && byte.is_ascii_digit())
+                    }),
+                "api_key_env must be an environment variable name"
+            );
+        }
         ensure!(
             !self.model.trim().is_empty() && !self.user_query.trim().is_empty(),
             "model and user_query are required"
@@ -175,6 +191,7 @@ impl Trace {
 
 struct ModelClient<'a> {
     config: &'a Config,
+    authorization: Option<&'a HeaderValue>,
     http: reqwest::Client,
     definitions: Vec<Value>,
     trace: &'a Trace,
@@ -214,14 +231,15 @@ impl ModelClient<'_> {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let mut response = self
+        let mut request = self
             .http
             .post(url)
             .header("Content-Type", "application/json")
-            .body(payload)
-            .send()
-            .await
-            .context("model request failed")?;
+            .body(payload);
+        if let Some(authorization) = self.authorization {
+            request = request.header(AUTHORIZATION, authorization);
+        }
+        let mut response = request.send().await.context("model request failed")?;
         ensure!(
             response.status().is_success(),
             "model endpoint returned HTTP {}",
@@ -305,7 +323,7 @@ fn valid_message_shape(message: &Value) -> bool {
             .is_none_or(|content| content.is_null() || content.is_string())
 }
 
-pub async fn run(config: Config) -> Result<RunResult> {
+pub async fn run(config: Config, authorization: Option<HeaderValue>) -> Result<RunResult> {
     config.validate()?;
     std::fs::create_dir(&config.session_dir)
         .context("session_dir must be new and its parent must exist")?;
@@ -317,7 +335,7 @@ pub async fn run(config: Config) -> Result<RunResult> {
     let session = ToolSession::new(config.workspace.clone(), config.session_dir.clone()).await?;
     let mut result = RunResult::stopped("max_turns");
     let outcome = tokio::select! {
-        result = execute(&config, &session, &trace, &mut result) => result,
+        result = execute(&config, authorization.as_ref(), &session, &trace, &mut result) => result,
         _ = tokio::time::sleep(Duration::from_secs(config.deadline_secs)) => { result.status = "deadline".into(); Ok(()) },
         signal = interrupted() => { result.status = "cancelled".into(); signal },
     };
@@ -344,16 +362,19 @@ async fn interrupted() -> Result<()> {
 
 async fn execute(
     config: &Config,
+    authorization: Option<&HeaderValue>,
     session: &ToolSession,
     trace: &Trace,
     result: &mut RunResult,
 ) -> Result<()> {
     let client = ModelClient {
         config,
+        authorization,
         http: xai_grok_extra_ca::build_reqwest_client(|builder| {
             builder
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(120))
+                .connect_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(config.deadline_secs))
         })?,
         definitions: session.definitions().await?,
         trace,

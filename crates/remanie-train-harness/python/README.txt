@@ -31,7 +31,7 @@ model implementation and SGLang tool parser for the policy model you train.
 Set RL_HARNESS_CONFIG to a trusted JSON file, for example:
 
   {
-    "binary": "/opt/grok/rl-harness",
+    "binary": "/opt/remanie/remanie-train-harness",
     "model": "policy",
     "verifier": "company_verifier.grade",
     "verifier_timeout_secs": 60,
@@ -119,7 +119,7 @@ check a policy model's chat-template/tokenizer parity.
 
 Built Rust integration checks
 
-  RL_HARNESS_TEST_BINARY=/absolute/path/to/rl-harness \
+  RL_HARNESS_TEST_BINARY=/absolute/path/to/remanie-train-harness \
     PYTHONPATH=/path/to/miles:/path/to/this/python \
     python3 /path/to/this/python/check_rust_adapter.py -v
 

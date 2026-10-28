@@ -1,0 +1,4 @@
+services:
+  main:
+    platform: linux/amd64
+    working_dir: /app

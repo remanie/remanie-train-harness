@@ -1,17 +1,19 @@
-# Eight-tool RL harness
+# remanie-train-harness
 
-This Rust program runs one coding attempt through a Miles session endpoint. It uses Grok Build's actual tool implementations and compaction helpers. Miles renders the model's chat template, records exact generated tokens and log probabilities, and performs training. A trusted external verifier supplies the reward.
+This Rust program runs one coding attempt against a Chat Completions endpoint. It uses Grok Build's native tools and compaction helper. Harbor can run it inside a benchmark task environment and grade the result. The evaluation configuration selects Grok 4.7 through OpenRouter; it does not require Miles.
+
+See the [Terminal-Bench evaluation guide](harbor/README.md) for setup, the pinned three-task configuration, and validation limits. The existing Miles adapter remains available separately in `python/`.
 
 The supported workload is one sequential agent per disposable sandbox, with many sandboxes running independently. The program does not create a sandbox. Native shell and file tools can access the environment in which the program runs, including absolute paths. The launcher must keep trainer credentials, private tests, and the verifier outside that environment and destroy it after every attempt, including crashes or forced termination.
 
 ## Build and test
 
-Use the repository's Rust 1.94 toolchain and install DotSlash as described in the root README. Debug builds also require `rg` on PATH, or an absolute `RG_BIN_PATH`. Release builds bundle ripgrep. When using the Python adapter, put `rg` on PATH. Run these commands from the repository root:
+Use the repository's Rust 1.94 toolchain and install DotSlash as described in README.upstream.md. Debug builds also require `rg` on PATH, or an absolute `RG_BIN_PATH`. Release builds bundle ripgrep. When using the Python adapter, put `rg` on PATH. Run these commands from the repository root:
 
 ```sh
-cargo build -p rl-harness
-cargo test -p rl-harness
-PYTHONPATH=/path/to/miles:$PWD/crates/rl-harness/python python3 -m unittest discover -s crates/rl-harness/python -p 'test_miles_grok.py' -v
+cargo build -p remanie-train-harness
+cargo test -p remanie-train-harness
+PYTHONPATH=/path/to/miles:$PWD/crates/remanie-train-harness/python python3 -m unittest discover -s crates/remanie-train-harness/python -p 'test_miles_grok.py' -v
 ```
 
 The tests use temporary workspaces and a local fake model endpoint. They run real file and process tools. They do not run an optimizer update or establish model learning quality.
@@ -22,8 +24,9 @@ The executable reads one JSON object from standard input and writes one JSON res
 
 ```json
 {
-  "base_url": "http://miles-session-server:8000/sessions/ATTEMPT/v1",
-  "model": "your-configured-model",
+  "base_url": "https://openrouter.ai/api/v1",
+  "model": "x-ai/grok-4.7",
+  "api_key_env": "OPENROUTER_API_KEY",
   "user_query": "Fix the failing tests in this repository.",
   "workspace": "/workspace/task",
   "session_dir": "/attempts/unique-attempt",
@@ -36,7 +39,9 @@ The executable reads one JSON object from standard input and writes one JSON res
 }
 ```
 
-Use the actual session URL supplied by Miles through its `openai_session_url` helper. The URL above only illustrates the shape. The Python adapter calls that helper. It rejects unexpected request fields rather than silently changing the sampling policy.
+For a direct run, `api_key_env` names the environment variable containing the bearer credential. It is optional for endpoints that need no authentication. The key is excluded from request JSON and traces, but environment removal is not an operating-system security boundary. The Harbor adapter keeps the provider key on the host and gives the task a temporary, limited proxy credential.
+
+The endpoint supplies the model chat template and tool parser. The runner rejects unexpected configuration fields. `sampling_params` accepts `reasoning` and `reasoning_effort` as well as its existing sampling fields.
 
 `user_query` is raw task text. The program wraps it once with the stored template. The system prompt is exactly:
 
@@ -52,17 +57,17 @@ This first training path supports text results. The native `read_file` implement
 
 ## Compaction and training records
 
-Set a positive `compaction_threshold_tokens` to enable automatic compaction. Zero disables it. Use Miles' experimental v2 session implementation when compaction is enabled. Its linear v1 implementation cannot preserve arbitrary replacement histories for training.
+Set a positive `compaction_threshold_tokens` to enable automatic compaction. Zero disables it. Compaction works with the evaluation endpoint directly. If training through Miles later, use its experimental v2 session implementation; v1 cannot preserve arbitrary replacement histories for training.
 
 The trigger starts with the model endpoint's `usage.total_tokens`. It adds the serialized bytes of new tool results and a response-token reserve. Byte counts deliberately overestimate tokens for common byte-based tokenizers, but this is not an exact count for every chat template. Set the threshold below the model's context limit with room for tool results and the summary request. A server context overflow ends the attempt with an error. The program never silently discards old messages to force a request to fit.
 
-Compaction makes one summary request through the same Miles session, model, and sampling settings. It accepts a finished, nonempty text summary, cleans it with Grok's helper, then starts a new conversation containing the original system prompt, original task, summary, and a snapshot of todo items and background task metadata. The tool executor stays alive. A malformed, empty, or truncated policy summary ends the attempt as a gradable `invalid_response` without replacing the old context. Transport and server failures remain ungraded errors. A short valid summary is accepted. Automatic retries are disabled because retries affect the training trajectory.
+Compaction makes one summary request through the same endpoint, model, and sampling settings. It accepts a finished, nonempty text summary, cleans it with Grok's helper, then starts a new conversation containing the original system prompt, original task, summary, and a snapshot of todo items and background task metadata. The tool executor stays alive. A malformed, empty, or truncated policy summary ends the attempt as a gradable `invalid_response` without replacing the old context. Transport and server failures remain ungraded errors. A short valid summary is accepted. Automatic retries are disabled because retries affect the training trajectory.
 
 The summary generation is intentionally a training target under the attempt's final reward. Its later copy is prompt context. Miles v2 retains earlier segments and masks shared generated prefixes so they are not trained twice. This behavior still needs validation with the selected model's tokenizer and parser before a real training run.
 
 The local `trace.jsonl` records exact request and response JSON, tool results, compacted contexts, and the outcome. It is an execution journal. Miles owns the authoritative token IDs, log probabilities, and loss masks. Export those records through Miles when retaining a training dataset.
 
-Each request and response is limited to 16 MiB, each native process log to 16 MiB, and the local journal to 256 MiB. Each model request has a two-minute timeout. The attempt deadline defaults to ten minutes. `max_turns` is at most 512 to fit Miles v2's 1024-node limit even when each turn triggers compaction. The outer sandbox must also enforce CPU, memory, disk, process, and network limits.
+Each request and response is limited to 16 MiB, each native process log to 16 MiB, and the local journal to 256 MiB. The connection timeout is 30 seconds. Model requests share the attempt deadline, which defaults to ten minutes for direct runs. The Harbor adapter leaves the task deadline to Harbor. `max_turns` is at most 512 to fit Miles v2's 1024-node limit even when each turn triggers compaction. The outer sandbox must also enforce CPU, memory, disk, process, and network limits.
 
 ## Miles adapter and grading
 
@@ -70,7 +75,7 @@ See `python/README.txt` for the trusted adapter configuration. Use `miles_grok.g
 
 The result includes `status`, `final_answer`, `turns`, and `compactions`, with `error` on infrastructure failure. `completed`, `max_turns`, `max_tokens`, `invalid_response`, and `deadline` can be graded. `error` and `cancelled` are not assigned fabricated rewards. The reward hook fails the batch on an ungraded attempt.
 
-The adapter requires an already-provisioned, unique workspace and a fresh session path for every sample. Repeated samples cannot share a fixed dataset workspace. Connecting an actual Harbor or GKE provisioner remains separate deployment work. Normal exits and signals clean up native process groups; sandbox deletion is still required after a crash or SIGKILL.
+The adapter requires an already-provisioned, unique workspace and a fresh session path for every sample. Repeated samples cannot share a fixed dataset workspace. This local Miles adapter does not use the separate Harbor evaluation adapter. Connecting training to a provisioner remains separate work. Normal exits and signals clean up native process groups; sandbox deletion is still required after a crash or SIGKILL.
 
 ## Source and scope
 
@@ -78,4 +83,4 @@ This checkout starts from Grok Build commit `2bdd1d6a6369de0e8c68132ea4539e9abd9
 
 The Miles adapter was checked against the PoC pin `203a8d279d80dc7d8d4691f442dc7fd6d6f64e2e` and the local v0.1.3 tag. The relevant agent wrapper and session sources match between those revisions. Upstream license and third-party notices remain in this checkout.
 
-The two review cycles and final test results are recorded in `reviews/`. Start with `reviews/validation.txt`.
+The two review cycles and final test results are recorded in `reviews/`. The original runner results are in `reviews/validation.txt`. The rename and Harbor results are in `reviews/harbor-validation.txt`.
