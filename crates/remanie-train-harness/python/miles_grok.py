@@ -1,5 +1,3 @@
-"""Miles agent and reward hooks for the Rust coding rollout process."""
-
 from __future__ import annotations
 
 import asyncio
@@ -67,7 +65,7 @@ async def _stop(proc):
 
 
 async def run(base_url, prompt, request_kwargs=None, metadata=None, **kwargs):
-    """Run one already-provisioned attempt and grade it with trusted Python code."""
+    """The caller provisions the attempt and supplies trusted verifier code."""
     phase = "runner_error"
     result = None
     try:
@@ -149,7 +147,7 @@ async def run(base_url, prompt, request_kwargs=None, metadata=None, **kwargs):
 
 
 async def reward(args, samples, **kwargs):
-    """Fail the rollout batch on runner/grader errors instead of inventing a reward."""
+    """Runner or grader errors must abort the batch."""
     def extract(sample):
         outcome = sample.metadata.get("rl_harness", {})
         if outcome.get("status") != "graded":

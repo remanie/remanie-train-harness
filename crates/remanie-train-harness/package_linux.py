@@ -1,5 +1,3 @@
-"""Package a locally built Linux executable for Harbor's task environments."""
-
 import hashlib
 import json
 import platform

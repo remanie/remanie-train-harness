@@ -1,5 +1,3 @@
-"""Exercise the built Rust binary through the Miles adapter and a local model fixture."""
-
 import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json

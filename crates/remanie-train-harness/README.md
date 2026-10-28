@@ -83,4 +83,4 @@ This checkout starts from Grok Build commit `2bdd1d6a6369de0e8c68132ea4539e9abd9
 
 The Miles adapter was checked against the PoC pin `203a8d279d80dc7d8d4691f442dc7fd6d6f64e2e` and the local v0.1.3 tag. The relevant agent wrapper and session sources match between those revisions. Upstream license and third-party notices remain in this checkout.
 
-The two review cycles and final test results are recorded in `reviews/`. The original runner results are in `reviews/validation.txt`. The rename and Harbor results are in `reviews/harbor-validation.txt`.
+The two review cycles and test results are recorded in `reviews/`. The original runner results are in `reviews/validation.txt`. The rename and Harbor checks are in `reviews/harbor-validation.txt`. The [live Grok 4.7 smoke report](reviews/terminal-bench-2.1-smoke-2026-10-27.txt) records two initial passes, one HTTP 502 interruption, and a passing fresh retry.

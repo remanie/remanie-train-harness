@@ -634,7 +634,7 @@ impl LocalTerminalActor {
             output_file_cap,
             tick_interval,
         } = settings;
-        // Do not probe host rc files when the caller requests no capture and no inherited environment.
+        // An empty cache prevents later shell initialization from probing host rc files.
         #[cfg(unix)]
         let login_env = (!login_shell_capture
             && shell_env_policy.as_ref().is_some_and(|policy| {

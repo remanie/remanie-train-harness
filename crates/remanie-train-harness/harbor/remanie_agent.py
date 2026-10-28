@@ -1,5 +1,3 @@
-"""Harbor 0.25 adapter for the prebuilt Remanie Rust harness."""
-
 import asyncio
 import json
 import math

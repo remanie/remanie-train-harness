@@ -475,7 +475,7 @@ async fn execute(
             trace.record("tool_result", &tool_message)?;
             messages.push(tool_message);
         }
-        // shortcut: new tool bytes estimate tokens; reserve context headroom until the endpoint exposes prompt counting.
+        // shortcut: new tool bytes estimate tokens until the endpoint supports prompt counting.
         let used = response["usage"]["total_tokens"].as_u64();
         if config.compaction_threshold_tokens > 0 && used.is_none() {
             bail!("compaction requires usage.total_tokens from the model endpoint");

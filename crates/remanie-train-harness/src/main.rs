@@ -18,7 +18,7 @@ fn bearer_header(key: &str) -> Result<HeaderValue> {
 }
 
 fn main() -> ExitCode {
-    // The terminal reads these process-wide limits before any worker threads start.
+    // Set process-wide limits before starting threads.
     unsafe {
         std::env::set_var("GROK_MAX_WAIT_BLOCK_MS", "300000");
         std::env::set_var("GROK_MAX_OUTPUT_FILE_BYTES", "16777216");

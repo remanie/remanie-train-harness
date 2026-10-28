@@ -1,4 +1,4 @@
-"""Local adapter checks. Put a Miles checkout on PYTHONPATH; no GPU is needed."""
+"""Put a Miles checkout on PYTHONPATH; no GPU is needed."""
 
 import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
