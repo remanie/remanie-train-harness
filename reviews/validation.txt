@@ -1,0 +1,93 @@
+Standalone extraction validation, 2026-10-27 America/Los_Angeles
+
+The repository now contains one Rust package. It keeps the eight agreed tool
+contracts, prompt assets, rollout loop, compaction, bounded execution traces,
+Linux runtime packaging and Harbor adapter. It removes the production app,
+tool registry, remote integrations, cloud clients, protocol generation, media
+renderers, unused tools and Miles adapter. No xAI crate remains in Cargo.lock.
+
+Size comparison against af383ca3838bf43dbb46988dbe8f8839842ad318
+
+Before: 108 local workspace packages, 4,529 tracked files, 81,982,953 bytes,
+3,694 Rust files and 2,005,981 Rust lines.
+After: one local package, about 0.66 MB of source, documentation and notices,
+11 Rust files and about 4,500 Rust lines including tests. The normal/build
+union for Linux and macOS contains 151 external dependencies. All direct
+runtime dependencies have callers. Generated license notices account for
+about 0.34 MB of the source tree.
+
+These are working-tree/source counts. Git history retains the upstream source
+and earlier implementation. The Linux ARM64 release executable is 9,505,432
+bytes; its bundle, including ripgrep, loader, shared libraries and licenses,
+is 17,073,048 bytes. The predecessor was a development build, so its binary
+size is not used as a like-for-like performance comparison.
+
+Checks passed
+
+- 45 Rust tests on macOS ARM64 and 45 on Linux ARM64.
+- macOS Clippy on all crate targets with warnings denied; formatting check.
+- Linux release build and Debian runtime packaging.
+- 12 Harbor adapter/proxy tests, Python compilation, and git diff --check.
+- Offline license regeneration check and missing-license regression test.
+- All five prompt/catalog assets match af383ca3 byte-for-byte.
+- Linux PDF integration exercises actual pdfinfo/pdftotext page selection.
+  That optional check returns early on hosts without both utilities.
+- Shell tests verify explicit kill, shutdown and drop stop both leader and
+  child, plus bounded output, safe log paths, clean environments and waits.
+- File tests cover edit expansion bounds, atomic replacement, target-change
+  detection, symlink and permission preservation, FIFO rejection, read limits,
+  Unicode, CRLF, grep flags, directory summaries and todo merging.
+
+Real Harbor/Docker fixtures against the packaged executable
+
+1. Completed: all eight tools, one compaction, retained todo and background
+   state, edited file and process cleanup. Verifier reward 1.
+2. Outer timeout: eight-second Harbor deadline cancels the runner; its managed
+   process is gone before verification. A forged PID file is ignored.
+   Verifier reward 1 confirms cleanup, not task-solving performance.
+3. Missing host process identity: RuntimeError skips verification and the
+   environment is destroyed. No reward is assigned.
+
+No paid model calls ran for these checks. No fixture containers remained.
+
+Reviews and fixes
+
+Three GPT 6.1 Sol agents at extra-high effort divided terminal extraction,
+file-tool extraction, and dependency/deletion analysis. Implementation checks
+were followed by independent cross-reviews and a full standalone-path audit.
+
+The reviews led to preallocation limits for expanding edits, synchronous
+atomic file replacement, a compaction fix that preserves non-numbered text
+around quoted analysis tags, direct descendant-cleanup tests, and required
+license coverage for every packaged executable/shared library. The final
+review reported no unresolved blocking finding in this scope.
+
+Intentional scope changes
+
+Linux/macOS Bash only; no Windows or host-shell discovery. No production-only
+pkill/pgrep policy, skill reminders, remote registry or corporate CA bundle
+handling. HTTPS uses reqwest's standard certificate validation. Text and PDF
+text reads remain; PDF text needs optional Poppler utilities in the task.
+PPTX extraction, image output and rendering are absent. Tool schemas and prompt
+copy remain unchanged, but the extracted handlers are not claimed to produce
+byte-identical outputs for every upstream edge case.
+
+Evidence
+
+Logs under /Users/p/.codex/artifacts/grok-rl-build-tools/:
+  lean-baseline.json
+  lean-after.json
+  lean-macos-tests.log
+  lean-clippy.log
+  lean-linux-build.log
+  lean-harbor-unit.log
+  lean-harbor-final.log
+  lean-harbor-final/summary.json
+
+The earlier live Grok 4.7 result is retained separately in
+terminal-bench-2.1-smoke-2026-10-27.txt and applies to revision 30964012 only.
+
+Not checked: a paid model evaluation on this extracted revision, the full
+Terminal-Bench suite, native AMD64 execution, optimizer updates or production
+sandbox enforcement. Harbor's local Docker backend still has no per-task disk
+quota. Sandbox destruction remains required after crashes or forced exits.

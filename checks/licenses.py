@@ -1,0 +1,160 @@
+"""Rebuild notices for the locked Linux/macOS normal and build dependencies."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TARGETS = (
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+)
+SIMD_REV = "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+SIMD_LICENSE_URL = f"https://raw.githubusercontent.com/Nugine/simd/{SIMD_REV}/LICENSE"
+# These published packages omit the repository's license file.
+SIMD_PACKAGES = {("uuid-simd", "0.8.0"), ("vsimd", "0.8.0")}
+SIMD_LICENSE = """MIT License
+
+Copyright (c) 2021 Nugine
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+
+def cargo(*arguments):
+    result = subprocess.run(
+        [os.environ.get("CARGO", "cargo"), *arguments, "--offline", "--locked"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise ValueError(f"Cargo could not inspect the local cache:\n{result.stderr.strip()}")
+    return result.stdout
+
+
+def dependencies():
+    packages = {}
+    for target in TARGETS:
+        metadata = json.loads(cargo(
+            "metadata", "--format-version", "1", "--filter-platform", target,
+        ))
+        # Metadata unifies dev features and can include unused optional edges.
+        tree = cargo("tree", "--target", target, "--edges", "normal,build", "--prefix", "none")
+        wanted = {tuple(match.groups()) for line in tree.splitlines()
+                  if (match := re.match(r"^(\S+) v(\S+)", line))}
+        matched = set()
+        for package in metadata["packages"]:
+            key = (package["name"], package["version"])
+            if key not in wanted:
+                continue
+            if key in matched:
+                raise ValueError(f"Ambiguous dependency source for {key}")
+            matched.add(key)
+            if package["source"] is not None:
+                packages[key] = package
+        if not wanted or matched != wanted:
+            raise ValueError(f"Incomplete dependency inventory for {target}: {wanted - matched}")
+    if not packages:
+        raise ValueError("The locked dependency inventory is empty")
+    return packages
+
+
+def license_files(package):
+    directory = Path(package["manifest_path"]).parent
+    stems = ("license", "licence", "copying", "notice", "unlicense")
+    paths = {path for path in directory.rglob("*") if path.is_file()
+             and any(part.lower().startswith(stems) for part in path.relative_to(directory).parts)}
+    if package["license_file"]:
+        paths.add(directory / package["license_file"])
+    if paths:
+        return [(path.relative_to(directory).as_posix(), path.read_text()) for path in sorted(paths)]
+    key = (package["name"], package["version"])
+    if key in SIMD_PACKAGES:
+        vcs = json.loads((directory / ".cargo_vcs_info.json").read_text())
+        if vcs["git"]["sha1"] == SIMD_REV:
+            return [(SIMD_LICENSE_URL, SIMD_LICENSE)]
+    raise ValueError(f"Missing license text for {key[0]} {key[1]}; inspect its pinned upstream source")
+
+
+def render(packages):
+    texts = {}
+    entries = []
+    for (name, version), package in sorted(packages.items()):
+        files = []
+        for path, raw in license_files(package):
+            content = raw.strip() + "\n"
+            if not raw.strip():
+                raise ValueError(f"Empty license text: {name} {version} {path}")
+            identifier = texts.setdefault(content, f"L{len(texts) + 1:03}")
+            files.append(f"  {path}: {identifier}")
+        entries.append("\n".join([
+            f"{name} {version}", f"Source: {package['source']}",
+            f"Repository: {package['repository'] or 'not declared'}",
+            f"Declared license: {package['license'] or 'see license file'}", *files,
+        ]))
+    return "\n".join([
+        "THIRD-PARTY NOTICES",
+        "Generated by checks/licenses.py from locked normal/build dependency graphs.",
+        "Development dependencies and unused target packages are excluded.",
+        "Targets: " + ", ".join(TARGETS),
+        f"Packages: {len(packages)}; distinct license/notice texts: {len(texts)}.",
+        "The original package license and notice texts follow; identical texts are shared.",
+        "", "PACKAGE ATTRIBUTION", "", "\n\n".join(entries),
+        "", "LICENSE AND NOTICE TEXTS", "",
+        "\n".join(f"===== {identifier} =====\n\n{content}" for content, identifier in texts.items()),
+    ])
+
+
+class InventoryTests(unittest.TestCase):
+    def test_uncovered_package_fails_instead_of_omitting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = {
+                "manifest_path": str(Path(directory) / "Cargo.toml"),
+                "name": "uncovered", "version": "1.0.0", "license_file": None,
+            }
+            with self.assertRaisesRegex(ValueError, "Missing license text for uncovered 1.0.0"):
+                license_files(package)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="fail if committed notices differ")
+    args = parser.parse_args()
+    try:
+        packages = dependencies()
+        content = render(packages)
+        destination = ROOT / "THIRD-PARTY-NOTICES"
+        if args.check:
+            if not destination.is_file() or destination.read_text() != content:
+                raise ValueError("THIRD-PARTY-NOTICES is stale; run python3 checks/licenses.py")
+        else:
+            destination.write_text(content)
+        print(f"{'Checked' if args.check else 'Wrote'} notices for {len(packages)} dependencies")
+    except (ValueError, OSError, KeyError) as error:
+        parser.exit(1, f"License inventory failed: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

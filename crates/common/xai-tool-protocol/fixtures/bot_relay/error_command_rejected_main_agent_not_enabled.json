@@ -1,9 +1,0 @@
-{
-  "code": "command_rejected",
-  "retryable": false,
-  "detail": {
-    "upstream": "status=400 connect=invalid_argument",
-    "upstreamMessage": "Main bot is not enabled."
-  },
-  "reason": "main_agent_not_enabled"
-}

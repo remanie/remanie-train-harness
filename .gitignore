@@ -1,3 +1,6 @@
-/target
-**/*.rs.bk
+/target/
+/runtime/
+/eval-results/
+/.venv/
+**/__pycache__/
 .DS_Store

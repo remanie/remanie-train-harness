@@ -1,1 +1,0 @@
-error: Uncaught (in promise) PermissionDenied: Requires read access to "/opt/ws-fixture/homedir/projects/other/x.json", run again with the --allow-read flag (deno sandbox)
