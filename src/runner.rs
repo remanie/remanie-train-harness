@@ -130,7 +130,7 @@ async fn attempt(
     let outcome = stopped.unwrap_or_else(|| Outcome::Deadline {
         request_in_flight: cx.model.in_flight(),
     });
-    if outcome.keeps_background_tasks() {
+    if outcome.gradable() {
         tally.background_tasks_left_running = tools.detach();
     } else {
         tools.kill_all().await;

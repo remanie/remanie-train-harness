@@ -94,10 +94,6 @@ impl Outcome {
             EXIT_INFRASTRUCTURE
         }
     }
-
-    pub fn keeps_background_tasks(&self) -> bool {
-        self.gradable()
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -337,15 +333,6 @@ mod tests {
             })
             .collect();
         assert_eq!(produced, listed);
-    }
-
-    #[test]
-    fn gradable_outcomes_exit_zero_and_keep_background_tasks() {
-        for outcome in every_outcome() {
-            let infrastructure = matches!(outcome, Outcome::Infrastructure(_));
-            assert_eq!(outcome.exit_code(), if infrastructure { 70 } else { 0 });
-            assert_eq!(outcome.keeps_background_tasks(), !infrastructure);
-        }
     }
 
     #[test]
