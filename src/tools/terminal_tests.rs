@@ -357,7 +357,7 @@ async fn kill_all_reaches_descendants_that_left_the_session() {
     run(
         &terminal,
         "(setsid sh -c 'printf %s $$ > forked.pid; exec sleep 913' &)",
-        5000,
+        0,
     )
     .await;
     let pids = [
