@@ -1,6 +1,6 @@
 {
   "run_terminal_cmd": {
-    "description": "Run a bash command and return its output.\n\nOutput over 20000 bytes is shortened to its start and end, a command ending in an unwaited & needs block_until_ms=0, and background commands keep running after your final answer.",
+    "description": "Run a bash command and return its output.\n\nOutput over 20000 bytes is shortened to its start and end. To run a command in the background, pass block_until_ms=0 instead of using &. Background commands keep running after your final answer.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -28,7 +28,7 @@
     }
   },
   "get_terminal_command_output": {
-    "description": "Get output and status from a background task, monitor, or subagent.\n\nOutput over 40000 bytes is shortened to its start and end.",
+    "description": "Get output and status from a background terminal command.\n\nOutput over 40000 bytes is shortened to its start and end.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -57,7 +57,7 @@
     }
   },
   "kill_terminal_command": {
-    "description": "Terminate a running background task, monitor, or subagent.\n\nThe command and every process in its session get SIGTERM, then SIGKILL after one second.",
+    "description": "Terminate a running background terminal command.\n\nThe command and every process in its session get SIGTERM, then SIGKILL after one second.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -74,7 +74,7 @@
     }
   },
   "read_file": {
-    "description": "Read a file.\n\nAt most 1000 lines are returned per call, and the output then ends with the offset to continue from.",
+    "description": "Read a file.\n\nA call returns at most 1000 lines. When a 1000-line call leaves lines unread, the output ends with the offset to continue from.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -113,7 +113,7 @@
     }
   },
   "search_replace": {
-    "description": "Replace an exact string in a file.\n\n- `read_file` prefixes each line with \"LINE_NUMBER→\". That prefix is not part of the file: match only what comes after the →, with its exact indentation.\n- `old_string` must match exactly one place in the file. If it appears more than once, add surrounding lines to make it unique, or set `replace_all` to change every occurrence (handy for renaming an identifier).\n- To create a new file, set `old_string` to an empty string.\n\nOnly UTF-8 files up to 50 MB can be edited.",
+    "description": "Replace an exact string in a file.\n\n- `read_file` prefixes each line with \"LINE_NUMBER→\". That prefix is not part of the file: match only what comes after the →, with its exact indentation.\n- `old_string` must match exactly one place in the file. If it appears more than once, add surrounding lines to make it unique, or set `replace_all` to change every occurrence (handy for renaming an identifier).\n- To create a new file, set `old_string` to an empty string.\n\nThe tool edits only UTF-8 files up to 50 MB.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -160,7 +160,7 @@
     }
   },
   "grep": {
-    "description": "Search file contents with regular expressions (ripgrep).\n\n- Full regex syntax, so escape literal special characters: `functionCall\\(`, or `interface\\{\\}` to find interface{} in Go.\n- Pass pattern as a raw regex string — no surrounding quotes.\n- Respects .gitignore unless you pass a broad glob like '--glob *'.\n- Only filter by 'type' or 'glob' when you are sure of the file type; import paths may not match source file types (.js vs .ts).\n- Output is ripgrep-style: ':' marks match lines, '-' marks context lines, grouped by file. Large results are capped and report \"at least\" counts.\n\nhead_limit defaults to 200 lines and cannot exceed 2000, and files over 5 MB are skipped.",
+    "description": "Search file contents with regular expressions (ripgrep).\n\n- Full regex syntax, so escape literal special characters: `functionCall\\(`, or `interface\\{\\}` to find interface{} in Go.\n- Pass pattern as a raw regex string — no surrounding quotes.\n- Respects .gitignore unless you pass a broad glob like '--glob *'.\n- Only filter by 'type' or 'glob' when you are sure of the file type; import paths may not match source file types (.js vs .ts).\n- Output is ripgrep-style: ':' marks match lines, '-' marks context lines, grouped by file. Large results are capped.\n\nhead_limit defaults to 200 lines and cannot exceed 2000. The search skips files over 5 MB.",
     "parameters": {
       "type": "object",
       "properties": {

@@ -190,7 +190,7 @@ async fn reads_bound_the_returned_window_and_reject_non_text() {
     assert_eq!(window.lines().count(), MAX_LINES);
     assert_eq!(
         marker,
-        "[lines 1-1000 shown; file continues, use offset=1001]"
+        "[lines 1-1000 shown. The file continues at offset=1001.]"
     );
     let crlf = format!(
         "{}\r\n{}",
@@ -900,7 +900,7 @@ async fn a_full_window_says_where_the_file_continues() {
         .await
         .unwrap();
     assert!(
-        first.contains("1000→line 1000\n[lines 1-1000 shown; file continues, use offset=1001]")
+        first.contains("1000→line 1000\n[lines 1-1000 shown. The file continues at offset=1001.]")
     );
     let rest = tools
         .call(

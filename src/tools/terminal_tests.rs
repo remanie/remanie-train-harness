@@ -141,6 +141,35 @@ async fn foreground_comments_and_arithmetic_run_without_background_errors() {
 }
 
 #[tokio::test]
+async fn background_commands_use_block_until_ms_zero_and_never_an_ampersand() {
+    let (dir, terminal) = fixture().await;
+    for block in [0, 1000] {
+        let error = terminal.run(&args("sleep 30 &", block)).await.unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "To run a command in the background, pass block_until_ms=0 instead of using &."
+            ),
+            "{error}"
+        );
+    }
+    let (started, id) = run(&terminal, "printf '%s' $$ > server.pid; exec sleep 30", 0).await;
+    assert!(started.contains("<status>running</status>"));
+    let pid = read_pid(&dir.path().join("server.pid")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the background command died"
+    );
+    assert!(
+        output(&terminal, &[id], 0)
+            .await
+            .contains("Status: running")
+    );
+    terminal.kill_all().await;
+}
+
+#[tokio::test]
 async fn commands_inherit_the_runner_environment() {
     let (_dir, terminal) = fixture().await;
     let (output, _) = run(
@@ -179,7 +208,7 @@ async fn previews_and_polls_mark_where_they_cut_the_log() {
 }
 
 #[tokio::test]
-async fn output_past_the_log_cap_runs_to_completion() {
+async fn the_log_keeps_every_byte_and_the_reply_shows_its_ends() {
     let (_dir, terminal) = fixture().await;
     let (output, id) = run(
         &terminal,
@@ -188,18 +217,11 @@ async fn output_past_the_log_cap_runs_to_completion() {
     )
     .await;
     assert!(output.starts_with("Exit code: 0"), "{}", &output[..100]);
-    assert!(
-        output.contains("finished\n```"),
-        "{}",
-        &output[output.len() - 400..]
-    );
+    assert!(output.len() < PREVIEW_BYTES + 1500);
+    assert!(output.contains(TRUNCATED) && output.contains("finished\n```"));
     let log = std::fs::read(terminal.log_dir.join(format!("{id}.log"))).unwrap();
-    assert!(log.len() as u64 <= MAX_LOG_BYTES, "{}", log.len());
-    assert!(
-        log.windows(TRUNCATED.len())
-            .any(|window| window == TRUNCATED.as_bytes())
-    );
-    assert!(log.ends_with(b"finished"));
+    assert_eq!(log.len(), 17_000_008);
+    assert!(log.ends_with(b"xfinished"));
     terminal.kill_all().await;
 }
 
@@ -375,7 +397,7 @@ fn kill_all_reaches_descendants_that_left_the_session() {
         .await;
         run(
             &terminal,
-            "(setsid sh -c 'printf %s $$ > forked.pid; exec sleep 913' &); sleep 0.2",
+            "sh -c \"(setsid sh -c 'printf %s \\$\\$ > forked.pid; exec sleep 913' &)\"; sleep 0.2",
             0,
         )
         .await;

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -41,13 +42,28 @@ struct Compaction {
     max_tokens: u64,
 }
 
-pub async fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> RunResult {
+pub fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> RunResult {
     let started = std::time::Instant::now();
     let mut tally = Tally::default();
     let mut session_dir = None;
     let mut trace = None;
-    let outcome = attempt(stdin, take_key, &mut session_dir, &mut trace, &mut tally)
-        .await
+    let outcome = parse_input(stdin, &mut session_dir)
+        .and_then(|(raw, input)| {
+            let authorization = input
+                .api_key_env
+                .as_deref()
+                .map(|name| authorization(take_key(name), name))
+                .transpose()?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| internal(format!("start runtime: {error}")))?;
+            let outcome =
+                runtime.block_on(attempt(&raw, &input, authorization, &mut trace, &mut tally));
+            // A tool thread stuck in a blocking call, such as opening a FIFO, must not delay the exit.
+            runtime.shutdown_background();
+            outcome
+        })
         .unwrap_or_else(Outcome::Infrastructure);
     let truncated = trace.as_ref().is_some_and(Trace::truncated);
     let mut result = RunResult::new(outcome, tally, truncated, started.elapsed());
@@ -66,17 +82,12 @@ pub async fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) 
 }
 
 async fn attempt(
-    stdin: &[u8],
-    take_key: impl FnOnce(&str) -> Option<OsString>,
-    session_dir: &mut Option<PathBuf>,
+    raw: &Value,
+    input: &Input,
+    authorization: Option<HeaderValue>,
     trace: &mut Option<Trace>,
     tally: &mut Tally,
 ) -> Result<Outcome, Cause> {
-    let (raw, input) = parse_input(stdin, session_dir)?;
-    let authorization = match &input.api_key_env {
-        Some(name) => Some(authorization(take_key(name), name)?),
-        None => None,
-    };
     let url = reqwest::Url::parse(&format!(
         "{}/chat/completions",
         input.base_url.trim_end_matches('/')
@@ -88,17 +99,20 @@ async fn attempt(
         Trace::create(&input.session_dir, MAX_TRACE_BYTES)
             .map_err(|error| internal(format!("create trace.jsonl: {error}")))?,
     );
-    let tools = ToolSession::new(input.workspace.clone(), input.session_dir.join("terminal"))
-        .await
-        .map_err(|error| Cause::ToolRuntime {
-            tool: "session".into(),
-            detail: format!("{error:#}"),
-        })?;
+    let tools = ToolSession::new(
+        input.workspace.clone(),
+        std::env::temp_dir().join("remanie-terminal"),
+    )
+    .await
+    .map_err(|error| Cause::ToolRuntime {
+        tool: "session".into(),
+        detail: format!("{error:#}"),
+    })?;
     let definitions = tools.definitions();
-    trace.header(&raw, &definitions);
+    trace.header(raw, &definitions);
     let deadline = Instant::now() + Duration::from_secs(input.deadline_secs);
     let mut cx = Attempt {
-        input: &input,
+        input,
         model: ModelClient::new(
             http,
             url,
@@ -127,7 +141,7 @@ async fn attempt(
     let outcome = stopped.unwrap_or_else(|| Outcome::Deadline {
         request_in_flight: cx.model.in_flight(),
     });
-    if outcome.keeps_background_tasks() {
+    if outcome.gradable() {
         tally.background_tasks_left_running = tools.detach();
     } else {
         tools.kill_all().await;
@@ -233,12 +247,22 @@ impl ContextBudget {
     }
 
     fn append(&mut self, message: &Value) {
-        self.appended_bytes += serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64);
+        self.appended_bytes += bytes(message);
+    }
+
+    fn at_most(&mut self, tokens: u64) {
+        if tokens < self.estimate() {
+            self.counted(tokens);
+        }
     }
 
     fn estimate(&self) -> u64 {
         self.counted + self.appended_bytes
     }
+}
+
+fn bytes(message: &Value) -> u64 {
+    serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64)
 }
 
 struct Attempt<'a> {
@@ -254,27 +278,40 @@ struct Attempt<'a> {
 }
 
 async fn execute(cx: &mut Attempt<'_>) -> Outcome {
-    loop {
-        if let Err(outcome) = turn(cx).await {
-            return outcome;
+    let outcome = loop {
+        if let ControlFlow::Break(outcome) = turn(cx).await {
+            break outcome;
         }
+    };
+    match outcome {
+        Outcome::ContextOverflow(overflow) if cx.tally.turns == 0 => {
+            Outcome::Infrastructure(config(format!(
+                "the first request does not fit: {}",
+                serde_json::to_value(&overflow).unwrap_or_default()
+            )))
+        }
+        outcome => outcome,
     }
 }
 
-async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
+fn proceed<T>(result: Result<T, Outcome>) -> ControlFlow<Outcome, T> {
+    result.map_or_else(ControlFlow::Break, ControlFlow::Continue)
+}
+
+async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
     let input = cx.input;
     if cx.tally.turns == input.max_turns {
-        return Err(Outcome::MaxTurns);
+        return ControlFlow::Break(Outcome::MaxTurns);
     }
     if cx.compact_next {
-        compact(cx).await?;
+        proceed(compact(cx).await)?;
         cx.compact_next = false;
     }
     let max_tokens = input.sampling_params.max_tokens();
     if let Some(window) = input.context_window_tokens {
         let estimated = cx.budget.estimate();
         if estimated + max_tokens > window {
-            return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
+            return ControlFlow::Break(Outcome::ContextOverflow(Overflow::ContextWindow {
                 estimated_prompt_tokens: estimated,
                 max_tokens,
                 context_window_tokens: window,
@@ -286,19 +323,20 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         finish,
         usage,
         context_tokens,
-    } = cx
-        .model
-        .sample(
-            Request {
-                kind: CallKind::Turn,
-                turn: cx.tally.turns + 1,
-                prompt: cx.segment.range(),
-                messages: cx.segment.messages(),
-                max_tokens_override: None,
-            },
-            cx.trace,
-        )
-        .await?;
+    } = proceed(
+        cx.model
+            .sample(
+                Request {
+                    kind: CallKind::Turn,
+                    turn: cx.tally.turns + 1,
+                    prompt: cx.segment.range(),
+                    messages: cx.segment.messages(),
+                    max_tokens_override: None,
+                },
+                cx.trace,
+            )
+            .await,
+    )?;
     cx.tally.turns += 1;
     cx.tally.count_response(usage);
     let reply = read_reply(&message);
@@ -306,7 +344,7 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     match context_tokens {
         Some(tokens) => cx.budget.counted(tokens),
         None if input.context_window_tokens.is_some() || input.compaction.is_some() => {
-            return Err(Outcome::Infrastructure(Cause::EndpointResponse {
+            return ControlFlow::Break(Outcome::Infrastructure(Cause::EndpointResponse {
                 detail: "usage.total_tokens is required with compaction or context_window_tokens"
                     .into(),
             }));
@@ -319,40 +357,44 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
                 .ok()
                 .and_then(|reply| reply.content)
                 .unwrap_or_default();
-            return Err(Outcome::MaxTokens);
+            return ControlFlow::Break(Outcome::MaxTokens);
         }
         Finish::Other(finish_reason) => {
-            return Err(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
+            return ControlFlow::Break(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
                 finish_reason,
             }));
         }
-        Finish::Stop | Finish::ToolCalls => reply.map_err(Outcome::InvalidResponse)?,
+        Finish::Stop | Finish::ToolCalls => proceed(reply.map_err(Outcome::InvalidResponse))?,
     };
     if reply.calls.is_empty() {
         if finish == Finish::ToolCalls {
-            return Err(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
+            return ControlFlow::Break(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
                 finish_reason: "tool_calls".into(),
             }));
         }
-        cx.tally.final_answer = [reply.content, reply.refusal]
+        let Some(answer) = [reply.content, reply.refusal]
             .into_iter()
             .flatten()
             .find(|text| !text.trim().is_empty())
-            .ok_or(Outcome::InvalidResponse(Misbehaviour::EmptyTurn))?;
-        return Err(Outcome::Completed);
+        else {
+            return ControlFlow::Break(Outcome::InvalidResponse(Misbehaviour::EmptyTurn));
+        };
+        cx.tally.final_answer = answer;
+        return ControlFlow::Break(Outcome::Completed);
     }
     for call in &reply.calls {
         let started = Instant::now();
-        let output = cx
-            .tools
-            .call(&call.name, &call.arguments)
-            .await
-            .map_err(|error| {
-                Outcome::Infrastructure(Cause::ToolRuntime {
-                    tool: call.name.clone(),
-                    detail: error.0,
-                })
-            })?;
+        let output = proceed(
+            cx.tools
+                .call(&call.name, &call.arguments)
+                .await
+                .map_err(|error| {
+                    Outcome::Infrastructure(Cause::ToolRuntime {
+                        tool: call.name.clone(),
+                        detail: error.0,
+                    })
+                }),
+        )?;
         cx.tally.tool_calls.count(output.error);
         let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
         cx.budget.append(&message);
@@ -368,7 +410,7 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     cx.compact_next = input.compaction.as_ref().is_some_and(|compaction| {
         cx.budget.estimate() + max_tokens.max(compaction.max_tokens) >= compaction.threshold_tokens
     });
-    Ok(())
+    ControlFlow::Continue(())
 }
 
 async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
@@ -416,13 +458,20 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         summary_call: cx.model.calls(),
         kept_messages: kept.len(),
     });
+    let continuation = json!({"role": "user", "content": continuation});
+    let counted = sampled
+        .context_tokens
+        .map(|tokens| tokens + bytes(&continuation));
     let mut messages = cx.initial.clone();
-    messages.push(json!({"role": "user", "content": continuation}));
+    messages.push(continuation);
     messages.extend(kept);
     cx.segment = Segment::new(from + 1, messages, cx.trace);
     cx.budget = ContextBudget::default();
     for message in cx.segment.messages() {
         cx.budget.append(message);
+    }
+    if let Some(tokens) = counted {
+        cx.budget.at_most(tokens);
     }
     cx.tally.compactions += 1;
     Ok(())

@@ -90,7 +90,10 @@ impl Fixture {
 
     async fn launch(&self, key: Option<&str>) -> (Value, u8) {
         let input = serde_json::to_vec(&self.config).unwrap();
-        let result = run(&input, |_| key.map(OsString::from)).await;
+        let key = key.map(OsString::from);
+        let result = tokio::task::spawn_blocking(move || run(&input, |_| key))
+            .await
+            .unwrap();
         let exit = result.outcome.exit_code();
         (serde_json::to_value(&result).unwrap(), exit)
     }
@@ -638,6 +641,64 @@ async fn compaction_keeps_the_last_two_turns_and_the_todo_list_after_the_summary
 }
 
 #[tokio::test]
+async fn after_compaction_the_budget_starts_from_the_endpoint_count_not_bytes() {
+    let read = |id| call(id, "read_file", json!({"target_file": "big.txt"}));
+    let mut f = fixture(vec![
+        tool_reply(vec![read("r1")], 4_900),
+        tool_reply(vec![read("r2")], 12_900),
+        tool_reply(vec![read("r3")], 20_900),
+        reply(
+            json!({"role": "assistant", "content": "<summary>Read big.txt three times.</summary>"}),
+            "stop",
+            21_500,
+        ),
+        final_reply(),
+    ])
+    .await;
+    let lines: String = (0..600)
+        .map(|i| format!("line {i:04} {}\n", "x".repeat(39)))
+        .collect();
+    std::fs::write(f.workspace().join("big.txt"), lines).unwrap();
+    f.config["context_window_tokens"] = json!(60_000);
+    f.config["sampling_params"]["max_tokens"] = json!(1000);
+    f.config["compaction"] = json!({"threshold_tokens": 50_000, "max_tokens": 2048});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+    let requests = f.requests().await;
+    let after = requests.last().unwrap()["messages"].as_array().unwrap();
+    let kept_bytes: usize = after
+        .iter()
+        .map(|message| serde_json::to_vec(message).unwrap().len())
+        .sum();
+    assert!(
+        kept_bytes as u64 + 1000 > 60_000,
+        "the kept turns alone must exceed the window in bytes"
+    );
+}
+
+#[tokio::test]
+async fn after_compaction_the_budget_never_exceeds_the_new_segment_bytes() {
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("first")], 100),
+        tool_reply(vec![list_dir("second")], 57_000),
+        reply(
+            json!({"role": "assistant", "content": "<summary>Listed the workspace twice.</summary>"}),
+            "stop",
+            59_000,
+        ),
+        final_reply(),
+    ])
+    .await;
+    f.config["context_window_tokens"] = json!(60_000);
+    f.config["sampling_params"]["max_tokens"] = json!(1000);
+    f.config["compaction"] = json!({"threshold_tokens": 50_000, "max_tokens": 2048});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+}
+
+#[tokio::test]
 async fn an_unusable_summary_ends_the_attempt_and_keeps_the_transcript() {
     for (summary, finish) in [
         (
@@ -780,6 +841,31 @@ async fn a_full_context_window_ends_the_attempt_before_sending() {
 }
 
 #[tokio::test]
+async fn an_overflow_before_the_first_reply_is_a_config_error() {
+    let mut f = fixture(vec![final_reply()]).await;
+    f.config["context_window_tokens"] = json!(8192);
+    f.config["sampling_params"]["max_tokens"] = json!(16_384);
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "infrastructure", "{result}");
+    assert_eq!(result["cause"]["kind"], "config");
+    assert!(
+        result["cause"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("context_window")
+    );
+    assert!(f.requests().await.is_empty());
+
+    let body =
+        "This model's maximum context length is 8192 tokens. However, you requested 16384 tokens.";
+    let f = fixture(vec![ResponseTemplate::new(400).set_body_string(body)]).await;
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "infrastructure", "{result}");
+    assert_eq!(result["cause"]["kind"], "config");
+    assert!(result["cause"]["detail"].as_str().unwrap().contains(body));
+}
+
+#[tokio::test]
 async fn budgeting_without_usage_is_an_endpoint_fault() {
     let mut f = fixture(vec![
         ResponseTemplate::new(200).set_body_json(json!({
@@ -812,6 +898,7 @@ async fn a_connection_lost_after_send_is_not_retried() {
     f.config["base_url"] = json!(format!("http://{address}/v1"));
     let result = f.run().await;
     assert_eq!(result["cause"]["kind"], "connection_lost");
+    assert_eq!(f.events("endpoint_error")[0]["failure"], "lost");
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
 
@@ -901,6 +988,34 @@ async fn gradable_outcomes_leave_background_processes_running() {
         result["background_tasks_left_running"][0]["task_id"],
         "task-1"
     );
+}
+
+#[tokio::test]
+async fn command_logs_stay_in_the_sandbox_temp_dir_outside_the_session_dir() {
+    let f = fixture(vec![
+        tool_reply(
+            vec![call(
+                "server",
+                "run_terminal_cmd",
+                json!({
+                    "command": "exec sleep 60", "description": "start a server", "block_until_ms": 0
+                }),
+            )],
+            10,
+        ),
+        final_reply(),
+    ])
+    .await;
+    let result = f.run().await;
+    let left = &result["background_tasks_left_running"][0];
+    unsafe { libc::kill(left["pid"].as_i64().unwrap() as i32, libc::SIGKILL) };
+    let log = PathBuf::from(left["output_file"].as_str().unwrap());
+    assert!(
+        log.starts_with(std::env::temp_dir().join("remanie-terminal")),
+        "{log:?}"
+    );
+    assert!(log.exists());
+    assert!(!f.session().join("terminal").exists());
 }
 
 #[tokio::test]

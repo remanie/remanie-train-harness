@@ -1,4 +1,4 @@
-// Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
+// Adapted from Grok Build 2bdd1d6a. NOTICE names the source.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -225,8 +225,8 @@ impl DirNode {
         format!("{indent}{summary}\n")
     }
 }
-// The parallel walker reads a directory's ignore files only after `filter_entry` accepts it;
-// the sequential walker reads them even for a rejected directory.
+// The parallel walker reads a directory's ignore files only after `filter_entry` accepts it.
+// The sequential walker reads them even for a rejected directory.
 fn walk(
     root: &Path,
     min_depth: usize,

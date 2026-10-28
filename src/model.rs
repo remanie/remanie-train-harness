@@ -12,7 +12,6 @@ use crate::trace::{CallKind, Event, MessageRange, Trace};
 
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-const RETRY_ATTEMPTS: u32 = 6;
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(30);
 const CONTEXT_LENGTH_PATTERNS: [&str; 5] = [
@@ -74,12 +73,10 @@ struct Body<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "failure", rename_all = "snake_case")]
 pub enum Failure {
-    Connect {
-        detail: String,
-    },
-    Lost {
-        detail: String,
-    },
+    #[serde(rename = "connect")]
+    NotSent { detail: String },
+    #[serde(rename = "lost")]
+    LostAfterSend { detail: String },
     Status {
         status: u16,
         body_excerpt: String,
@@ -92,21 +89,22 @@ pub enum Failure {
 }
 
 impl Failure {
-    fn retryable(&self) -> Option<Option<Duration>> {
-        match self {
-            Failure::Connect { .. } => Some(None),
+    fn retry_in(&self, attempt: u32, remaining: Duration) -> Option<Duration> {
+        let at_least = match self {
+            Failure::NotSent { .. } => Duration::ZERO,
             Failure::Status {
                 status: 429 | 503,
                 retry_after_ms,
                 ..
-            } => Some(retry_after_ms.map(Duration::from_millis)),
-            _ => None,
-        }
+            } => Duration::from_millis(retry_after_ms.unwrap_or(0)),
+            _ => return None,
+        };
+        Some(backoff(attempt, at_least)).filter(|delay| *delay < remaining)
     }
 
     fn into_outcome(self, attempts: u32) -> Outcome {
         Outcome::Infrastructure(match self {
-            Failure::Connect { detail } => Cause::EndpointUnavailable {
+            Failure::NotSent { detail } => Cause::EndpointUnavailable {
                 attempts,
                 status: None,
                 detail,
@@ -138,7 +136,7 @@ impl Failure {
                 status,
                 body_excerpt,
             },
-            Failure::Lost { detail } => Cause::ConnectionLost { detail },
+            Failure::LostAfterSend { detail } => Cause::LostAfterSend { detail },
             Failure::Response { detail, .. } => Cause::EndpointResponse { detail },
         })
     }
@@ -151,15 +149,12 @@ fn names_context_length(body: &str) -> bool {
         .any(|pattern| body.contains(pattern))
 }
 
-fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
+fn backoff(attempt: u32, at_least: Duration) -> Duration {
     let ceiling = RETRY_BASE
         .saturating_mul(1 << (attempt - 1).min(16))
         .min(RETRY_CAP);
     let unit = RandomState::new().build_hasher().finish() as f64 / u64::MAX as f64;
-    ceiling
-        .mul_f64(unit)
-        .max(retry_after.unwrap_or_default())
-        .min(RETRY_CAP)
+    ceiling.mul_f64(unit).max(at_least).min(RETRY_CAP)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,8 +184,9 @@ pub fn http_client() -> Result<reqwest::Client, Cause> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
-        // A pooled connection the server closed while tools ran would fail after send, which
-        // is never retried; one connection per request keeps that from looking like a lost reply.
+        // A pooled connection that the server closed while tools ran would fail after the send,
+        // and the runner never retries such a failure. One connection per request keeps it from
+        // looking like a lost reply.
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|error| Cause::Internal {
@@ -298,11 +294,10 @@ impl<'a> ModelClient<'a> {
                 }
                 Err(failure) => failure,
             };
-            let retry_in = failure
-                .retryable()
-                .filter(|_| attempt < RETRY_ATTEMPTS)
-                .map(|retry_after| backoff(attempt, retry_after))
-                .filter(|delay| Instant::now() + *delay < self.deadline);
+            let retry_in = failure.retry_in(
+                attempt,
+                self.deadline.saturating_duration_since(Instant::now()),
+            );
             trace.record(&Event::EndpointError {
                 call,
                 turn: request.turn,
@@ -337,9 +332,9 @@ async fn exchange(request: reqwest::RequestBuilder) -> Result<Vec<u8>, Failure> 
     let mut response = request.send().await.map_err(|error| {
         let detail = error_chain(&error);
         if error.is_connect() {
-            Failure::Connect { detail }
+            Failure::NotSent { detail }
         } else {
-            Failure::Lost { detail }
+            Failure::LostAfterSend { detail }
         }
     })?;
     let status = response.status();
@@ -363,9 +358,13 @@ async fn exchange(request: reqwest::RequestBuilder) -> Result<Vec<u8>, Failure> 
         });
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| Failure::Lost {
-        detail: error_chain(&error),
-    })? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| Failure::LostAfterSend {
+            detail: error_chain(&error),
+        })?
+    {
         if body.len() + chunk.len() > MAX_BODY_BYTES {
             return Err(Failure::Response {
                 detail: "response exceeds 16 MiB".into(),
@@ -442,33 +441,50 @@ mod tests {
 
     #[test]
     fn only_requests_the_endpoint_did_not_process_are_retried() {
-        let lost = Failure::Lost {
+        let hour = Duration::from_secs(3600);
+        let lost = Failure::LostAfterSend {
             detail: "reset".into(),
         };
         let response = Failure::Response {
             detail: "not JSON".into(),
             body_excerpt: String::new(),
         };
-        assert!(
-            Failure::Connect {
-                detail: "refused".into()
-            }
-            .retryable()
-            .is_some()
-        );
-        assert_eq!(status(429, "").retryable(), Some(None));
-        assert_eq!(status(503, "").retryable(), Some(None));
-        for code in [400, 401, 403, 404, 408, 409, 413, 422, 500, 502, 504] {
-            assert_eq!(status(code, "").retryable(), None, "{code}");
+        let refused = Failure::NotSent {
+            detail: "refused".into(),
+        };
+        for retried in [&refused, &status(429, ""), &status(503, "")] {
+            assert!(retried.retry_in(1, hour).is_some(), "{retried:?}");
         }
-        assert_eq!(lost.retryable(), None);
-        assert_eq!(response.retryable(), None);
+        for code in [400, 401, 403, 404, 408, 409, 413, 422, 500, 502, 504] {
+            assert_eq!(status(code, "").retry_in(1, hour), None, "{code}");
+        }
+        assert_eq!(lost.retry_in(1, hour), None);
+        assert_eq!(response.retry_in(1, hour), None);
         let after = Failure::Status {
             status: 429,
             body_excerpt: String::new(),
             retry_after_ms: Some(2000),
         };
-        assert_eq!(after.retryable(), Some(Some(Duration::from_secs(2))));
+        assert!(after.retry_in(1, hour).unwrap() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retries_continue_until_the_next_wait_would_pass_the_deadline() {
+        for attempt in 1..=40 {
+            assert!(
+                status(503, "")
+                    .retry_in(attempt, Duration::from_secs(3600))
+                    .is_some(),
+                "attempt {attempt} was not retried with an hour left"
+            );
+        }
+        assert_eq!(status(503, "").retry_in(1, Duration::ZERO), None);
+        let after = Failure::Status {
+            status: 429,
+            body_excerpt: String::new(),
+            retry_after_ms: Some(20_000),
+        };
+        assert_eq!(after.retry_in(1, Duration::from_secs(10)), None);
     }
 
     #[test]
@@ -490,13 +506,13 @@ mod tests {
             json!({"outcome": "infrastructure", "cause": {"kind": "endpoint_unavailable", "attempts": 3, "status": 503, "detail": "UpstreamGenerationAbortedError"}})
         );
         assert_eq!(
-            as_json(Failure::Lost {
+            as_json(Failure::LostAfterSend {
                 detail: "reset".into()
             })["cause"]["kind"],
             "connection_lost"
         );
         assert_eq!(
-            as_json(Failure::Connect {
+            as_json(Failure::NotSent {
                 detail: "refused".into()
             })["cause"],
             json!({"kind": "endpoint_unavailable", "attempts": 3, "status": null, "detail": "refused"})
@@ -507,12 +523,13 @@ mod tests {
     fn backoff_is_jittered_capped_and_honours_retry_after() {
         for attempt in 1..=10 {
             let ceiling = RETRY_BASE.saturating_mul(1 << (attempt - 1)).min(RETRY_CAP);
-            assert!(backoff(attempt, None) <= ceiling);
+            assert!(backoff(attempt, Duration::ZERO) <= ceiling);
         }
-        let delays: std::collections::BTreeSet<_> = (0..8).map(|_| backoff(3, None)).collect();
+        let delays: std::collections::BTreeSet<_> =
+            (0..8).map(|_| backoff(3, Duration::ZERO)).collect();
         assert!(delays.len() > 1, "backoff is not jittered");
-        assert!(backoff(1, Some(Duration::from_secs(5))) >= Duration::from_secs(5));
-        assert_eq!(backoff(1, Some(Duration::from_secs(600))), RETRY_CAP);
+        assert!(backoff(1, Duration::from_secs(5)) >= Duration::from_secs(5));
+        assert_eq!(backoff(1, Duration::from_secs(600)), RETRY_CAP);
     }
 
     #[test]

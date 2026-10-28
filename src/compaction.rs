@@ -1,4 +1,4 @@
-// Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
+// Adapted from Grok Build 2bdd1d6a. NOTICE names the source.
 pub fn format_compact_summary(summary: &str) -> String {
     let mut result = summary.trim().to_string();
 

@@ -1,4 +1,4 @@
-// Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
+// Adapted from Grok Build 2bdd1d6a. NOTICE names the source.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -19,9 +19,10 @@ use super::internal;
 
 const PREVIEW_BYTES: usize = 20_000;
 const POLL_BYTES: usize = 40_000;
-const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL_WAITED: Duration = Duration::from_millis(10);
+const POLL_BACKGROUND: Duration = Duration::from_millis(250);
 const TRUNCATED: &str = "\n[... output truncated ...]\n";
 const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
     ("TERM", "dumb"),
@@ -39,7 +40,7 @@ const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
     ("GPG_TTY", ""),
 ];
 
-static SPAWNED: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
+static CHILDREN_WITH_HANDLES: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -88,10 +89,8 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub async fn new(cwd: PathBuf, log_dir: PathBuf) -> Result<Self> {
-        tokio::fs::create_dir_all(&log_dir)
-            .await
-            .context("create command log directory")?;
+    pub async fn new(cwd: PathBuf, log_root: PathBuf) -> Result<Self> {
+        let log_dir = fresh_dir(&log_root).context("create command log directory")?;
         #[cfg(target_os = "linux")]
         adopt_orphans().context("become the subreaper of command descendants")?;
         Ok(Self {
@@ -135,8 +134,8 @@ impl TerminalSession {
         let block = args["block_until_ms"].as_u64().unwrap_or(30_000);
         ensure!(block <= 300_000, "block_until_ms exceeds 300000");
         ensure!(
-            block == 0 || !unwaited_background(command),
-            "Do not use an unwaited background '&'; use block_until_ms=0 instead."
+            !unwaited_background(command),
+            "To run a command in the background, pass block_until_ms=0 instead of using &."
         );
         let id = {
             let mut state = lock(&self.state);
@@ -178,7 +177,7 @@ impl TerminalSession {
             finished: watch::channel(false).0,
         });
         lock(&self.state).tasks.insert(id, task.clone());
-        tokio::spawn(drive(child, task.clone(), log));
+        tokio::spawn(drive(child, task.clone()));
         let mut abort = AbortOnDrop(Some(task.clone()));
         let finished = block > 0
             && tokio::time::timeout_at(started + Duration::from_millis(block), task.wait())
@@ -205,7 +204,7 @@ impl TerminalSession {
         let ids = args["task_ids"].as_array().context("missing task_ids")?;
         ensure!(
             !ids.is_empty() && ids.len() <= 20,
-            "task_ids must have 1–20 entries"
+            "task_ids must have 1 to 20 entries"
         );
         let timeout = args["timeout_ms"].as_u64().unwrap_or(0);
         ensure!(timeout <= 300_000, "timeout_ms exceeds 300000");
@@ -261,7 +260,7 @@ impl TerminalSession {
                 "description": task.description, "start_time": task.started,
                 "end_time": state.ended, "output_file": task.log,
                 "output_total_bytes": std::fs::metadata(&task.log).map_or(0, |metadata| metadata.len()),
-                "truncated": state.truncated, "exit_code": state.exit_code, "signal": state.signal,
+                "exit_code": state.exit_code, "signal": state.signal,
                 "completed": state.completed, "kind": "bash", "is_backgrounded": true,
                 "explicitly_killed": state.explicitly_killed,
             }))
@@ -322,7 +321,6 @@ struct TaskState {
     background: bool,
     completed: bool,
     explicitly_killed: bool,
-    truncated: bool,
     ended: Option<SystemTime>,
     stop_deadline: Option<Instant>,
     exit_code: Option<i32>,
@@ -414,7 +412,7 @@ impl Task {
             });
         }
         text.push_str(&output);
-        if total > POLL_BYTES as u64 || state.truncated {
+        if total > POLL_BYTES as u64 {
             text.push_str("\n[truncated - use read_file on output_file for full content]");
         }
         Ok(text)
@@ -467,13 +465,21 @@ impl Drop for AbortOnDrop {
     }
 }
 
+fn fresh_dir(root: &Path) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let mut n = 0;
+    loop {
+        let dir = root.join(format!("{}-{n}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            created => return created.map(|()| dir),
+        }
+    }
+}
+
 fn create_log(dir: &Path, path: &Path) -> io::Result<File> {
     std::fs::create_dir_all(dir)?;
-    File::options()
-        .read(true)
-        .append(true)
-        .create_new(true)
-        .open(path)
+    File::options().append(true).create_new(true).open(path)
 }
 
 fn read_log(path: &Path, limit: usize) -> io::Result<(String, u64)> {
@@ -492,43 +498,11 @@ fn read_log(path: &Path, limit: usize) -> io::Result<(String, u64)> {
     Ok((strip_ansi(&String::from_utf8_lossy(&bytes)), total))
 }
 
-fn cap_log(log: &File, path: &Path, kept: &mut Option<u64>) -> io::Result<bool> {
-    use std::os::unix::fs::FileExt;
-    let mut end = log.metadata()?.len();
-    if end <= MAX_LOG_BYTES {
-        return Ok(false);
-    }
-    // Positional writes need a descriptor without O_APPEND, which Linux applies to pwrite too.
-    let writer = File::options().write(true).open(path)?;
-    let mut to = match *kept {
-        Some(head) => head,
-        None => {
-            writer.write_all_at(TRUNCATED.as_bytes(), MAX_LOG_BYTES / 2)?;
-            MAX_LOG_BYTES / 2 + TRUNCATED.len() as u64
-        }
-    };
-    *kept = Some(to);
-    let mut from = end - MAX_LOG_BYTES / 4;
-    for _ in 0..100 {
-        let mut chunk = vec![0; (end - from) as usize];
-        log.read_exact_at(&mut chunk, from)?;
-        writer.write_all_at(&chunk, to)?;
-        to += chunk.len() as u64;
-        from = end;
-        end = log.metadata()?.len();
-        if end == from {
-            break;
-        }
-    }
-    writer.set_len(to)?;
-    Ok(true)
-}
-
 fn spawn_tracked(command: &mut Command) -> io::Result<(Child, libc::pid_t)> {
-    let mut spawned = lock(&SPAWNED);
+    let mut with_handles = lock(&CHILDREN_WITH_HANDLES);
     let child = command.spawn()?;
     let pid = child.id().expect("an unwaited child has a pid") as libc::pid_t;
-    spawned.insert(pid);
+    with_handles.insert(pid);
     Ok((child, pid))
 }
 
@@ -589,7 +563,7 @@ struct Process {
 }
 
 #[cfg(target_os = "linux")]
-fn adopted_processes() -> Vec<Process> {
+fn processes_outside_own_session() -> Vec<Process> {
     let own_session = unsafe { libc::getsid(0) };
     processes()
         .into_iter()
@@ -608,10 +582,10 @@ fn adopted_processes() -> Vec<Process> {
 
 #[cfg(target_os = "linux")]
 fn reap_orphans() {
-    let spawned = lock(&SPAWNED);
+    let with_handles = lock(&CHILDREN_WITH_HANDLES);
     let runner = std::process::id() as libc::pid_t;
-    for process in adopted_processes() {
-        if process.zombie && process.parent == runner && !spawned.contains(&process.pid) {
+    for process in processes_outside_own_session() {
+        if process.zombie && process.parent == runner && !with_handles.contains(&process.pid) {
             unsafe { libc::waitpid(process.pid, std::ptr::null_mut(), libc::WNOHANG) };
         }
     }
@@ -621,12 +595,12 @@ fn reap_orphans() {
 async fn sweep_orphans() {
     let runner = std::process::id() as libc::pid_t;
     for _ in 0..100 {
-        let table = adopted_processes();
+        let table = processes_outside_own_session();
         let mut doomed = {
-            let spawned = lock(&SPAWNED);
+            let with_handles = lock(&CHILDREN_WITH_HANDLES);
             table
                 .iter()
-                .filter(|process| process.parent == runner && !spawned.contains(&process.pid))
+                .filter(|process| process.parent == runner && !with_handles.contains(&process.pid))
                 .map(|process| process.pid)
                 .collect::<Vec<_>>()
         };
@@ -657,12 +631,11 @@ async fn sweep_orphans() {
     reap_orphans();
 }
 
-async fn drive(mut child: Child, task: Arc<Task>, log: File) {
+async fn drive(mut child: Child, task: Arc<Task>) {
     let deadline = Instant::now() + MAX_RUNTIME;
-    let mut tick = tokio::time::interval(Duration::from_millis(10));
-    let mut kept = None;
+    let mut pause = POLL_WAITED;
     loop {
-        tick.tick().await;
+        tokio::time::sleep(pause).await;
         if Instant::now() >= deadline {
             task.stop("timeout", false);
         }
@@ -684,11 +657,12 @@ async fn drive(mut child: Child, task: Arc<Task>, log: File) {
                 Some(Err(format!("observe command exit: {error}")))
             }
         };
-        match cap_log(&log, &task.log, &mut kept) {
-            Ok(cut) => state.truncated |= cut,
-            Err(error) => state.error = Some(format!("truncate command output log: {error}")),
-        }
         let Some(exit) = exit else {
+            pause = if state.background && task.finished.receiver_count() == 0 {
+                POLL_BACKGROUND
+            } else {
+                POLL_WAITED
+            };
             continue;
         };
         match exit {
@@ -702,7 +676,7 @@ async fn drive(mut child: Child, task: Arc<Task>, log: File) {
         }
         state.completed = true;
         state.ended = Some(SystemTime::now());
-        lock(&SPAWNED).remove(&task.pid);
+        lock(&CHILDREN_WITH_HANDLES).remove(&task.pid);
         drop(state);
         task.finished.send_replace(true);
         return;
@@ -751,7 +725,7 @@ pub async fn capture(
         let _ = child.start_kill();
     }
     let status = child.wait().await?;
-    lock(&SPAWNED).remove(&pid);
+    lock(&CHILDREN_WITH_HANDLES).remove(&pid);
     output.extend_from_slice(&errors);
     truncated |= output.len() > max_bytes;
     output.truncate(max_bytes);
