@@ -380,7 +380,6 @@ async fn execute(
     };
     let original = initial_messages(&config.user_query)?;
     let mut messages = original.clone();
-    let mut seen_ids = HashSet::new();
     let mut compact_before_next_turn = false;
     for _ in 0..config.max_turns {
         if compact_before_next_turn {
@@ -439,6 +438,7 @@ async fn execute(
             .as_array()
             .context("invalid tool_calls")?;
         let mut new_tool_bytes = 0_u64;
+        let mut seen_ids = HashSet::new();
         for call in calls {
             let valid = call["id"]
                 .as_str()

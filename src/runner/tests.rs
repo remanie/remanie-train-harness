@@ -551,3 +551,22 @@ async fn tool_schemas_reach_the_wire_byte_for_byte_in_file_order() {
     assert_eq!(positions.len(), 8);
     assert!(positions.is_sorted());
 }
+
+#[tokio::test]
+async fn call_ids_may_repeat_across_turns() {
+    let todo = |status| {
+        call(
+            "functions.todo_write:0",
+            "todo_write",
+            json!({"todos":[{"id":"work", "content":"verify", "status":status}]}),
+        )
+    };
+    let (_dir, server, config) = fixture(vec![
+        tool_reply(vec![todo("in_progress")], 10),
+        tool_reply(vec![todo("completed")], 10),
+        final_reply(),
+    ])
+    .await;
+    assert_eq!(run(config, None).await.unwrap().status, "completed");
+    assert_eq!(requests(&server).await.len(), 3);
+}
