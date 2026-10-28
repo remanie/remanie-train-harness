@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -268,7 +269,7 @@ struct Attempt<'a> {
 
 async fn execute(cx: &mut Attempt<'_>) -> Outcome {
     let outcome = loop {
-        if let Err(outcome) = turn(cx).await {
+        if let ControlFlow::Break(outcome) = turn(cx).await {
             break outcome;
         }
     };
@@ -283,20 +284,24 @@ async fn execute(cx: &mut Attempt<'_>) -> Outcome {
     }
 }
 
-async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
+fn proceed<T>(result: Result<T, Outcome>) -> ControlFlow<Outcome, T> {
+    result.map_or_else(ControlFlow::Break, ControlFlow::Continue)
+}
+
+async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
     let input = cx.input;
     if cx.tally.turns == input.max_turns {
-        return Err(Outcome::MaxTurns);
+        return ControlFlow::Break(Outcome::MaxTurns);
     }
     if cx.compact_next {
-        compact(cx).await?;
+        proceed(compact(cx).await)?;
         cx.compact_next = false;
     }
     let max_tokens = input.sampling_params.max_tokens();
     if let Some(window) = input.context_window_tokens {
         let estimated = cx.budget.estimate();
         if estimated + max_tokens > window {
-            return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
+            return ControlFlow::Break(Outcome::ContextOverflow(Overflow::ContextWindow {
                 estimated_prompt_tokens: estimated,
                 max_tokens,
                 context_window_tokens: window,
@@ -308,19 +313,20 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         finish,
         usage,
         context_tokens,
-    } = cx
-        .model
-        .sample(
-            Request {
-                kind: CallKind::Turn,
-                turn: cx.tally.turns + 1,
-                prompt: cx.segment.range(),
-                messages: cx.segment.messages(),
-                max_tokens_override: None,
-            },
-            cx.trace,
-        )
-        .await?;
+    } = proceed(
+        cx.model
+            .sample(
+                Request {
+                    kind: CallKind::Turn,
+                    turn: cx.tally.turns + 1,
+                    prompt: cx.segment.range(),
+                    messages: cx.segment.messages(),
+                    max_tokens_override: None,
+                },
+                cx.trace,
+            )
+            .await,
+    )?;
     cx.tally.turns += 1;
     cx.tally.count_response(usage);
     let reply = read_reply(&message);
@@ -328,7 +334,7 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     match context_tokens {
         Some(tokens) => cx.budget.counted(tokens),
         None if input.context_window_tokens.is_some() || input.compaction.is_some() => {
-            return Err(Outcome::Infrastructure(Cause::EndpointResponse {
+            return ControlFlow::Break(Outcome::Infrastructure(Cause::EndpointResponse {
                 detail: "usage.total_tokens is required with compaction or context_window_tokens"
                     .into(),
             }));
@@ -341,40 +347,44 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
                 .ok()
                 .and_then(|reply| reply.content)
                 .unwrap_or_default();
-            return Err(Outcome::MaxTokens);
+            return ControlFlow::Break(Outcome::MaxTokens);
         }
         Finish::Other(finish_reason) => {
-            return Err(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
+            return ControlFlow::Break(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
                 finish_reason,
             }));
         }
-        Finish::Stop | Finish::ToolCalls => reply.map_err(Outcome::InvalidResponse)?,
+        Finish::Stop | Finish::ToolCalls => proceed(reply.map_err(Outcome::InvalidResponse))?,
     };
     if reply.calls.is_empty() {
         if finish == Finish::ToolCalls {
-            return Err(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
+            return ControlFlow::Break(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
                 finish_reason: "tool_calls".into(),
             }));
         }
-        cx.tally.final_answer = [reply.content, reply.refusal]
+        let Some(answer) = [reply.content, reply.refusal]
             .into_iter()
             .flatten()
             .find(|text| !text.trim().is_empty())
-            .ok_or(Outcome::InvalidResponse(Misbehaviour::EmptyTurn))?;
-        return Err(Outcome::Completed);
+        else {
+            return ControlFlow::Break(Outcome::InvalidResponse(Misbehaviour::EmptyTurn));
+        };
+        cx.tally.final_answer = answer;
+        return ControlFlow::Break(Outcome::Completed);
     }
     for call in &reply.calls {
         let started = Instant::now();
-        let output = cx
-            .tools
-            .call(&call.name, &call.arguments)
-            .await
-            .map_err(|error| {
-                Outcome::Infrastructure(Cause::ToolRuntime {
-                    tool: call.name.clone(),
-                    detail: error.0,
-                })
-            })?;
+        let output = proceed(
+            cx.tools
+                .call(&call.name, &call.arguments)
+                .await
+                .map_err(|error| {
+                    Outcome::Infrastructure(Cause::ToolRuntime {
+                        tool: call.name.clone(),
+                        detail: error.0,
+                    })
+                }),
+        )?;
         cx.tally.tool_calls.count(output.error);
         let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
         cx.budget.append(&message);
@@ -390,7 +400,7 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     cx.compact_next = input.compaction.as_ref().is_some_and(|compaction| {
         cx.budget.estimate() + max_tokens.max(compaction.max_tokens) >= compaction.threshold_tokens
     });
-    Ok(())
+    ControlFlow::Continue(())
 }
 
 async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
