@@ -21,6 +21,8 @@ const PREVIEW_BYTES: usize = 20_000;
 const POLL_BYTES: usize = 40_000;
 const MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL_WAITED: Duration = Duration::from_millis(10);
+const POLL_BACKGROUND: Duration = Duration::from_millis(250);
 const TRUNCATED: &str = "\n[... output truncated ...]\n";
 const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
     ("TERM", "dumb"),
@@ -631,9 +633,9 @@ async fn sweep_orphans() {
 
 async fn drive(mut child: Child, task: Arc<Task>) {
     let deadline = Instant::now() + MAX_RUNTIME;
-    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    let mut pause = POLL_WAITED;
     loop {
-        tick.tick().await;
+        tokio::time::sleep(pause).await;
         if Instant::now() >= deadline {
             task.stop("timeout", false);
         }
@@ -656,6 +658,11 @@ async fn drive(mut child: Child, task: Arc<Task>) {
             }
         };
         let Some(exit) = exit else {
+            pause = if state.background && task.finished.receiver_count() == 0 {
+                POLL_BACKGROUND
+            } else {
+                POLL_WAITED
+            };
             continue;
         };
         match exit {
