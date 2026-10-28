@@ -636,8 +636,8 @@ struct TodoUpdate {
     status: Option<String>,
 }
 
-// Grok Build's lock key: `.` and `..` resolved lexically, then the longest existing ancestor
-// canonicalized, so aliases of one file, created or not, share a key.
+// Grok Build's lock key. It resolves `.` and `..` lexically, then canonicalizes the longest
+// existing ancestor, so aliases of one file share a key even before the file exists.
 pub(super) fn lock_key(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {

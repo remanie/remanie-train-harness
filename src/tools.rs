@@ -194,8 +194,8 @@ impl ToolSession {
         }
     }
 
-    /// Grok Build's per-path locks for one reply's calls: a path a writing call targets gets a
-    /// lock, and every call on that path takes it.
+    /// Grok Build's per-path locks for one reply's calls. A path that a writing call targets gets
+    /// a lock, and every call on that path takes it.
     pub fn path_locks<'c>(
         &self,
         calls: impl IntoIterator<Item = (&'c str, &'c str)>,
