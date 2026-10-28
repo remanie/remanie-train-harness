@@ -717,8 +717,11 @@ async fn grep_honors_paths_filters_regex_flags_and_output_limit() {
         )
         .await
         .unwrap();
+    assert_eq!(output.lines().count(), 4, "{output}");
     assert!(
-        output.contains("truncated") && output.lines().count() < 6,
+        output.ends_with(
+            "\n... [at least 51 lines; output truncated. Narrow the path or pattern.] ..."
+        ),
         "{output}"
     );
     tokio::fs::write(dir.path().join("multi.txt"), "alpha\nbeta\n")

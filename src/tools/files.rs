@@ -407,10 +407,14 @@ impl FileTools {
         if code == 1 || output.is_empty() {
             return Ok("No matches found".into());
         }
-        let mut lines = output.lines();
-        let mut text = lines.by_ref().take(limit).collect::<Vec<_>>().join("\n");
-        if lines.next().is_some() {
-            text.push_str("\n... [output truncated. Narrow the path or pattern.] ...");
+        let lines: Vec<_> = output.lines().collect();
+        let mut text = lines[..lines.len().min(limit)].join("\n");
+        if lines.len() > limit {
+            let read = lines.len() - usize::from(output.ends_with("\n[output truncated]"));
+            write!(
+                text,
+                "\n... [at least {read} lines; output truncated. Narrow the path or pattern.] ..."
+            )?;
         }
         if unread {
             let messages: Vec<_> = errors.lines().collect();
