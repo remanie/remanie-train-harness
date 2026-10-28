@@ -56,9 +56,9 @@ Leave `compaction` unset under the v1 linear session server. A compaction opens 
 import remanie_trace
 
 trace = remanie_trace.read("eval-results/<job>/<trial>/agent/remanie")
-trace.outcome                    # the result object, or None when the runner died
-body = trace.request_body(0)     # the exact chat-completions body of call 0
-trace.usage()                    # token totals, with complete=False if any response lacked usage
+trace.outcome                            # "completed", ..., or None when the runner died
+body = trace.request_body(trace.calls[0])  # the chat-completions body of the first call
+trace.usage()                            # token totals; complete is False when any are missing
 ```
 
 ## Run the smoke job
