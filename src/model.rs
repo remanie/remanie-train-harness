@@ -12,7 +12,6 @@ use crate::trace::{CallKind, Event, MessageRange, Trace};
 
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-const RETRY_ATTEMPTS: u32 = 6;
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(30);
 const CONTEXT_LENGTH_PATTERNS: [&str; 5] = [
@@ -92,16 +91,17 @@ pub enum Failure {
 }
 
 impl Failure {
-    fn retryable(&self) -> Option<Option<Duration>> {
-        match self {
-            Failure::Connect { .. } => Some(None),
+    fn retry_in(&self, attempt: u32, remaining: Duration) -> Option<Duration> {
+        let at_least = match self {
+            Failure::Connect { .. } => Duration::ZERO,
             Failure::Status {
                 status: 429 | 503,
                 retry_after_ms,
                 ..
-            } => Some(retry_after_ms.map(Duration::from_millis)),
-            _ => None,
-        }
+            } => Duration::from_millis(retry_after_ms.unwrap_or(0)),
+            _ => return None,
+        };
+        Some(backoff(attempt, at_least)).filter(|delay| *delay < remaining)
     }
 
     fn into_outcome(self, attempts: u32) -> Outcome {
@@ -151,15 +151,12 @@ fn names_context_length(body: &str) -> bool {
         .any(|pattern| body.contains(pattern))
 }
 
-fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
+fn backoff(attempt: u32, at_least: Duration) -> Duration {
     let ceiling = RETRY_BASE
         .saturating_mul(1 << (attempt - 1).min(16))
         .min(RETRY_CAP);
     let unit = RandomState::new().build_hasher().finish() as f64 / u64::MAX as f64;
-    ceiling
-        .mul_f64(unit)
-        .max(retry_after.unwrap_or_default())
-        .min(RETRY_CAP)
+    ceiling.mul_f64(unit).max(at_least).min(RETRY_CAP)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,11 +295,10 @@ impl<'a> ModelClient<'a> {
                 }
                 Err(failure) => failure,
             };
-            let retry_in = failure
-                .retryable()
-                .filter(|_| attempt < RETRY_ATTEMPTS)
-                .map(|retry_after| backoff(attempt, retry_after))
-                .filter(|delay| Instant::now() + *delay < self.deadline);
+            let retry_in = failure.retry_in(
+                attempt,
+                self.deadline.saturating_duration_since(Instant::now()),
+            );
             trace.record(&Event::EndpointError {
                 call,
                 turn: request.turn,
@@ -442,6 +438,7 @@ mod tests {
 
     #[test]
     fn only_requests_the_endpoint_did_not_process_are_retried() {
+        let hour = Duration::from_secs(3600);
         let lost = Failure::Lost {
             detail: "reset".into(),
         };
@@ -449,26 +446,42 @@ mod tests {
             detail: "not JSON".into(),
             body_excerpt: String::new(),
         };
-        assert!(
-            Failure::Connect {
-                detail: "refused".into()
-            }
-            .retryable()
-            .is_some()
-        );
-        assert_eq!(status(429, "").retryable(), Some(None));
-        assert_eq!(status(503, "").retryable(), Some(None));
-        for code in [400, 401, 403, 404, 408, 409, 413, 422, 500, 502, 504] {
-            assert_eq!(status(code, "").retryable(), None, "{code}");
+        let refused = Failure::Connect {
+            detail: "refused".into(),
+        };
+        for retried in [&refused, &status(429, ""), &status(503, "")] {
+            assert!(retried.retry_in(1, hour).is_some(), "{retried:?}");
         }
-        assert_eq!(lost.retryable(), None);
-        assert_eq!(response.retryable(), None);
+        for code in [400, 401, 403, 404, 408, 409, 413, 422, 500, 502, 504] {
+            assert_eq!(status(code, "").retry_in(1, hour), None, "{code}");
+        }
+        assert_eq!(lost.retry_in(1, hour), None);
+        assert_eq!(response.retry_in(1, hour), None);
         let after = Failure::Status {
             status: 429,
             body_excerpt: String::new(),
             retry_after_ms: Some(2000),
         };
-        assert_eq!(after.retryable(), Some(Some(Duration::from_secs(2))));
+        assert!(after.retry_in(1, hour).unwrap() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retries_continue_until_the_next_wait_would_pass_the_deadline() {
+        for attempt in 1..=40 {
+            assert!(
+                status(503, "")
+                    .retry_in(attempt, Duration::from_secs(3600))
+                    .is_some(),
+                "attempt {attempt} was not retried with an hour left"
+            );
+        }
+        assert_eq!(status(503, "").retry_in(1, Duration::ZERO), None);
+        let after = Failure::Status {
+            status: 429,
+            body_excerpt: String::new(),
+            retry_after_ms: Some(20_000),
+        };
+        assert_eq!(after.retry_in(1, Duration::from_secs(10)), None);
     }
 
     #[test]
@@ -507,12 +520,13 @@ mod tests {
     fn backoff_is_jittered_capped_and_honours_retry_after() {
         for attempt in 1..=10 {
             let ceiling = RETRY_BASE.saturating_mul(1 << (attempt - 1)).min(RETRY_CAP);
-            assert!(backoff(attempt, None) <= ceiling);
+            assert!(backoff(attempt, Duration::ZERO) <= ceiling);
         }
-        let delays: std::collections::BTreeSet<_> = (0..8).map(|_| backoff(3, None)).collect();
+        let delays: std::collections::BTreeSet<_> =
+            (0..8).map(|_| backoff(3, Duration::ZERO)).collect();
         assert!(delays.len() > 1, "backoff is not jittered");
-        assert!(backoff(1, Some(Duration::from_secs(5))) >= Duration::from_secs(5));
-        assert_eq!(backoff(1, Some(Duration::from_secs(600))), RETRY_CAP);
+        assert!(backoff(1, Duration::from_secs(5)) >= Duration::from_secs(5));
+        assert_eq!(backoff(1, Duration::from_secs(600)), RETRY_CAP);
     }
 
     #[test]
