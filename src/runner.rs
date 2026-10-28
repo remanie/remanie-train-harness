@@ -97,7 +97,7 @@ async fn attempt(
     ))
     .map_err(|error| config(format!("invalid base_url: {error}")))?;
     let http = crate::model::http_client()?;
-    let initial = initial_messages(&input.user_query)?;
+    let initial = initial_messages(&input.user_query, &input.workspace)?;
     let summary_prompt = json!({"role": "user", "content": render("compaction", include_str!("../assets/compaction.jinja2"), json!({}))?});
     let trace = trace.insert(
         Trace::create(&input.session_dir, MAX_TRACE_BYTES)
@@ -226,11 +226,42 @@ fn render(name: &str, source: &str, context: Value) -> Result<String, Cause> {
     Ok(rendered)
 }
 
-fn initial_messages(query: &str) -> Result<Vec<Value>, Cause> {
+fn initial_messages(query: &str, workspace: &Path) -> Result<Vec<Value>, Cause> {
     Ok(vec![
         json!({"role": "system", "content": render("system", include_str!("../assets/system_prompt.jinja2"), json!({}))?}),
-        json!({"role": "user", "content": render("user", include_str!("../assets/user_query.jinja2"), json!({"user_query": query}))?}),
+        json!({"role": "user", "content": render("user", include_str!("../assets/user_query.jinja2"), user_info(workspace, query))?}),
     ])
+}
+
+pub(crate) fn user_info(workspace: &Path, query: &str) -> Value {
+    json!({
+        "os": std::env::consts::OS,
+        "shell": std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned()),
+        "workspace": workspace.display().to_string(),
+        "today": today(),
+        "user_query": query,
+    })
+}
+
+fn today() -> String {
+    let seconds = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs() as i64)
+        });
+    let z = seconds.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 async fn interrupted() {

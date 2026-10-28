@@ -239,8 +239,20 @@ async fn exact_prompt_catalog_and_assistant_replay_edit_a_real_file() {
         requests[0]["messages"],
         json!([
             {"role": "system", "content": "You are an autonomous coding agent. Your main goal is to complete the user's request denoted with the <user_query> tag."},
-            {"role": "user", "content": "<user_query>\nCreate result.txt and verify the result.\n</user_query>"}
+            {"role": "user", "content": render("user", include_str!("../../assets/user_query.jinja2"), user_info(&f.workspace(), "Create result.txt and verify the result.")).unwrap()}
         ])
+    );
+    let first = requests[0]["messages"][1]["content"].as_str().unwrap();
+    assert!(first.starts_with("<user_info>\nOS Version: "), "{first}");
+    assert!(
+        first.contains(&format!("Workspace Path: {}\n", f.workspace().display())),
+        "{first}"
+    );
+    assert!(
+        first.ends_with(
+            "</user_info>\n\n<user_query>\nCreate result.txt and verify the result.\n</user_query>"
+        ),
+        "{first}"
     );
     let raw = String::from_utf8(f.raw_requests().await[1].clone()).unwrap();
     assert!(raw.contains(&serde_json::to_string(&assistant).unwrap()));

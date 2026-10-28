@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -90,7 +91,7 @@ def main():
             "context_window_tokens": 20000,
             "compaction": {"max_tokens": 256},
         }
-        run = subprocess.run([str(args.runner.resolve())], input=json.dumps(job).encode(), capture_output=True, timeout=120)
+        run = subprocess.run([str(args.runner.resolve())], input=json.dumps(job).encode(), capture_output=True, timeout=120, env={**os.environ, "SOURCE_DATE_EPOCH": "0"})
         server.shutdown()
         result = json.loads(run.stdout)
         assert run.returncode == 0 and result["outcome"] == "completed", (run.returncode, run.stdout, run.stderr)
