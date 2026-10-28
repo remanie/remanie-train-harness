@@ -338,40 +338,66 @@ async fn kill_and_kill_all_stop_every_process_in_the_session() {
     }
 }
 
+// Runs in a process of its own: the subreaper and kill_all's sweep are process-wide, so
+// another test's kill_all would kill these daemons first.
 #[cfg(target_os = "linux")]
-#[tokio::test]
-async fn kill_all_reaches_descendants_that_left_the_session() {
-    let (dir, terminal) = fixture().await;
-    run(
-        &terminal,
-        "timeout 600 sh -c 'printf %s $$ > timeout.pid; exec sleep 4001'; echo end",
-        0,
-    )
-    .await;
-    run(
-        &terminal,
-        "setsid -f sh -c 'printf %s $$ > setsid.pid; exec sleep 912'",
-        5000,
-    )
-    .await;
-    run(
-        &terminal,
-        "(setsid sh -c 'printf %s $$ > forked.pid; exec sleep 913' &)",
-        0,
-    )
-    .await;
-    let pids = [
-        read_pid(&dir.path().join("timeout.pid")).await,
-        read_pid(&dir.path().join("setsid.pid")).await,
-        read_pid(&dir.path().join("forked.pid")).await,
-    ];
-    for pid in pids {
-        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+#[test]
+fn kill_all_reaches_descendants_that_left_the_session() {
+    const NAME: &str = "tools::terminal::tests::kill_all_reaches_descendants_that_left_the_session";
+    if std::env::var_os("RTH_ISOLATED_TEST").is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("RTH_ISOLATED_TEST", "1")
+            .output()
+            .unwrap();
+        let output = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && output.contains("1 passed"),
+            "{output}"
+        );
+        return;
     }
-    terminal.kill_all().await;
-    for pid in pids {
-        assert_stopped(pid).await;
-    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (dir, terminal) = fixture().await;
+        run(
+            &terminal,
+            "timeout 600 sh -c 'printf %s $$ > timeout.pid; exec sleep 4001'; echo end",
+            0,
+        )
+        .await;
+        run(
+            &terminal,
+            "setsid -f sh -c 'printf %s $$ > setsid.pid; exec sleep 912'",
+            5000,
+        )
+        .await;
+        run(
+            &terminal,
+            "(setsid sh -c 'printf %s $$ > forked.pid; exec sleep 913' &); sleep 0.2",
+            0,
+        )
+        .await;
+        let pids = [
+            read_pid(&dir.path().join("timeout.pid")).await,
+            read_pid(&dir.path().join("setsid.pid")).await,
+            read_pid(&dir.path().join("forked.pid")).await,
+        ];
+        for pid in pids {
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "{pid} died before kill_all"
+            );
+        }
+        terminal.kill_all().await;
+        for pid in pids {
+            assert_stopped(pid).await;
+        }
+    });
 }
 
 #[test]

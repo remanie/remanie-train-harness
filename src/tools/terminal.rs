@@ -573,7 +573,8 @@ fn processes() -> Vec<libc::pid_t> {
 }
 
 // The runner adopts descendants that leave their command's session (setsid, double fork), so
-// kill_all can still find them; it then has to reap them itself.
+// kill_all can still find them, and reaps what it adopts. Processes in the runner's own session
+// are never touched: no command descendant can be in it, and other code's children are.
 #[cfg(target_os = "linux")]
 fn adopt_orphans() -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
@@ -589,14 +590,26 @@ fn adopt_orphans() -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_table() -> Vec<(libc::pid_t, libc::pid_t, bool)> {
+struct Process {
+    pid: libc::pid_t,
+    parent: libc::pid_t,
+    zombie: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn adopted_processes() -> Vec<Process> {
+    let own_session = unsafe { libc::getsid(0) };
     processes()
         .into_iter()
         .filter_map(|pid| {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            let mut fields = stat.rsplit_once(") ")?.1.split(' ');
-            let zombie = fields.next()? == "Z";
-            Some((pid, fields.next()?.parse().ok()?, zombie))
+            let fields = stat.rsplit_once(") ")?.1.split(' ').collect::<Vec<_>>();
+            let session: libc::pid_t = fields.get(3)?.parse().ok()?;
+            (session != own_session).then_some(Process {
+                pid,
+                parent: fields.get(1)?.parse().ok()?,
+                zombie: fields.first()? == &"Z",
+            })
         })
         .collect()
 }
@@ -605,9 +618,9 @@ fn process_table() -> Vec<(libc::pid_t, libc::pid_t, bool)> {
 fn reap_orphans() {
     let spawned = lock(&SPAWNED);
     let runner = std::process::id() as libc::pid_t;
-    for (pid, parent, zombie) in process_table() {
-        if zombie && parent == runner && !spawned.contains(&pid) {
-            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    for process in adopted_processes() {
+        if process.zombie && process.parent == runner && !spawned.contains(&process.pid) {
+            unsafe { libc::waitpid(process.pid, std::ptr::null_mut(), libc::WNOHANG) };
         }
     }
 }
@@ -616,13 +629,13 @@ fn reap_orphans() {
 async fn sweep_orphans() {
     let runner = std::process::id() as libc::pid_t;
     for _ in 0..100 {
-        let table = process_table();
+        let table = adopted_processes();
         let mut doomed = {
             let spawned = lock(&SPAWNED);
             table
                 .iter()
-                .filter(|(pid, parent, _)| *parent == runner && !spawned.contains(pid))
-                .map(|(pid, _, _)| *pid)
+                .filter(|process| process.parent == runner && !spawned.contains(&process.pid))
+                .map(|process| process.pid)
                 .collect::<Vec<_>>()
         };
         let mut next = 0;
@@ -630,12 +643,16 @@ async fn sweep_orphans() {
             doomed.extend(
                 table
                     .iter()
-                    .filter(|(_, p, _)| *p == parent)
-                    .map(|(pid, _, _)| *pid),
+                    .filter(|process| process.parent == parent)
+                    .map(|process| process.pid),
             );
             next += 1;
         }
-        doomed.retain(|pid| table.iter().any(|(p, _, zombie)| p == pid && !zombie));
+        doomed.retain(|pid| {
+            table
+                .iter()
+                .any(|process| process.pid == *pid && !process.zombie)
+        });
         if doomed.is_empty() {
             break;
         }
