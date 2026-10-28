@@ -82,7 +82,7 @@ An unknown tool name, arguments that are not JSON or fail the schema, and a tool
 | `kill_terminal_command` | Sends SIGTERM to every process in one task's session, then SIGKILL after 1 s, and waits up to 5 s for the task to exit. |
 | `read_file` | At most 1000 lines and about 100,000 bytes per call. When a full 1000-line window leaves lines unread, the output ends with a note naming the next `offset`. A window over about 100,000 bytes is a tool error. A text read stops after 30 s and a PDF read after 60 s. A PDF needs Poppler and may be at most 50 MiB. A PDF over 10 pages needs `pages`, at most 20 per call. |
 | `search_replace` | `old_string` must match exactly once, overlapping matches included, unless `replace_all`. The tool edits UTF-8 files up to 50 MiB, writes in place, and keeps the file's line endings. |
-| `list_dir` | Hides ignored and dot files. Scans up to 100,000 entries and returns at most 10,000 bytes. |
+| `list_dir` | Hides ignored and dot files. Scans up to 100,000 entries and stops the listing at about 10,000 bytes. |
 | `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. The tool keeps at most 40,000 bytes of `rg` output and then at most `head_limit` lines. `rg` cuts lines at 1000 columns and skips files over 5 MiB. A search stops after 20 s. |
 | `todo_write` | `merge` defaults to `true` and updates by `id`. The list survives compaction. |
 
