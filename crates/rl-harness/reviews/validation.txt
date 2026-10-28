@@ -1,0 +1,46 @@
+Validation, 2026-10-27
+
+Completed two implementation, review and audit cycles. Four GPT-6 Astra agents
+used Ultra reasoning. Ponytail Ultra guided scope; ponytail-review and
+ponytail-audit guided independent checks; Unslop guided the documentation.
+
+Final results
+
+macOS ARM64, Rust 1.94.0:
+- cargo test -p rl-harness: 12 passed.
+- Focused native no-capture regression: 1 passed, covering six combinations.
+- cargo build -p rl-harness: passed.
+- cargo clippy -p rl-harness --all-targets --no-deps -- -D warnings: passed.
+- Real executable through the Miles adapter: 2 passed, including cancellation.
+
+Linux ARM64, Rust 1.94.0, Debian Bookworm in a disposable Docker container:
+- cargo test -p rl-harness: 12 passed.
+- cargo test -p xai-grok-tools --lib no_capture_with_no_inheritance_skips_login_probe:
+  1 passed; 3411 unrelated native tests were filtered out.
+- cargo build -p rl-harness: passed.
+- Real Linux executable through the Miles adapter: 2 passed.
+- Native compile used a generic ARM64 CPU target and system protoc.
+
+Python and actual Miles source:
+- Adapter fixture suite: 10 passed.
+- Real Miles CPU checks: 6 passed. These use actual tree, sample assembly,
+  loss-mask, codec and reward-normalization code with synthetic token records.
+- The relevant source files match both the PoC pin203a8d279d80dc7d8d4691f442dc7fd6d6f64e2e
+  and local v0.1.3 tag74f47d37c8d741fef467be558cb0ea2caced60bc.
+- Original agreed system_prompt.jinja2, user_query.jinja2 and tools.json remain
+  byte-identical to their source bundle.
+- Formatting and git diff --check passed.
+
+The first Linux CLI test could not import Miles because Docker saw an empty
+/tmp bind mount. Copying the actual source to a shared directory corrected
+that test setup. Both CLI checks then passed with no product-code change.
+
+Evidence logs are under /Users/p/.codex/artifacts/grok-rl-build-tools/:
+test-cycle-2-final.log, build-final.log, clippy.log, python-final.log,
+miles-final.log, adapter-native-final.log, linux-final.log, linux-cli-final.log.
+
+Not run: live policy model generation, model-specific tokenizer/parser parity,
+a real optimizer update, GPU training, GKE/Harbor provisioning, production
+sandbox enforcement, Windows execution, or the full upstream test suite.
+The implementation retains upstream build dependencies. The launcher still
+owns protected grading, isolated environments and destruction after crashes.

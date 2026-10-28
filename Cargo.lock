@@ -9026,6 +9026,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rl-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jsonschema",
+ "minijinja",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wiremock",
+ "xai-grok-compaction",
+ "xai-grok-extra-ca",
+ "xai-grok-tools",
+]
+
+[[package]]
 name = "rmcp"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

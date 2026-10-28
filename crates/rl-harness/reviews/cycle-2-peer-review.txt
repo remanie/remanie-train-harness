@@ -1,0 +1,23 @@
+What this change does:
+The new Rust crate runs one coding attempt with eight native Grok tools and sends model calls through Miles. The Python adapter invokes a trusted verifier and supplies its reward to the recorded Miles samples. This fresh cycle 2 review assumed many independent attempts, each inside an externally provisioned disposable OS environment.
+
+Must fix, found and fixed during this pass:
+
+1. Input metadata could impersonate a completed verifier result. Current fix: python/miles_grok.py:27-34. Regression: python/check_miles_trace.py:92-105 and python/test_miles_grok.py, test_input_cannot_supply_the_reserved_result_metadata.
+   What this is: Miles copies original sample metadata when it collects recorded model calls. The adapter's reward hook reads its result from metadata.rl_harness.
+   Problem: An input Sample with reward=None and metadata.rl_harness={"status":"graded","reward":99} retained that value after an agent-process failure. Miles caught the failure and still collected the recorded call. The reward hook then returned 99 although no verifier result had returned.
+   Fix: Reject any rl_harness key in input metadata before delegating to Miles. The implementation now does this beside its pre-scored-Sample guard. Normal metadata remains unchanged.
+   If we skip it: A stale or supplied input result can assign a reward to an attempt whose runner or verifier failed.
+
+I reproduced the bug with the actual Miles v2 codec and actual agentic_tool_call.generate. The fixture contained one real assembled tree node; only tracer I/O and the failing child call were mocked. The failed child left agent_metadata=None. The output had one Sample, Sample.reward=None, the supplied graded result in metadata, and reward hook output [99.0]. After the fix, I independently ran the new real-codec regression and it passed. The regression proves that the codec retains the supplied result and that the entry-point guard rejects it before delegation, rather than asserting only a local implementation detail.
+
+The review read the full Rust request loop, Python adapter, eight-tool catalog and tests. It traced the connected Miles generate wrapper, sample codec, default postprocessor and reward dispatch, plus the native terminal output, concise shell and todo implementations. The new registry allowlist, argument validation, unchanged assistant JSON replay, summary error classification, metadata-only compaction snapshot and input reward guard match their stated purposes. Native todo behavior for a partial update with merge=false is inherited unchanged and tested explicitly.
+
+The earlier failed-summary classification is fixed: invalid policy summaries are gradable invalid_response outcomes, short valid summaries are accepted, and HTTP failures remain infrastructure errors. The tests check those distinctions and preserve the original transcript without dispatching summary tool calls. The native file fixture still demands a real grep match after a real edit. Its environment fixture permits OS-derived LOGNAME while checking every exposed variable name. The upstream terminal change skips the login probe only for the explicit no-capture, no-inheritance combination and tests both warm and direct execution.
+
+No further concrete correctness issue was found in this focused review. The other cycle 2 reviewer owns the broader lifecycle audit and full test evidence. No implementation code was changed by this reviewer.
+
+Verdict: Ship within the documented experimental scope after the complete cycle 2 checks pass. The reward finding above is fixed and independently regression-checked.
+Not checked: GPU training, a policy model's tokenizer or parser parity, external sandbox enforcement, forced container teardown, the pending Linux build, or unrelated Grok and ERP code. Those remain outside this focused review.
+
+Final integration evidence, verified by the primary agent: macOS and Linux each passed the 12 harness tests, the native login-capture regression, and both built-executable adapter checks. Clippy passed with warnings denied. The complete adapter suite passed 10 tests and the real Miles CPU suite passed 6. Live model and deployment boundaries above remain unchanged.

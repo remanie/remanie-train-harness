@@ -634,6 +634,13 @@ impl LocalTerminalActor {
             output_file_cap,
             tick_interval,
         } = settings;
+        // Do not probe host rc files when the caller requests no capture and no inherited environment.
+        #[cfg(unix)]
+        let login_env = (!login_shell_capture
+            && shell_env_policy.as_ref().is_some_and(|policy| {
+                policy.inherit == crate::util::ShellEnvironmentPolicyInherit::None
+            }))
+        .then(HashMap::new);
         Self {
             cmd_rx,
             // Weak: a strong sender would keep the channel open and the actor
@@ -662,7 +669,7 @@ impl LocalTerminalActor {
             #[cfg(unix)]
             static_shell: None,
             #[cfg(unix)]
-            login_env: None,
+            login_env,
         }
     }
 
@@ -3512,6 +3519,75 @@ mod tests {
             kind: TaskKind::Bash,
             owner_session_id: None,
             description: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct LoginCaptureProbe(std::sync::atomic::AtomicUsize);
+
+    #[cfg(unix)]
+    impl crate::sandbox_launch::SandboxLaunch for LoginCaptureProbe {
+        fn prepare(
+            &self,
+            _cmd: &mut tokio::process::Command,
+            _original: &crate::sandbox_launch::OriginalArgv,
+            call: &crate::sandbox_launch::CallId,
+        ) -> Result<
+            Option<crate::sandbox_launch::LaunchReceipt>,
+            crate::sandbox_launch::SandboxLaunchError,
+        > {
+            if call.kind() == crate::sandbox_launch::CallKind::ShellInit {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(crate::sandbox_launch::SandboxLaunchError::new(
+                    std::io::Error::other("test forbids reading host rc files"),
+                ));
+            }
+            Ok(None)
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_capture_with_no_inheritance_skips_login_probe() {
+        use crate::util::{ShellEnvironmentPolicy, ShellEnvironmentPolicyInherit};
+        let strict = ShellEnvironmentPolicy {
+            inherit: ShellEnvironmentPolicyInherit::None,
+            ..Default::default()
+        };
+        for warm in [false, true] {
+            for policy in [
+                None,
+                Some(ShellEnvironmentPolicy::default()),
+                Some(strict.clone()),
+            ] {
+                let expected_probes = usize::from(
+                    policy
+                        .as_ref()
+                        .is_none_or(|p| p.inherit != ShellEnvironmentPolicyInherit::None),
+                );
+                let probe = Arc::new(LoginCaptureProbe::default());
+                let backend = LocalTerminalBackend::new_inner(LocalTerminalConfig {
+                    login_shell_capture: false,
+                    shell_env_policy: policy,
+                    sandbox_launch: Some(probe.clone()),
+                    ..Default::default()
+                });
+                let dir = tempfile::tempdir().unwrap();
+                if warm {
+                    backend.warm_shell(dir.path()).await;
+                }
+                let mut request = make_request("printf safe");
+                request.working_directory = dir.path().to_path_buf();
+                request.output_file = dir.path().join("output");
+                let result = backend.run(request).await.unwrap();
+                assert_eq!(result.combined_output, "safe");
+                assert_eq!(
+                    probe.0.load(std::sync::atomic::Ordering::Relaxed),
+                    expected_probes
+                );
+                backend.cancel();
+            }
         }
     }
 
