@@ -1,1 +1,2 @@
 harbor==0.25.0
+jsonschema==4.26.0

@@ -1,15 +1,18 @@
 import asyncio
+import hashlib
 import json
-import math
 import os
 import re
 import shlex
 import stat
-from contextlib import contextmanager
+import tempfile
+import uuid
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from pydantic import Field
+import jsonschema
+from pydantic import ConfigDict
 
 from harbor.agents.agent_auth_resolution import ModelConnectionSpec, ProviderAccess, require_model_api_key
 from harbor.agents.capabilities import AgentCapabilities
@@ -19,36 +22,61 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.model_api_format import ModelApiFormat
 
-MAX_BODY = 16 * 1024 * 1024
+RUNTIME = PurePosixPath("/opt/remanie-train-harness")
+MAX_RESULT_BYTES = 16 * 1024 * 1024
+IDENTITY = re.compile(r"^REMANIE_PROCESS=([1-9][0-9]*):([0-9]+)$", re.M)
+TRIAL_FIELDS = ("user_query", "workspace", "session_dir")
+CONNECTION_FIELDS = ("model", "base_url", "api_key_env")
 
 
-@contextmanager
-def bounded_log(root: Path, relative: str, limit: int):
-    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        parts = Path(relative).parts
-        for part in parts[:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = child
-        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        with os.fdopen(descriptor, "rb") as file:
-            info = os.fstat(file.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-                raise ValueError("Log must be a bounded regular file")
-            yield file
-    finally:
-        os.close(directory)
+class RemanieInfrastructureError(RuntimeError):
+    """The runner reported a failure the policy did not cause (its infrastructure exit code).
+    Not a NonZeroAgentExitCodeError, so Harbor skips the verifier."""
+
+
+@dataclass(frozen=True)
+class Bundle:
+    root: Path
+    architecture: str
+    sha256: str
+    input_schema: dict[str, Any]
+    exit_gradable: int
+    exit_infrastructure: int
+
+    @classmethod
+    def load(cls, root: Path) -> "Bundle":
+        root = root.expanduser().resolve()
+        for name in ("remanie-train-harness", "rg"):
+            executable = root / name
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                raise ValueError(f"runtime_dir must contain an executable {name}")
+        try:
+            manifest_bytes = (root / "manifest.json").read_bytes()
+            architecture = json.loads(manifest_bytes)["architecture"]
+            contract = json.loads((root / "contract.json").read_text())
+            codes = contract["exit_codes"]
+            return cls(
+                root=root,
+                architecture=architecture,
+                sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+                input_schema=contract["input"],
+                exit_gradable=codes["gradable"],
+                exit_infrastructure=codes["infrastructure"],
+            )
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise ValueError(f"runtime_dir is not a packaged bundle: {error!r}") from None
+
+    def validate_job(self, job: dict[str, Any]) -> None:
+        required = [name for name in self.input_schema.get("required", []) if name not in TRIAL_FIELDS]
+        try:
+            jsonschema.validate(job, {**self.input_schema, "required": required})
+        except jsonschema.ValidationError as error:
+            raise ValueError(f"Invalid runner setting at {error.json_path}: {error.message}") from None
 
 
 class RemanieOptions(InstalledAgentOptions):
+    model_config = ConfigDict(extra="allow")
     runtime_dir: Path
-    max_turns: int = Field(default=100, ge=1, le=512)
-    max_response_tokens: int = Field(default=4096, gt=0)
-    deadline_secs: int = Field(default=86400, ge=1, le=86400)
-    compaction_threshold_tokens: int = Field(default=0, ge=0)
-    compaction_max_tokens: int = Field(default=2048, gt=0)
-    sampling_params: dict[str, Any] = Field(default_factory=dict)
 
 
 class RemanieAgent(BaseInstalledAgent):
@@ -67,114 +95,138 @@ class RemanieAgent(BaseInstalledAgent):
             "default": ModelApiFormat.OPENAI_CHAT_COMPLETIONS,
         },
     )
-    runtime_path = PurePosixPath("/opt/remanie-train-harness")
 
-    def __init__(self, *args, model_name="openrouter/x-ai/grok-4.7", **kwargs):
-        super().__init__(*args, model_name=model_name, **kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         if self._prompt_template_path:
             raise ValueError("Remanie passes the task instruction unchanged")
-        self.runtime_dir = self.options.runtime_dir.expanduser().resolve()
-        for name in ("remanie-train-harness", "rg"):
-            executable = self.runtime_dir / name
-            if not executable.is_file() or not os.access(executable, os.X_OK):
-                raise ValueError(f"runtime_dir must contain an executable {name}")
-        self.run_dir = self.environment_logs_dir / "remanie"
+        if not self._parsed_model_name:
+            raise ValueError("Set model_name; Remanie has no default model")
+        self.bundle = Bundle.load(self.options.runtime_dir)
+        settings = dict(self.options.model_extra or {})
+        reserved = sorted(settings.keys() & {*TRIAL_FIELDS, *CONNECTION_FIELDS})
+        if reserved:
+            raise ValueError(f"Harbor supplies {', '.join(reserved)}; remove them from kwargs")
+        base_url = self.model_connection.execution_base_url
+        if not base_url:
+            raise ValueError("Set Harbor's base_url to an OpenAI-compatible /v1 endpoint")
+        self.job = {**settings, "model": self._parsed_model_name, "base_url": base_url}
+        self.bundle.validate_job(self.job)
+        self.exit_code: int | None = None
 
     @staticmethod
     def name() -> str:
         return "remanie-train-harness"
 
     async def install(self, environment: BaseEnvironment) -> None:
-        await self.exec_as_root(
+        probe = await self.exec_as_root(
             environment,
-            "mkdir -p /opt /usr/local/bin && command -v bash >/dev/null && command -v setsid >/dev/null",
+            "mkdir -p /opt && command -v bash >/dev/null && command -v setsid >/dev/null && uname -m",
         )
-        await environment.upload_dir(self.runtime_dir, str(self.runtime_path))
-        await self.exec_as_root(
-            environment,
-            f"chmod -R a+rX {self.runtime_path} && "
-            f"ln -sf {self.runtime_path}/remanie-train-harness /usr/local/bin/remanie-train-harness && "
-            f"ln -sf {self.runtime_path}/rg /usr/local/bin/rg && "
-            "/usr/local/bin/rg --version >/dev/null",
-        )
+        machine = (probe.stdout or "").strip()
+        if machine != self.bundle.architecture:
+            raise RuntimeError(f"Bundle is built for {self.bundle.architecture}; container runs {machine}")
+        await environment.upload_dir(self.bundle.root, str(RUNTIME))
+        await self.exec_as_root(environment, f"chmod -R a+rX {RUNTIME} && {RUNTIME}/rg --version >/dev/null")
+
+    def _credential(self) -> tuple[str, str] | None:
+        connection = self.model_connection
+        if self._model_api_key_name or connection.base_url_is_default:
+            require_model_api_key(connection, self.name())
+        if not connection.api_key:
+            return None
+        return connection.api_key_destination_name, connection.api_key
+
+    async def _upload_private(self, environment: BaseEnvironment, content: str, remote_path: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="remanie-") as directory:
+            local = Path(directory) / "credential"
+            local.touch(mode=0o600)
+            local.write_text(content)
+            await environment.upload_file(local, remote_path)
+        target = shlex.quote(remote_path)
+        owner = "" if environment.default_user is None else f"chown {shlex.quote(str(environment.default_user))} {target} && "
+        await self.exec_as_root(environment, f"{owner}chmod 600 {target}")
 
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
-        connection = self.model_connection
-        require_model_api_key(connection, self.name())
-        if not connection.execution_base_url:
-            raise ValueError("Set Harbor's base_url to an OpenAI-compatible /v1 endpoint")
+        credential = self._credential()
         cwd = await self.exec_as_agent(environment, "pwd -P")
         workspace = (cwd.stdout or "").rstrip("\n")
         if not PurePosixPath(workspace).is_absolute():
             raise RuntimeError("Task environment did not provide an absolute working directory")
-        await self.exec_as_agent(
-            environment, f"mkdir -p {shlex.quote(str(self.environment_logs_dir))}"
-        )
+        logs = self.environment_logs_dir
+        await self.exec_as_agent(environment, f"mkdir -p {shlex.quote(str(logs))}")
         config = {
-            "model": self._parsed_model_name,
-            "base_url": connection.execution_base_url,
-            "api_key_env": connection.api_key_destination_name,
+            **self.job,
+            "api_key_env": credential[0] if credential else None,
             "user_query": instruction,
             "workspace": workspace,
-            "session_dir": str(self.run_dir),
-            **self.options.model_dump(include={
-                "max_turns", "max_response_tokens", "deadline_secs",
-                "compaction_threshold_tokens", "compaction_max_tokens", "sampling_params",
-            }),
+            "session_dir": str(logs / "remanie"),
         }
-        config_path = self.environment_logs_dir / "input.json"
-        result_path = self.environment_logs_dir / "result.json"
-        stderr_path = self.environment_logs_dir / "runtime-stderr.txt"
-        script = (
-            'read -r process_stat < /proc/$$/stat; set -- ${process_stat##*) }; '
-            'printf "REMANIE_PROCESS=%s:%s\\n" "$$" "${20}"; '
-            f"exec {self.runtime_path}/remanie-train-harness "
-            f"< {shlex.quote(str(config_path))} "
-            f"> {shlex.quote(str(result_path))} "
-            f"2> {shlex.quote(str(stderr_path))}"
-        )
+        input_path = logs / "input.json"
         await self._upload_config_text(
             environment,
             content=json.dumps(config, allow_nan=False),
-            remote_path=str(config_path),
+            remote_path=str(input_path),
             filename="input.json",
         )
-        process = None
+        exports = f"RG_BIN_PATH={RUNTIME}/rg"
+        read_key = ""
+        if credential:
+            # Outside the logs directory: on Docker that directory is a host bind mount.
+            key_path = f"/tmp/remanie-{uuid.uuid4().hex}.key"
+            await self._upload_private(environment, credential[1] + "\n", key_path)
+            read_key = f"IFS= read -r key < {key_path}; rm -f -- {key_path}; "
+            exports = f'{credential[0]}="$key" {exports}'
+        script = (
+            'read -r process_stat < /proc/$$/stat; set -- ${process_stat##*) }; '
+            'printf "REMANIE_PROCESS=%s:%s\\n" "$$" "${20}"; '
+            f"{read_key}{exports} exec {RUNTIME}/remanie-train-harness "
+            f"< {shlex.quote(str(input_path))} "
+            f"> {shlex.quote(str(logs / 'result.json'))} "
+            f"2> {shlex.quote(str(logs / 'runtime-stderr.txt'))}"
+        )
+        identity = None
 
-        async def capture_process(text, stream):
-            nonlocal process
-            match = re.fullmatch(r"REMANIE_PROCESS=([1-9][0-9]*):([0-9]+)\n?", text)
-            if process is None and stream == "stdout" and match:
-                process = match.groups()
+        async def capture_identity(text, stream):
+            nonlocal identity
+            if identity is None and stream == "stdout" and (match := IDENTITY.search(text)):
+                identity = match.groups()
 
+        execution = asyncio.create_task(environment.exec(
+            command=f"exec setsid --wait bash -c {shlex.quote(script)}"
+        ))
         try:
-            with environment.scoped_output_callback(capture_process):
-                execution = asyncio.create_task(self.exec_as_agent(
-                    environment,
-                    f"exec setsid --wait bash -c {shlex.quote(script)}",
-                    env=dict(connection.env),
-                ))
+            with environment.scoped_output_callback(capture_identity):
                 result = await asyncio.shield(execution)
-                if process is None:
-                    await capture_process(result.stdout or "", "stdout")
-        finally:
-            cleanup = asyncio.create_task(self._stop_runtime(environment, process, execution))
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await cleanup
-                raise
-            finally:
-                if not execution.done():
-                    execution.cancel()
-                await asyncio.gather(execution, return_exceptions=True)
+        except BaseException:
+            await self._stop_after_interruption(environment, identity, execution)
+            raise
+        self.exit_code = result.return_code
+        if self.exit_code == self.bundle.exit_infrastructure:
+            raise RemanieInfrastructureError(
+                f"Runner reported an infrastructure failure (exit {self.exit_code}); see metadata remanie.result"
+            )
+        if self.exit_code != self.bundle.exit_gradable:
+            raise RuntimeError(f"Runner died with exit {self.exit_code}; container teardown required")
 
-    async def _stop_runtime(self, environment, process, execution):
-        if process is None:
+    async def _stop_after_interruption(self, environment, identity, execution):
+        cleanup = asyncio.create_task(self._stop_runtime(environment, identity, execution))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
+        finally:
+            if not execution.done():
+                execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+
+    async def _stop_runtime(self, environment, identity, execution):
+        if identity is None:
             raise RuntimeError("Runtime identity was not captured; container teardown required")
-        pid, started = process
+        pid, started = identity
         script = f"""
 pid={pid}
 alive() {{
@@ -192,89 +244,33 @@ kill -KILL -- "-$pid" 2>/dev/null || true
 exit 1
 """
         try:
-            await self.exec_as_agent(environment, script, timeout_sec=10)
-            await asyncio.wait_for(asyncio.shield(execution), timeout=10)
+            await self.exec_as_agent(environment, f"bash -c {shlex.quote(script)}", timeout_sec=10)
+            result = await asyncio.wait_for(asyncio.shield(execution), timeout=10)
         except Exception as exc:
             raise RuntimeError("Runtime shutdown was not confirmed; container teardown required") from exc
+        self.exit_code = result.return_code
+        if self.exit_code != self.bundle.exit_gradable:
+            raise RuntimeError(f"Runner exited {self.exit_code} after the stop signal; container teardown required")
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        metadata: dict[str, Any] = {}
+        metadata: dict[str, Any] = {"bundle_sha256": self.bundle.sha256, "exit_code": self.exit_code, "result": None}
         try:
-            with bounded_log(self.logs_dir, "result.json", MAX_BODY) as file:
-                raw = file.read(MAX_BODY + 1)
-                if len(raw) > MAX_BODY:
-                    raise ValueError("Result exceeds 16 MiB")
-                result = json.loads(raw)
-                if not isinstance(result, dict):
-                    raise ValueError("result must be an object")
-                metadata.update({
-                    key: result[key]
-                    for key in ("status", "turns", "compactions", "error")
-                    if key in result
-                })
+            descriptor = os.open(self.logs_dir / "result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as file:
+                info = os.fstat(file.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RESULT_BYTES:
+                    raise ValueError("result.json must be a bounded regular file")
+                result = json.loads(file.read(MAX_RESULT_BYTES + 1))
+            if not isinstance(result, dict):
+                raise ValueError("result.json must hold an object")
+            metadata["result"] = result
         except FileNotFoundError:
             pass
-        except (OSError, ValueError, TypeError, RecursionError):
+        except (OSError, ValueError, RecursionError):
             metadata["result_invalid"] = True
-
-        totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
-        requests = 0
-        responses = 0
-        complete = True
-        cost_count = 0
-        total_cost = 0.0
-        try:
-            with bounded_log(self.logs_dir, "remanie/trace.jsonl", 256 * 1024 * 1024) as trace:
-                total_bytes = 0
-                while line := trace.readline(MAX_BODY + 1025):
-                    total_bytes += len(line)
-                    if len(line) > MAX_BODY + 1024 or total_bytes > 256 * 1024 * 1024:
-                        raise ValueError("Trace exceeds read limits")
-                    try:
-                        event = json.loads(line)
-                    except (ValueError, RecursionError):
-                        metadata["trace_incomplete"] = True
-                        complete = False
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("event") in ("model_request", "compaction_request"):
-                        requests += 1
-                        continue
-                    if event.get("event") not in ("model_response", "compaction_response"):
-                        continue
-                    responses += 1
-                    body = event.get("body")
-                    usage = body.get("usage") if isinstance(body, dict) else None
-                    if not isinstance(usage, dict):
-                        complete = False
-                        continue
-                    details = usage.get("prompt_tokens_details")
-                    counts = {
-                        "prompt_tokens": usage.get("prompt_tokens"),
-                        "completion_tokens": usage.get("completion_tokens"),
-                        "cached_tokens": details.get("cached_tokens", 0) if isinstance(details, dict) else 0,
-                    }
-                    if all(type(n) is int and n >= 0 for n in counts.values()):
-                        for key, value in counts.items():
-                            totals[key] += value
-                    else:
-                        complete = False
-                    cost = usage.get("cost")
-                    if type(cost) in (int, float) and 0 <= cost <= 1e9 and math.isfinite(cost):
-                        cost_count += 1
-                        total_cost += cost
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            metadata["trace_incomplete"] = True
-            complete = False
-        complete = complete and requests == responses
-        if responses and complete:
-            context.n_input_tokens = totals["prompt_tokens"]
-            context.n_output_tokens = totals["completion_tokens"]
-            context.n_cache_tokens = totals["cached_tokens"]
-        if responses and requests == responses and cost_count == responses and not metadata.get("trace_incomplete"):
-            context.cost_usd = total_cost
-        metadata.update(request_count=requests, response_count=responses, usage_complete=bool(responses and complete))
+        usage = (metadata["result"] or {}).get("usage")
+        if isinstance(usage, dict) and usage.get("complete") is True:
+            counts = [usage.get(name) for name in ("prompt_tokens", "completion_tokens", "cached_tokens")]
+            if all(type(count) is int and count >= 0 for count in counts):
+                context.n_input_tokens, context.n_output_tokens, context.n_cache_tokens = counts
         context.metadata = {**(context.metadata or {}), "remanie": metadata}
