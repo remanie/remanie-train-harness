@@ -57,7 +57,7 @@ On exit 0 background tasks keep running so the verifier can reach them. On exit 
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. A compaction writes the system prompt, the task, and the kept turns again under the new segment. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, the continuation message, and the kept turns. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
 
 | `event` | Written | Fields |
 |---|---|---|
