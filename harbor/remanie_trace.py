@@ -45,7 +45,7 @@ class Trace:
     complete: bool
 
     @property
-    def outcome(self) -> dict[str, Any] | None:
+    def outcome(self) -> str | None:
         return self.result["outcome"] if self.result else None
 
     def request_body(self, call: Call) -> dict[str, Any]:

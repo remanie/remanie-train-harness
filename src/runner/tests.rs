@@ -656,7 +656,7 @@ async fn after_compaction_the_budget_starts_from_the_endpoint_count_not_bytes() 
     ])
     .await;
     let lines: String = (0..600)
-        .map(|i| format!("line {i:04} {}\n", "x".repeat(39)))
+        .map(|i| format!("line {i:04} {}\n", "x".repeat(89)))
         .collect();
     std::fs::write(f.workspace().join("big.txt"), lines).unwrap();
     f.config["context_window_tokens"] = json!(60_000);
@@ -672,8 +672,8 @@ async fn after_compaction_the_budget_starts_from_the_endpoint_count_not_bytes() 
         .map(|message| serde_json::to_vec(message).unwrap().len())
         .sum();
     assert!(
-        kept_bytes as u64 + 1000 > 60_000,
-        "the kept turns alone must exceed the window in bytes"
+        kept_bytes as u64 / 2 + 1000 > 60_000,
+        "the kept turns alone must exceed the window at two bytes per token"
     );
 }
 

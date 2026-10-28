@@ -247,6 +247,8 @@ struct ContextBudget {
     appended_bytes: u64,
 }
 
+const BYTES_PER_TOKEN: u64 = 2;
+
 impl ContextBudget {
     fn counted(&mut self, tokens: u64) {
         *self = Self {
@@ -266,7 +268,7 @@ impl ContextBudget {
     }
 
     fn estimate(&self) -> u64 {
-        self.counted + self.appended_bytes
+        self.counted + self.appended_bytes / BYTES_PER_TOKEN
     }
 }
 
@@ -476,12 +478,13 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let continuation = json!({"role": "user", "content": continuation});
     let summary_prompt = sampled.usage.map(|usage| usage.prompt_tokens);
     let counted = match (summary_prompt, cx.turn_prompts.get(&kept_start)) {
-        (Some(summary), Some(&dropped)) => {
-            Some(summary.saturating_sub(dropped) + cx.initial.iter().map(bytes).sum::<u64>())
-        }
+        (Some(summary), Some(&dropped)) => Some(
+            summary.saturating_sub(dropped)
+                + cx.initial.iter().map(bytes).sum::<u64>() / BYTES_PER_TOKEN,
+        ),
         _ => sampled.context_tokens,
     }
-    .map(|tokens| tokens + bytes(&continuation));
+    .map(|tokens| tokens + bytes(&continuation) / BYTES_PER_TOKEN);
     let mut messages = cx.initial.clone();
     messages.push(continuation);
     messages.extend(kept);
