@@ -30,7 +30,7 @@ CONNECTION_FIELDS = ("model", "base_url", "api_key_env")
 
 
 class RemanieInfrastructureError(RuntimeError):
-    """Not a NonZeroAgentExitCodeError, so Harbor skips the verifier."""
+    """It is not a NonZeroAgentExitCodeError, so Harbor skips the verifier."""
 
 
 @dataclass(frozen=True)
@@ -98,14 +98,14 @@ class RemanieAgent(BaseInstalledAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self._prompt_template_path:
-            raise ValueError("Remanie passes the task instruction unchanged")
+            raise ValueError("Remove the prompt template. Remanie passes the task instruction unchanged")
         if not self._parsed_model_name:
-            raise ValueError("Set model_name; Remanie has no default model")
+            raise ValueError("Set model_name. Remanie has no default model")
         self.bundle = Bundle.load(self.options.runtime_dir)
         settings = dict(self.options.model_extra or {})
         reserved = sorted(settings.keys() & {*TRIAL_FIELDS, *CONNECTION_FIELDS})
         if reserved:
-            raise ValueError(f"Harbor supplies {', '.join(reserved)}; remove them from kwargs")
+            raise ValueError(f"Harbor supplies {', '.join(reserved)}. Remove them from kwargs")
         base_url = self.model_connection.execution_base_url
         if not base_url:
             raise ValueError("Set Harbor's base_url to an OpenAI-compatible /v1 endpoint")
@@ -124,7 +124,7 @@ class RemanieAgent(BaseInstalledAgent):
         )
         machine = (probe.stdout or "").strip()
         if machine != self.bundle.architecture:
-            raise RuntimeError(f"Bundle is built for {self.bundle.architecture}; container runs {machine}")
+            raise RuntimeError(f"Bundle is built for {self.bundle.architecture}, but the container runs {machine}")
         await environment.upload_dir(self.bundle.root, str(RUNTIME))
         await self.exec_as_root(environment, f"chmod -R a+rX {RUNTIME} && {RUNTIME}/rg --version >/dev/null")
 
@@ -172,7 +172,7 @@ class RemanieAgent(BaseInstalledAgent):
         exports = f"RG_BIN_PATH={RUNTIME}/rg"
         read_key = ""
         if credential:
-            # Outside the logs directory: on Docker that directory is a host bind mount.
+            # Keep the key outside the logs directory, which Docker bind-mounts from the host.
             key_path = f"/tmp/remanie-{uuid.uuid4().hex}.key"
             await self._upload_private(environment, credential[1] + "\n", key_path)
             read_key = f"IFS= read -r key < {key_path}; rm -f -- {key_path}; "
@@ -205,10 +205,10 @@ class RemanieAgent(BaseInstalledAgent):
         self.exit_code = result.return_code
         if self.exit_code == self.bundle.exit_infrastructure:
             raise RemanieInfrastructureError(
-                f"Runner reported an infrastructure failure (exit {self.exit_code}); see metadata remanie.result"
+                f"Runner reported an infrastructure failure (exit {self.exit_code}). See metadata remanie.result"
             )
         if self.exit_code != self.bundle.exit_gradable:
-            raise RuntimeError(f"Runner died with exit {self.exit_code}; container teardown required")
+            raise RuntimeError(f"Runner died with exit {self.exit_code}. Tear down the container")
 
     async def _stop_after_interruption(self, environment, identity, execution):
         cleanup = asyncio.create_task(self._stop_runtime(environment, identity, execution))
@@ -224,7 +224,7 @@ class RemanieAgent(BaseInstalledAgent):
 
     async def _stop_runtime(self, environment, identity, execution):
         if identity is None:
-            raise RuntimeError("Runtime identity was not captured; container teardown required")
+            raise RuntimeError("Runtime identity was not captured. Tear down the container")
         pid, started = identity
         script = f"""
 pid={pid}
@@ -246,10 +246,10 @@ exit 1
             await self.exec_as_agent(environment, f"bash -c {shlex.quote(script)}", timeout_sec=10)
             result = await asyncio.wait_for(asyncio.shield(execution), timeout=10)
         except Exception as exc:
-            raise RuntimeError("Runtime shutdown was not confirmed; container teardown required") from exc
+            raise RuntimeError("Runtime shutdown was not confirmed. Tear down the container") from exc
         self.exit_code = result.return_code
         if self.exit_code != self.bundle.exit_gradable:
-            raise RuntimeError(f"Runner exited {self.exit_code} after the stop signal; container teardown required")
+            raise RuntimeError(f"Runner exited {self.exit_code} after the stop signal. Tear down the container")
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         metadata: dict[str, Any] = {"bundle_sha256": self.bundle.sha256, "exit_code": self.exit_code, "result": None}

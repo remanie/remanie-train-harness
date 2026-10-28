@@ -305,7 +305,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_runner_that_dies_badly_requires_teardown(self):
         _, task = await self.cancel_running("REMANIE_PROCESS=123:456\n", after_stop=137)
-        with self.assertRaisesRegex(RuntimeError, "teardown required"):
+        with self.assertRaisesRegex(RuntimeError, "Tear down the container"):
             await task
 
     async def test_stop_script_checks_process_identity(self):
