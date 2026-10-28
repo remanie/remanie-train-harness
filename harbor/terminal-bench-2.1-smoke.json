@@ -12,10 +12,9 @@
       "kwargs": {
         "runtime_dir": "runtime",
         "max_turns": 100,
-        "max_response_tokens": 32768,
-        "compaction_threshold_tokens": 400000,
-        "compaction_max_tokens": 4096,
-        "sampling_params": {"reasoning": {"effort": "high"}}
+        "deadline_secs": 840,
+        "sampling_params": {"max_tokens": 32768, "reasoning": {"effort": "high"}},
+        "compaction": {"threshold_tokens": 400000, "max_tokens": 4096}
       }
     }
   ],

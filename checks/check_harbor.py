@@ -24,6 +24,12 @@ from harbor.trial.trial import Trial
 from remanie_agent import RemanieAgent
 
 FAKE_KEY = "remanie-local-fixture-key"
+KWARGS = {
+    "max_turns": 4,
+    "deadline_secs": 120,
+    "sampling_params": {"max_tokens": 2048, "reasoning": {"effort": "high"}},
+    "compaction": {"threshold_tokens": 20_000, "max_tokens": 2048},
+}
 CATALOG = json.loads((CRATE / "assets/tools.json").read_text())
 
 
@@ -180,12 +186,7 @@ async def check(mode, runtime_dir, output_dir):
                 env={"OPENROUTER_API_KEY": FAKE_KEY},
                 override_timeout_sec=8 if mode in ("timeout", "cleanup_error") else 60,
                 override_setup_timeout_sec=120,
-                kwargs={
-                    "runtime_dir": str(runtime_dir), "max_turns": 4,
-                    "max_response_tokens": 2048, "deadline_secs": 120,
-                    "compaction_threshold_tokens": 20_000,
-                    "sampling_params": {"reasoning": {"effort": "high"}},
-                },
+                kwargs={"runtime_dir": str(runtime_dir), **KWARGS},
             ),
             environment=EnvironmentConfig(type="docker", delete=True),
             verifier=VerifierConfig(env={"REMANIE_CHECK_MODE": mode}),

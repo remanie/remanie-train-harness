@@ -1,8 +1,11 @@
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
 import shlex
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -20,34 +23,8 @@ from harbor.models.trial.config import AgentConfig
 from remanie_agent import RemanieAgent, RemanieInfrastructureError
 
 SECRET = "test-only-secret"
-CONTRACT = {
-    "exit_codes": {"gradable": 0, "infrastructure": 70},
-    "input": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["base_url", "model", "user_query", "workspace", "session_dir", "sampling_params", "max_turns"],
-        "properties": {
-            "base_url": {"type": "string"},
-            "api_key_env": {"type": ["string", "null"]},
-            "model": {"type": "string", "minLength": 1},
-            "user_query": {"type": "string"},
-            "workspace": {"type": "string"},
-            "session_dir": {"type": "string"},
-            "max_turns": {"type": "integer", "minimum": 1, "maximum": 512},
-            "sampling_params": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["max_tokens"],
-                "properties": {
-                    "max_tokens": {"type": "integer", "minimum": 1, "maximum": 4294967295},
-                    "reasoning": {"type": "object"},
-                },
-            },
-        },
-    },
-    "result": {"type": "object"},
-}
-JOB = {"max_turns": 7, "sampling_params": {"max_tokens": 4096, "reasoning": {"effort": "high"}}}
+REPO = Path(__file__).resolve().parents[1]
+JOB = {"max_turns": 7, "deadline_secs": 120, "sampling_params": {"max_tokens": 4096, "reasoning": {"effort": "high"}}}
 
 
 async def compose_argv(call):
@@ -78,7 +55,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         manifest = json.dumps({"architecture": "x86_64", "files": {}}).encode()
         (self.runtime / "manifest.json").write_bytes(manifest)
         self.bundle_sha256 = hashlib.sha256(manifest).hexdigest()
-        (self.runtime / "contract.json").write_text(json.dumps(CONTRACT))
+        shutil.copyfile(REPO / "assets/contract.json", self.runtime / "contract.json")
         self.logs = self.root / "logs"
         self.logs.mkdir()
         self.env = patch.dict(os.environ, {"OPENROUTER_API_KEY": SECRET}, clear=True)
@@ -86,13 +63,14 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.env.stop)
 
     def agent(self, *, model_name="openrouter/x-ai/grok-4.7", base_url=None, model_api_key_name=None, **kwargs):
+        settings = {key: value for key, value in {**JOB, **kwargs}.items() if value is not None}
         return AgentFactory.create_agent_from_config(
             AgentConfig(
                 import_path="remanie_agent:RemanieAgent",
                 model_name=model_name,
                 base_url=base_url,
                 model_api_key_name=model_api_key_name,
-                kwargs={"runtime_dir": str(self.runtime), **JOB, **kwargs},
+                kwargs={"runtime_dir": str(self.runtime), **settings},
             ),
             logs_dir=self.logs,
         )
@@ -190,7 +168,9 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
             {"model_name": None},
             {"max_turns": 0},
             {"max_turns": "7"},
-            {"sampling_params": {"max_tokens": 4096, "reasoning_efort": "high"}},
+            {"sampling_params": {"max_tokens": 4096, "stream": True}},
+            {"deadline_secs": 0},
+            {"deadline_secs": None},
             {"sampling_params": {"max_tokens": 4294967296}},
             {"sampling_params": {}},
             {"workspace": "/elsewhere"},
@@ -203,6 +183,30 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         (self.runtime / "contract.json").unlink()
         with self.assertRaisesRegex(ValueError, "packaged bundle"):
             self.agent()
+
+    def test_every_job_in_the_repository_passes_the_real_contract(self):
+        spec = importlib.util.spec_from_file_location("check_harbor", REPO / "checks/check_harbor.py")
+        check_harbor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(check_harbor)
+        listed = subprocess.run(["git", "ls-files", "*.json"], cwd=REPO, capture_output=True, text=True, check=True)
+        jobs = [
+            (path, agent["model_name"], agent["kwargs"])
+            for path in listed.stdout.split()
+            for agent in json.loads((REPO / path).read_text()).get("agents", [])
+            if agent.get("import_path") == "remanie_agent:RemanieAgent"
+        ]
+        self.assertIn("harbor/terminal-bench-2.1-smoke.json", [path for path, _, _ in jobs])
+        jobs.append(("checks/check_harbor.py", "openrouter/x-ai/grok-4.7", check_harbor.KWARGS))
+        for path, model_name, kwargs in jobs:
+            with self.subTest(job=path):
+                AgentFactory.create_agent_from_config(
+                    AgentConfig(
+                        import_path="remanie_agent:RemanieAgent",
+                        model_name=model_name,
+                        kwargs={**kwargs, "runtime_dir": str(self.runtime)},
+                    ),
+                    logs_dir=self.logs,
+                )
 
     async def test_credential_reaches_the_runner_only_through_a_private_file(self):
         agent = self.agent()
