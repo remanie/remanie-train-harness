@@ -101,8 +101,13 @@ struct Line<'a> {
     t_ms: u128,
 }
 
+enum Sink {
+    Open(File),
+    Truncated,
+}
+
 pub struct Trace {
-    file: Option<File>,
+    sink: Sink,
     written: u64,
     cap: u64,
     started: Instant,
@@ -115,7 +120,7 @@ impl Trace {
             .create_new(true)
             .open(session_dir.join("trace.jsonl"))?;
         Ok(Self {
-            file: Some(file),
+            sink: Sink::Open(file),
             written: 0,
             cap,
             started: Instant::now(),
@@ -136,7 +141,9 @@ impl Trace {
     }
 
     pub fn record(&mut self, event: &Event<'_>) {
-        let Some(file) = &mut self.file else { return };
+        let Sink::Open(file) = &mut self.sink else {
+            return;
+        };
         let line = Line {
             event,
             t_ms: self.started.elapsed().as_millis(),
@@ -148,12 +155,12 @@ impl Trace {
         });
         match written {
             Some(total) => self.written = total,
-            None => self.file = None,
+            None => self.sink = Sink::Truncated,
         }
     }
 
     pub fn truncated(&self) -> bool {
-        self.file.is_none()
+        matches!(self.sink, Sink::Truncated)
     }
 }
 
