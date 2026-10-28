@@ -90,7 +90,10 @@ impl Fixture {
 
     async fn launch(&self, key: Option<&str>) -> (Value, u8) {
         let input = serde_json::to_vec(&self.config).unwrap();
-        let result = run(&input, |_| key.map(OsString::from)).await;
+        let key = key.map(OsString::from);
+        let result = tokio::task::spawn_blocking(move || run(&input, |_| key))
+            .await
+            .unwrap();
         let exit = result.outcome.exit_code();
         (serde_json::to_value(&result).unwrap(), exit)
     }

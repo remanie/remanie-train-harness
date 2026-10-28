@@ -42,13 +42,28 @@ struct Compaction {
     max_tokens: u64,
 }
 
-pub async fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> RunResult {
+pub fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> RunResult {
     let started = std::time::Instant::now();
     let mut tally = Tally::default();
     let mut session_dir = None;
     let mut trace = None;
-    let outcome = attempt(stdin, take_key, &mut session_dir, &mut trace, &mut tally)
-        .await
+    let outcome = parse_input(stdin, &mut session_dir)
+        .and_then(|(raw, input)| {
+            let authorization = input
+                .api_key_env
+                .as_deref()
+                .map(|name| authorization(take_key(name), name))
+                .transpose()?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| internal(format!("start runtime: {error}")))?;
+            let outcome =
+                runtime.block_on(attempt(&raw, &input, authorization, &mut trace, &mut tally));
+            // A tool thread stuck in a blocking call, such as opening a FIFO, must not delay the exit.
+            runtime.shutdown_background();
+            outcome
+        })
         .unwrap_or_else(Outcome::Infrastructure);
     let truncated = trace.as_ref().is_some_and(Trace::truncated);
     let mut result = RunResult::new(outcome, tally, truncated, started.elapsed());
@@ -67,17 +82,12 @@ pub async fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) 
 }
 
 async fn attempt(
-    stdin: &[u8],
-    take_key: impl FnOnce(&str) -> Option<OsString>,
-    session_dir: &mut Option<PathBuf>,
+    raw: &Value,
+    input: &Input,
+    authorization: Option<HeaderValue>,
     trace: &mut Option<Trace>,
     tally: &mut Tally,
 ) -> Result<Outcome, Cause> {
-    let (raw, input) = parse_input(stdin, session_dir)?;
-    let authorization = match &input.api_key_env {
-        Some(name) => Some(authorization(take_key(name), name)?),
-        None => None,
-    };
     let url = reqwest::Url::parse(&format!(
         "{}/chat/completions",
         input.base_url.trim_end_matches('/')
@@ -99,10 +109,10 @@ async fn attempt(
         detail: format!("{error:#}"),
     })?;
     let definitions = tools.definitions();
-    trace.header(&raw, &definitions);
+    trace.header(raw, &definitions);
     let deadline = Instant::now() + Duration::from_secs(input.deadline_secs);
     let mut cx = Attempt {
-        input: &input,
+        input,
         model: ModelClient::new(
             http,
             url,
