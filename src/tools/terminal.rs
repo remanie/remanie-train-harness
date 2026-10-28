@@ -270,7 +270,6 @@ impl TerminalSession {
         }).collect())
     }
 
-    /// Leaves every background command running with its log; kills nothing.
     pub fn detach(self) -> Vec<LeftRunning> {
         lock(&self.state)
             .tasks
