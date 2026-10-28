@@ -73,7 +73,7 @@ When a write fails or the trace would pass 256 MiB, the runner stops tracing, fi
 
 ## Tools
 
-`assets/tools.json` holds Grok Build's tool descriptions without their usage notes, and its parameter names, types, descriptions, required lists, and defaults, with no added bounds. An unknown tool name, arguments that are not JSON or fail the schema, a bound the runner checks, and a tool's own error go back to the model as the tool message. They do not end the attempt.
+`assets/tools.json` holds Grok Build's tool descriptions without their usage notes. Its parameter names, types, descriptions, required lists, defaults, and bounds are Grok Build's too, except that `read_file`'s `format` accepts only `image` or `text` and defaults to `image`. An unknown tool name, arguments that are not JSON or fail the schema, a bound the runner checks, and a tool's own error go back to the model as the tool message. They do not end the attempt.
 
 | Tool | Enforced limits |
 |---|---|
