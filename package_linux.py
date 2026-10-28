@@ -21,6 +21,7 @@ def distro_notices(paths):
             )
             if result.returncode == 0:
                 owners = [owner for line in result.stdout.splitlines()
+                          if not line.startswith("diversion by ")
                           for owner in line.split(": ", 1)[0].split(", ")]
                 if owners:
                     break

@@ -27,7 +27,12 @@ class PackageNoticesTest(unittest.TestCase):
             )
             for name in ("LGPL-2.1", "GPL"):
                 (licenses / name).write_text("test license text\n")
-            owner = SimpleNamespace(returncode=0, stdout="libc6:arm64: /lib/libc.so.6\n")
+            owner = SimpleNamespace(
+                returncode=0,
+                stdout="diversion by libc6 from: /lib/libc.so.6\n"
+                "diversion by libc6 to: /lib/libc.so.6.usr-is-merged\n"
+                "libc6:arm64: /lib/libc.so.6\n",
+            )
             with patch.object(package_linux, "DEBIAN_DOCS", docs), \
                     patch.object(package_linux, "DEBIAN_LICENSES", licenses), \
                     patch.object(package_linux.subprocess, "run", return_value=owner):
