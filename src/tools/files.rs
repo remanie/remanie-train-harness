@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::Mutex;
 
-use super::{list_dir, terminal::capture};
+use super::{internal, list_dir, terminal::capture};
 
 const READ_MAX_BYTES: usize = 100_003;
 const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
@@ -19,15 +19,17 @@ const MAX_LINES: usize = 1_000;
 
 pub(super) struct FileTools {
     cwd: PathBuf,
-    home: PathBuf,
+    home: Option<PathBuf>,
+    ripgrep: PathBuf,
     todos: Mutex<IndexMap<String, Value>>,
 }
 
 impl FileTools {
-    pub(super) fn new(cwd: PathBuf, home: PathBuf) -> Self {
+    pub(super) fn new(cwd: PathBuf, home: Option<PathBuf>, ripgrep: PathBuf) -> Self {
         Self {
             cwd,
             home,
+            ripgrep,
             todos: Mutex::new(IndexMap::new()),
         }
     }
@@ -42,7 +44,7 @@ impl FileTools {
                         args["target_directory"]
                             .as_str()
                             .context("missing target_directory")?,
-                    ),
+                    )?,
                 )
                 .await
             }
@@ -56,18 +58,22 @@ impl FileTools {
         json!({"todos": *self.todos.lock().await})
     }
 
-    fn path(&self, input: &str) -> PathBuf {
-        if input == "~" {
-            return self.home.clone();
+    fn path(&self, input: &str) -> Result<PathBuf> {
+        if input != "~" && !input.starts_with("~/") {
+            return Ok(self.cwd.join(input));
         }
-        if let Some(relative) = input.strip_prefix("~/") {
-            return self.home.join(relative.trim_start_matches('/'));
-        }
-        self.cwd.join(input)
+        let home = self
+            .home
+            .clone()
+            .context("HOME is not set, so ~ cannot be expanded")?;
+        Ok(match input.strip_prefix("~/") {
+            Some(relative) => home.join(relative.trim_start_matches('/')),
+            None => home,
+        })
     }
 
     async fn read(&self, input: ReadInput) -> Result<String> {
-        let path = resolve_file(self.path(&input.target_file)).await;
+        let path = resolve_file(self.path(&input.target_file)?).await;
         let file = tokio::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -84,10 +90,6 @@ impl FileTools {
             .to_ascii_lowercase();
         let sample = reader.fill_buf().await?;
         if extension == "pdf" || sample.starts_with(b"%PDF-") {
-            ensure!(
-                input.format.as_deref() == Some("text"),
-                "non-text tool output is unsupported; use format=text for PDFs"
-            );
             ensure!(
                 metadata.len() <= MAX_DOCUMENT_BYTES,
                 "PDF exceeds the 50 MB limit"
@@ -113,6 +115,7 @@ impl FileTools {
         let mut saw_bytes = false;
         let mut last_newline = false;
         let mut trailing_empty = false;
+        let mut more = false;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let chunk = reader.fill_buf().await?;
@@ -138,6 +141,7 @@ impl FileTools {
                 }
                 reader.consume(consumed);
                 if line_number >= end {
+                    more = !reader.fill_buf().await?.is_empty();
                     break;
                 }
             }
@@ -170,6 +174,13 @@ impl FileTools {
             output.len() <= READ_MAX_BYTES,
             "file content exceeds 25000 tokens; use offset and limit to read a shorter range"
         );
+        if more && input.limit.is_none_or(|limit| limit >= MAX_LINES) {
+            write!(
+                output,
+                "\n[lines {start}-{} shown; file continues, use offset={end}]",
+                end - 1
+            )?;
+        }
         Ok(output)
     }
 
@@ -190,7 +201,7 @@ impl FileTools {
                 );
             }
         }
-        let path = resolve_file(self.path(&input.file_path)).await;
+        let path = resolve_file(self.path(&input.file_path)?).await;
         let mut existing = None;
         let old = match tokio::fs::OpenOptions::new()
             .read(true)
@@ -212,7 +223,7 @@ impl FileTools {
                     bytes.len() as u64 <= MAX_DOCUMENT_BYTES,
                     "file exceeds the 50 MB edit limit"
                 );
-                existing = Some(metadata);
+                existing = Some((file.into_std().await, metadata));
                 Some(String::from_utf8(bytes).context("cannot edit a non-UTF-8 file")?)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -243,8 +254,12 @@ impl FileTools {
                 count > 0,
                 "The string to replace was not found in the file, use the read_file tool to see the correct string."
             );
+            let overlapping = matching.find(needle.as_ref()).is_some_and(|start| {
+                let next = start + needle.chars().next().map_or(1, char::len_utf8);
+                matching[next..].contains(needle.as_ref())
+            });
             ensure!(
-                count == 1 || input.replace_all,
+                (count == 1 && !overlapping) || input.replace_all,
                 "The string to replace was found multiple times in the file. Use replace_all to replace all occurrences, or include more context to only edit one occurrence."
             );
             let replacement = if normalize {
@@ -305,7 +320,7 @@ impl FileTools {
             text.push_str(&old[copied..]);
             (text, false, count)
         };
-        atomic_write(&path, existing.as_ref(), &text)?;
+        write_file(&path, existing.as_ref(), &text)?;
         Ok(format!(
             "The file {} has been {}.{}",
             input.file_path,
@@ -319,7 +334,7 @@ impl FileTools {
     }
 
     async fn grep(&self, input: GrepInput) -> Result<String> {
-        let root = self.path(input.path.as_deref().unwrap_or(""));
+        let root = self.path(input.path.as_deref().unwrap_or(""))?;
         let mut args: Vec<String> = [
             "--heading",
             "--with-filename",
@@ -358,12 +373,20 @@ impl FileTools {
             "--".into(),
             root.to_string_lossy().into_owned(),
         ]);
-        let program = std::env::var_os("RG_BIN_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "rg".into());
-        let (code, output) = capture(&program, &args, &self.cwd, Duration::from_secs(20), 40_000)
-            .await
-            .context("grep failed; install ripgrep or set RG_BIN_PATH")?;
+        let (code, output) = capture(
+            &self.ripgrep,
+            &args,
+            &self.cwd,
+            Duration::from_secs(20),
+            40_000,
+        )
+        .await
+        .map_err(|error| {
+            internal(format!(
+                "ripgrep at {} could not run: {error:#}",
+                self.ripgrep.display()
+            ))
+        })?;
         ensure!(matches!(code, 0 | 1), "grep failed (exit {code}): {output}");
         if code == 1 || output.is_empty() {
             return Ok("No matches found".into());
@@ -499,40 +522,43 @@ impl FileTools {
     }
 }
 
-fn atomic_write(path: &Path, expected: Option<&std::fs::Metadata>, text: &str) -> Result<()> {
+// In place rather than rename, so the inode, owner, mode and hardlinks survive; a crash
+// mid-write can leave the file partly written.
+fn write_file(
+    path: &Path,
+    existing: Option<&(std::fs::File, std::fs::Metadata)>,
+    text: &str,
+) -> Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
 
-    let parent = path.parent().context("file path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(text.as_bytes())?;
-    temporary.flush()?;
-    if let Some(expected) = expected {
-        let current =
-            std::fs::symlink_metadata(path).context("file changed during edit; read_file again")?;
-        let fingerprint = |metadata: &std::fs::Metadata| {
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.len(),
-                metadata.mtime(),
-                metadata.mtime_nsec(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-            )
-        };
-        ensure!(
-            current.is_file() && fingerprint(&current) == fingerprint(expected),
-            "file changed during edit; read_file again"
-        );
-        temporary
-            .as_file()
-            .set_permissions(expected.permissions())?;
-        temporary.persist(path)?;
-    } else {
-        temporary.persist_noclobber(path)?;
-    }
+    let Some((file, expected)) = existing else {
+        std::fs::create_dir_all(path.parent().context("file path has no parent")?)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        return Ok(file.write_all(text.as_bytes())?);
+    };
+    let current =
+        std::fs::symlink_metadata(path).context("file changed during edit; read_file again")?;
+    let fingerprint = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    ensure!(
+        current.is_file() && fingerprint(&current) == fingerprint(expected),
+        "file changed during edit; read_file again"
+    );
+    file.write_all_at(text.as_bytes(), 0)?;
+    file.set_len(text.len() as u64)?;
     Ok(())
 }
 
@@ -542,7 +568,6 @@ struct ReadInput {
     offset: Option<usize>,
     limit: Option<usize>,
     pages: Option<String>,
-    format: Option<String>,
 }
 
 #[derive(Deserialize)]

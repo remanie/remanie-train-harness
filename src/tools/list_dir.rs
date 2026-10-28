@@ -1,11 +1,15 @@
 // Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
+use ignore::WalkState;
+
+use super::internal;
 
 const MAX_GLOBAL_ITEMS: usize = 100_000;
-const MAX_SEED_ITEMS: usize = MAX_GLOBAL_ITEMS;
+const IGNORE_FILES: [&str; 4] = [".ignore", ".gitignore", ".git", ".git/info/exclude"];
 const MAX_OUTPUT_BYTES: usize = 10_000;
 const TRUNCATION_NOTICE: &str = "    ...\n\nNote: this directory is too large to list fully. Try list_dir on a narrower path, or use grep / run_terminal_cmd.";
 
@@ -16,12 +20,45 @@ pub(super) async fn list(path: std::path::PathBuf) -> Result<String> {
         path.display()
     );
     tokio::task::spawn_blocking(move || {
-        let (mut tree, truncated) = build_tree(&path, true);
+        if let Some(file) = unreadable_ignore_file(&path) {
+            bail!(
+                "{} is not a regular file, so the ignore rules cannot be read",
+                file.display()
+            );
+        }
+        let (mut tree, truncated) = build_tree(&path);
         let body = budget_expand(&mut tree, MAX_OUTPUT_BYTES, 3, truncated, TRUNCATION_NOTICE);
-        format!("- {}/\n{}", path.display(), body.trim_end())
+        Ok(format!("- {}/\n{}", path.display(), body.trim_end()))
     })
     .await
-    .map_err(Into::into)
+    .map_err(internal)?
+}
+
+// The ignore crate opens ignore files with a blocking open, so a FIFO or device hangs it.
+fn special(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file() && !metadata.is_dir())
+}
+
+fn has_special_ignore_file(dir: &Path) -> bool {
+    IGNORE_FILES.iter().any(|name| special(&dir.join(name)))
+}
+
+fn unreadable_ignore_file(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    let git_config = home
+        .map(|home| home.join(".gitconfig"))
+        .into_iter()
+        .chain(config.map(|config| config.join("git/config")));
+    let root = root.canonicalize().ok()?;
+    root.ancestors()
+        .flat_map(|dir| IGNORE_FILES.map(|name| dir.join(name)))
+        .chain(git_config)
+        .find(|path| special(path))
+        .or_else(|| ignore::gitignore::gitconfig_excludes_path().filter(|path| special(path)))
 }
 
 #[derive(Debug, Default)]
@@ -188,79 +225,80 @@ impl DirNode {
         format!("{indent}{summary}\n")
     }
 }
-fn list_dir_walk_builder(root: &Path, respect_gitignore: bool) -> ignore::WalkBuilder {
+// The parallel walker reads a directory's ignore files only after `filter_entry` accepts it;
+// the sequential walker reads them even for a rejected directory.
+fn walk(
+    root: &Path,
+    min_depth: usize,
+    max_depth: Option<usize>,
+    max_items: usize,
+) -> (Vec<(Vec<String>, bool)>, bool) {
+    let unentered = Arc::new(Mutex::new(Vec::new()));
+    let record = unentered.clone();
     let mut builder = ignore::WalkBuilder::new(root);
     builder
-        .standard_filters(true)
-        .git_ignore(respect_gitignore)
-        .git_global(respect_gitignore)
-        .git_exclude(respect_gitignore);
-    builder
-}
-fn seed_depth1_children(
-    root: &Path,
-    root_node: &mut DirNode,
-    respect_gitignore: bool,
-    max_seed: usize,
-) -> bool {
-    let walker = list_dir_walk_builder(root, respect_gitignore)
-        .max_depth(Some(1))
-        .build();
-    let mut seed_count: usize = 0;
-    for entry in walker {
-        let Ok(entry) = entry else { continue };
-        if entry.depth() != 1 {
-            continue;
-        }
-        let Some(ft) = entry.file_type() else {
-            continue;
+        .min_depth(Some(min_depth))
+        .max_depth(max_depth)
+        .threads(1)
+        .filter_entry(move |entry| {
+            let enter = !entry.file_type().is_some_and(|kind| kind.is_dir())
+                || !has_special_ignore_file(entry.path());
+            if !enter {
+                lock(&record).push((entry.path().to_path_buf(), entry.depth()));
+            }
+            enter
+        });
+    let found = Mutex::new((Vec::new(), false));
+    let add = |path: &Path, is_dir: bool| {
+        let Some(parts) = path.strip_prefix(root).ok().and_then(|relative| {
+            relative
+                .iter()
+                .map(|c| c.to_str().map(str::to_owned))
+                .collect()
+        }) else {
+            return WalkState::Continue;
         };
-        let Some(name) = entry.file_name().to_str() else {
-            continue;
-        };
-        seed_count += 1;
-        if seed_count > max_seed {
-            return true;
+        let mut found = lock(&found);
+        if found.0.len() >= max_items {
+            found.1 = true;
+            return WalkState::Quit;
         }
-        root_node.add_item(&[name], ft.is_dir());
+        found.0.push((parts, is_dir));
+        WalkState::Continue
+    };
+    builder.build_parallel().run(|| {
+        Box::new(|entry| match entry {
+            Ok(entry) => match entry.file_type() {
+                Some(kind) => add(entry.path(), kind.is_dir()),
+                None => WalkState::Continue,
+            },
+            Err(_) => WalkState::Continue,
+        })
+    });
+    for (path, depth) in lock(&unentered).drain(..) {
+        if depth >= min_depth {
+            add(&path, true);
+        }
     }
-    false
+    found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-fn build_tree(root: &Path, respect_gitignore: bool) -> (DirNode, bool) {
-    build_tree_with_limit(root, respect_gitignore, MAX_GLOBAL_ITEMS)
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-fn build_tree_with_limit(
-    root: &Path,
-    respect_gitignore: bool,
-    max_items: usize,
-) -> (DirNode, bool) {
+fn build_tree(root: &Path) -> (DirNode, bool) {
+    build_tree_with_limit(root, MAX_GLOBAL_ITEMS)
+}
+fn build_tree_with_limit(root: &Path, max_items: usize) -> (DirNode, bool) {
     let mut root_node = DirNode::new(0);
-    let seed_truncated =
-        seed_depth1_children(root, &mut root_node, respect_gitignore, MAX_SEED_ITEMS);
-    let walker = list_dir_walk_builder(root, respect_gitignore).build();
-    let mut item_count: usize = 0;
-    let mut walk_truncated = false;
-    for entry in walker {
-        let Ok(entry) = entry else { continue };
-        let Some(ft) = entry.file_type() else {
-            continue;
-        };
-        if entry.depth() <= 1 {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
-        if parts.is_empty() {
-            continue;
-        }
-        item_count += 1;
-        if item_count > max_items {
-            walk_truncated = true;
-            break;
-        }
-        root_node.add_item(&parts, ft.is_dir());
+    let (seed, seed_truncated) = walk(root, 1, Some(1), MAX_GLOBAL_ITEMS);
+    let (deep, walk_truncated) = walk(root, 2, None, max_items);
+    for (parts, is_dir) in seed.iter().chain(&deep) {
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        root_node.add_item(&parts, *is_dir);
     }
     root_node.sort_recursive();
     (root_node, seed_truncated || walk_truncated)
@@ -391,7 +429,7 @@ mod tests {
                 std::fs::write(dir.path().join(name).join(format!("file{i}.rs")), "").unwrap();
             }
         }
-        let (mut tree, truncated) = build_tree_with_limit(dir.path(), true, 1);
+        let (mut tree, truncated) = build_tree_with_limit(dir.path(), 1);
         let output = budget_expand(&mut tree, MAX_OUTPUT_BYTES, 3, truncated, TRUNCATION_NOTICE);
         assert!(
             output.contains("- a/") && output.contains("- z/"),
@@ -407,7 +445,7 @@ mod tests {
         for i in 0..50 {
             std::fs::write(dir.path().join("large").join(format!("file{i}.rs")), "").unwrap();
         }
-        let (mut tree, truncated) = build_tree(dir.path(), true);
+        let (mut tree, truncated) = build_tree(dir.path());
         let output = budget_expand(&mut tree, 200, 3, truncated, TRUNCATION_NOTICE);
         assert!(
             output.contains("[50 files in subtree: 50 *.rs]"),
@@ -416,9 +454,65 @@ mod tests {
         for i in 0..100 {
             std::fs::write(dir.path().join(format!("wide-filename-{i}.txt")), "").unwrap();
         }
-        let (mut tree, truncated) = build_tree(dir.path(), true);
+        let (mut tree, truncated) = build_tree(dir.path());
         let output = budget_expand(&mut tree, 200, 3, truncated, TRUNCATION_NOTICE);
         assert!(output.contains("directory is too large"), "{output}");
         assert!(output.len() <= 200 + TRUNCATION_NOTICE.len(), "{output}");
+    }
+
+    #[test]
+    fn special_ignore_files_never_block_the_listing() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/inner")).unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
+        std::fs::write(dir.path().join("sub/inner/hidden-by-fifo.rs"), "").unwrap();
+        let fifo = |path: &Path| {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        };
+        fifo(&dir.path().join("sub/.gitignore"));
+        let listing = |root: PathBuf| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let _ = sender.send(runtime.block_on(list(root)).map_err(|e| e.to_string()));
+                std::mem::forget(runtime);
+            });
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("list_dir blocked on a special ignore file")
+        };
+        let output = listing(dir.path().to_path_buf()).unwrap();
+        assert!(
+            output.contains("- sub/") && output.contains("visible.txt"),
+            "{output}"
+        );
+        assert!(!output.contains("hidden-by-fifo.rs"), "{output}");
+        fifo(&dir.path().join(".ignore"));
+        let error = listing(dir.path().to_path_buf()).unwrap_err();
+        assert!(error.contains(".ignore is not a regular file"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_components_are_skipped_at_every_depth() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        std::fs::create_dir_all(bad.join("deeper")).unwrap();
+        std::fs::write(bad.join("deeper/misplaced.rs"), "").unwrap();
+        std::fs::write(dir.path().join("good.rs"), "").unwrap();
+        let (mut tree, truncated) = build_tree(dir.path());
+        let output = budget_expand(&mut tree, MAX_OUTPUT_BYTES, 3, truncated, TRUNCATION_NOTICE);
+        assert!(output.contains("good.rs"), "{output}");
+        assert!(
+            !output.contains("misplaced.rs") && !output.contains("deeper"),
+            "{output}"
+        );
     }
 }
