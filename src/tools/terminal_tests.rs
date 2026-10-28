@@ -3,9 +3,7 @@ use tempfile::TempDir;
 
 async fn fixture() -> (TempDir, TerminalSession) {
     let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("session");
-    tokio::fs::create_dir(&session).await.unwrap();
-    let terminal = TerminalSession::new(dir.path().into(), session)
+    let terminal = TerminalSession::new(dir.path().into(), dir.path().join("logs"))
         .await
         .unwrap();
     (dir, terminal)
@@ -13,6 +11,24 @@ async fn fixture() -> (TempDir, TerminalSession) {
 
 fn args(command: &str, block: u64) -> Value {
     json!({"command":command,"description":"exercise terminal","block_until_ms":block})
+}
+
+async fn run(terminal: &TerminalSession, command: &str, block: u64) -> (String, TaskId) {
+    terminal.run(&args(command, block)).await.unwrap()
+}
+
+async fn output(terminal: &TerminalSession, ids: &[TaskId], timeout_ms: u64) -> String {
+    terminal
+        .output(&json!({"task_ids":ids,"timeout_ms":timeout_ms}))
+        .await
+        .unwrap()
+}
+
+async fn kill(terminal: &TerminalSession, id: impl std::fmt::Display) -> String {
+    terminal
+        .kill(&json!({"task_id":id.to_string()}))
+        .await
+        .unwrap()
 }
 
 async fn read_pid(path: &Path) -> i32 {
@@ -46,221 +62,111 @@ async fn assert_reaped(pid: i32) {
 #[tokio::test]
 async fn foreground_background_wait_all_and_kill() {
     let (_dir, terminal) = fixture().await;
-    let output = terminal
-        .call(
-            "run_terminal_cmd",
-            &args(
-                "printf '\\033[31mhello\\033[0m'; printf error >&2; exit 7",
-                1000,
-            ),
-            "first",
-        )
-        .await
-        .unwrap();
+    let (foreground, _) = run(
+        &terminal,
+        "printf '\\033[31mhello\\033[0m'; printf error >&2; exit 7",
+        1000,
+    )
+    .await;
     assert!(
-        output.contains("Exit code: 7") && output.contains("hello") && output.contains("error")
+        foreground.contains("Exit code: 7")
+            && foreground.contains("hello")
+            && foreground.contains("error")
     );
-    assert!(!output.contains('\u{1b}'));
-    assert_eq!(terminal.snapshot().await, json!([]));
+    assert!(!foreground.contains('\u{1b}'));
+    assert_eq!(terminal.background_tasks(), json!([]));
 
-    terminal
-        .call(
-            "run_terminal_cmd",
-            &args("sleep 0.05; printf first-done", 1),
-            "first-bg",
-        )
-        .await
-        .unwrap();
-    let second = terminal
-        .call(
-            "run_terminal_cmd",
-            &args("sleep 0.1; printf second-done", 0),
-            "second-bg",
-        )
-        .await
-        .unwrap();
-    let second_id = second
-        .split_once("<task-id>")
-        .unwrap()
-        .1
-        .split_once("</task-id>")
-        .unwrap()
-        .0;
-    let output = terminal
-        .call(
-            "get_terminal_command_output",
-            &json!({"task_ids":["first-bg", second_id],"timeout_ms":2000}),
-            "wait",
-        )
-        .await
-        .unwrap();
+    let (_, first) = run(&terminal, "sleep 0.05; printf first-done", 1).await;
+    let (started, second) = run(&terminal, "sleep 0.1; printf second-done", 0).await;
+    assert!(started.contains(&format!("<task-id>{second}</task-id>")));
+    let waited = output(&terminal, &[first, second], 2000).await;
     assert!(
-        output.contains("2/2 tasks completed (wait_all)"),
-        "{output}"
+        waited.contains("2/2 tasks completed (wait_all)"),
+        "{waited}"
     );
-    assert!(output.contains("first-done") && output.contains("second-done"));
-    assert!(output.find("first-bg").unwrap() < output.find(second_id).unwrap());
+    assert!(waited.contains("first-done") && waited.contains("second-done"));
+    assert!(waited.find(&first.to_string()).unwrap() < waited.find(&second.to_string()).unwrap());
 
-    terminal
-        .call("run_terminal_cmd", &args("sleep 60", 1), "kill-me")
-        .await
-        .unwrap();
-    let snapshot = terminal
-        .call(
-            "get_terminal_command_output",
-            &json!({"task_ids":["kill-me"]}),
-            "poll",
-        )
-        .await
-        .unwrap();
-    assert!(snapshot.contains("Status: running"));
+    let (_, sleeper) = run(&terminal, "sleep 60", 1).await;
     assert!(
-        terminal
-            .call(
-                "kill_terminal_command",
-                &json!({"task_id":"kill-me"}),
-                "kill"
-            )
+        output(&terminal, &[sleeper], 0)
             .await
-            .unwrap()
-            .starts_with("killed:")
+            .contains("Status: running")
     );
+    assert!(kill(&terminal, sleeper).await.starts_with("killed:"));
     assert!(
-        terminal
-            .call(
-                "kill_terminal_command",
-                &json!({"task_id":"kill-me"}),
-                "again"
-            )
+        kill(&terminal, sleeper)
             .await
-            .unwrap()
             .starts_with("already_exited:")
     );
     assert!(
-        terminal
-            .call(
-                "get_terminal_command_output",
-                &json!({"task_ids":["kill-me"]}),
-                "poll"
-            )
+        output(&terminal, &[sleeper], 0)
             .await
-            .unwrap()
             .contains("Status: cancelled")
     );
-    assert!(
-        terminal
-            .call(
-                "kill_terminal_command",
-                &json!({"task_id":"unknown"}),
-                "missing"
-            )
-            .await
-            .unwrap()
-            .contains("not found")
-    );
-    assert!(
-        terminal
-            .snapshot()
-            .await
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|task| task["output"] == "")
-    );
-    terminal.shutdown().await;
-    assert!(
-        terminal
-            .call("run_terminal_cmd", &args("true", 0), "closed")
-            .await
-            .is_err()
-    );
+    assert!(kill(&terminal, "unknown").await.contains("not found"));
+    assert!(kill(&terminal, "task-99").await.contains("not found"));
+    terminal.kill_all().await;
 }
 
 #[tokio::test]
-async fn task_ids_stay_unique_across_foreground_and_background_calls() {
+async fn task_ids_count_up_across_foreground_and_background_commands() {
     let (_dir, terminal) = fixture().await;
-    let background = terminal
-        .call("run_terminal_cmd", &args("sleep 60", 0), "background")
-        .await
-        .unwrap();
-    assert!(background.contains("<task-id>background</task-id>"));
-    let foreground = terminal
-        .call(
-            "run_terminal_cmd",
-            &args("printf collision-ok", 1000),
-            "terminal-1",
-        )
-        .await
-        .unwrap();
-    assert!(foreground.contains("Exit code: 0") && foreground.contains("collision-ok"));
-    terminal.shutdown().await;
+    let (started, background) = run(&terminal, "sleep 60", 0).await;
+    let (finished, foreground) = run(&terminal, "printf done", 1000).await;
+    assert_eq!(
+        (background.to_string(), foreground.to_string()),
+        ("task-1".to_owned(), "task-2".to_owned())
+    );
+    assert!(started.contains("<task-id>task-1</task-id>"));
+    assert!(finished.contains("Exit code: 0") && finished.contains("done"));
+    terminal.kill_all().await;
 }
 
 #[tokio::test]
 async fn foreground_comments_and_arithmetic_run_without_background_errors() {
     let (_dir, terminal) = fixture().await;
-    for (id, command) in [
-        ("comment", "printf comment-ok # R&D"),
-        (
-            "arithmetic",
-            "((mask = 3 & (5 & 1))); printf 'arithmetic-%s' \"$mask\"",
-        ),
-        ("expansion", "printf 'expansion-%s' $((3 & (5 & 1)))"),
-        ("wait", "sleep 0.01 & wait # R&D"),
-        ("builtin-wait", "sleep 0.01 & builtin wait"),
-        ("command-wait", "sleep 0.01 & command wait"),
+    for command in [
+        "printf comment-ok # R&D",
+        "((mask = 3 & (5 & 1))); printf 'arithmetic-%s' \"$mask\"",
+        "printf 'expansion-%s' $((3 & (5 & 1)))",
+        "sleep 0.01 & wait # R&D",
+        "sleep 0.01 & builtin wait",
+        "sleep 0.01 & command wait",
     ] {
-        let output = terminal
-            .call("run_terminal_cmd", &args(command, 1000), id)
-            .await
-            .unwrap();
+        let (output, _) = run(&terminal, command, 1000).await;
         assert!(output.contains("Exit code: 0"), "{command}: {output}");
     }
-    terminal.shutdown().await;
+    terminal.kill_all().await;
 }
 
 #[tokio::test]
 async fn commands_inherit_the_runner_environment() {
     let (_dir, terminal) = fixture().await;
-    let output = terminal
-        .call(
-            "run_terminal_cmd",
-            &args(
-                "printf '%s|%s|%s|%s|%s' \"$HOME\" \"$PATH\" \"$CARGO_PKG_NAME\" \"$TERM\" \"$GIT_PAGER\"",
-                1000,
-            ),
-            "env",
-        )
-        .await
-        .unwrap();
+    let (output, _) = run(
+        &terminal,
+        "printf '%s|%s|%s|%s|%s' \"$HOME\" \"$PATH\" \"$CARGO_PKG_NAME\" \"$TERM\" \"$GIT_PAGER\"",
+        1000,
+    )
+    .await;
     let expected = format!(
         "{}|{}|remanie-train-harness|dumb|cat",
         std::env::var("HOME").unwrap(),
         std::env::var("PATH").unwrap()
     );
     assert!(output.contains(&expected), "{output}");
-    terminal.shutdown().await;
+    terminal.kill_all().await;
 }
 
 #[tokio::test]
-async fn bounded_logs_and_safe_names() {
+async fn bounded_logs() {
     let (dir, terminal) = fixture().await;
-    terminal
-        .call("run_terminal_cmd", &args("true", 1000), "../../escape")
-        .await
-        .unwrap();
-    assert!(!dir.path().join("escape.log").exists());
-    let output = terminal
-        .call(
-            "run_terminal_cmd",
-            &args(
-                "head -c 200000 /dev/zero | tr '\\0' x; printf tail-marker",
-                1000,
-            ),
-            "large",
-        )
-        .await
-        .unwrap();
+    let (output, _) = run(
+        &terminal,
+        "head -c 200000 /dev/zero | tr '\\0' x; printf tail-marker",
+        1000,
+    )
+    .await;
     assert!(output.len() < PREVIEW_BYTES + 1500);
     assert!(output.contains("tail-marker") && output.contains("truncated"));
 
@@ -276,7 +182,7 @@ async fn bounded_logs_and_safe_names() {
     let task = spawn(
         command,
         TaskState::new(
-            "cap".into(),
+            TaskId(1),
             "",
             "",
             dir.path(),
@@ -293,7 +199,7 @@ async fn bounded_logs_and_safe_names() {
         .unwrap();
     assert_eq!(tokio::fs::metadata(log_path).await.unwrap().len(), 1000);
     assert_eq!(lock(&task.state).signal.as_deref(), Some("output_limit"));
-    terminal.shutdown().await;
+    terminal.kill_all().await;
 }
 
 #[tokio::test]
@@ -346,21 +252,14 @@ async fn capture_bounds_timeout_and_cancellation_reap() {
 #[tokio::test]
 async fn dropped_session_and_aborted_foreground_leave_no_leader() {
     let (dir, terminal) = fixture().await;
-    terminal
-        .call(
-            "run_terminal_cmd",
-            &args("printf '%s' $$ > bg.pid; exec sleep 60", 0),
-            "drop",
-        )
-        .await
-        .unwrap();
+    run(&terminal, "printf '%s' $$ > bg.pid; exec sleep 60", 0).await;
     let pid = read_pid(&dir.path().join("bg.pid")).await;
     drop(terminal);
     assert_reaped(pid).await;
 
     let (dir, terminal) = fixture().await;
     let arguments = args("printf '%s' $$ > fg.pid; exec sleep 60", 300_000);
-    let call = terminal.call("run_terminal_cmd", &arguments, "abort");
+    let call = terminal.run(&arguments);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), call)
             .await
@@ -368,7 +267,7 @@ async fn dropped_session_and_aborted_foreground_leave_no_leader() {
     );
     let pid = read_pid(&dir.path().join("fg.pid")).await;
     assert_reaped(pid).await;
-    terminal.shutdown().await;
+    terminal.kill_all().await;
 }
 
 #[tokio::test]
@@ -397,33 +296,21 @@ async fn kill_shutdown_and_drop_stop_the_entire_process_group() {
 
     for action in ["kill", "shutdown", "drop"] {
         let (dir, terminal) = fixture().await;
-        terminal
-            .call(
-                "run_terminal_cmd",
-                &args(
-                    "printf '%s' $$ > leader.pid; sleep 60 & printf '%s' $! > child.pid; wait",
-                    0,
-                ),
-                action,
-            )
-            .await
-            .unwrap();
+        let (_, id) = run(
+            &terminal,
+            "printf '%s' $$ > leader.pid; sleep 60 & printf '%s' $! > child.pid; wait",
+            0,
+        )
+        .await;
         let leader = read_pid(&dir.path().join("leader.pid")).await;
         let child = read_pid(&dir.path().join("child.pid")).await;
         assert_eq!(unsafe { libc::kill(leader, 0) }, 0);
         assert_eq!(unsafe { libc::kill(child, 0) }, 0);
         match action {
             "kill" => {
-                let id = terminal.snapshot().await[0]["task_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned();
-                terminal
-                    .call("kill_terminal_command", &json!({"task_id":id}), "kill")
-                    .await
-                    .unwrap();
+                kill(&terminal, id).await;
             }
-            "shutdown" => terminal.shutdown().await,
+            "shutdown" => terminal.kill_all().await,
             "drop" => drop(terminal),
             _ => unreachable!(),
         }

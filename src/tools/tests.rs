@@ -4,16 +4,18 @@ use tempfile::TempDir;
 
 async fn fixture() -> (TempDir, ToolSession) {
     let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("session");
-    tokio::fs::create_dir(&session).await.unwrap();
-    let tools = ToolSession::new(dir.path().to_path_buf(), session)
+    let tools = ToolSession::new(dir.path().to_path_buf(), dir.path().join("logs"))
         .await
         .unwrap();
     (dir, tools)
 }
 
+async fn call(tools: &ToolSession, name: &str, args: Value) -> ToolOutput {
+    tools.call(name, &args.to_string()).await.unwrap()
+}
+
 async fn running_pid(tools: &ToolSession, dir: &TempDir) -> String {
-    tools.call("run_terminal_cmd", json!({"command":"printf '%s' $$ > tracked.pid; exec sleep 60", "description":"test process cleanup", "block_until_ms":0}), "cleanup").await.unwrap();
+    call(tools, "run_terminal_cmd", json!({"command":"printf '%s' $$ > tracked.pid; exec sleep 60", "description":"test process cleanup", "block_until_ms":0})).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Ok(pid) = tokio::fs::read_to_string(dir.path().join("tracked.pid")).await
@@ -52,94 +54,111 @@ async fn files_catalog_and_validation() {
         assert_eq!(function["parameters"], tools.catalog[name]["parameters"]);
         assert_eq!(function["description"], tools.catalog[name]["description"]);
     }
-    for (name, args) in [
-        ("task", json!({})),
+    for (name, args, kind) in [
+        ("task", "{}", ToolErrorKind::UnknownTool),
         (
-            "run_terminal_cmd",
-            json!({"command":"true", "description":"test", "timeout":1}),
+            "read_file",
+            "{\"target_file\":",
+            ToolErrorKind::InvalidArguments,
         ),
         (
             "run_terminal_cmd",
-            json!({"command":"true", "description":"test", "block_until_ms":300001}),
+            r#"{"command":"true", "description":"test", "timeout":1}"#,
+            ToolErrorKind::InvalidArguments,
         ),
         (
             "run_terminal_cmd",
-            json!({"command":"true", "description":"test", "block_until_ms":"0"}),
+            r#"{"command":"true", "description":"test", "block_until_ms":300001}"#,
+            ToolErrorKind::InvalidArguments,
+        ),
+        (
+            "run_terminal_cmd",
+            r#"{"command":"true", "description":"test", "block_until_ms":"0"}"#,
+            ToolErrorKind::InvalidArguments,
+        ),
+        (
+            "run_terminal_cmd",
+            r#"{"command":"true", "description":"test", "block_until_ms":0.5}"#,
+            ToolErrorKind::InvalidArguments,
         ),
         (
             "get_terminal_command_output",
-            json!({"task_ids":[], "timeout_ms":0}),
+            r#"{"task_ids":[], "timeout_ms":0}"#,
+            ToolErrorKind::InvalidArguments,
         ),
-        ("grep", json!({"pattern":"test", "output_mode":"content"})),
+        (
+            "grep",
+            r#"{"pattern":"test", "output_mode":"content"}"#,
+            ToolErrorKind::InvalidArguments,
+        ),
         (
             "todo_write",
-            json!({"todos":[{"id":"x", "status":"wrong"}]}),
+            r#"{"todos":[{"id":"x", "status":"wrong"}]}"#,
+            ToolErrorKind::InvalidArguments,
+        ),
+        (
+            "read_file",
+            r#"{"target_file":"missing.txt"}"#,
+            ToolErrorKind::Failed,
         ),
     ] {
+        let output = tools.call(name, args).await.unwrap();
+        assert_eq!(
+            output.error,
+            Some(kind),
+            "{name} {args}: {}",
+            output.content
+        );
         assert!(
-            tools.call(name, args, "invalid").await.is_err(),
-            "accepted {name}"
+            output.content.starts_with("Tool error: "),
+            "{}",
+            output.content
         );
     }
-    tools
-        .call(
-            "search_replace",
-            json!({"file_path":"sample.txt", "old_string":"", "new_string":"before\nkeep\n"}),
-            "create",
-        )
-        .await
-        .unwrap();
-    tools
-        .call(
-            "search_replace",
-            json!({"file_path":"sample.txt", "old_string":"", "new_string":"erase"}),
-            "guard",
-        )
-        .await
-        .ok();
+    call(
+        &tools,
+        "search_replace",
+        json!({"file_path":"sample.txt", "old_string":"", "new_string":"before\nkeep\n"}),
+    )
+    .await;
+    let guard = call(
+        &tools,
+        "search_replace",
+        json!({"file_path":"sample.txt", "old_string":"", "new_string":"erase"}),
+    )
+    .await;
+    assert_eq!(guard.error, Some(ToolErrorKind::Failed));
     assert_eq!(
         tokio::fs::read_to_string(dir.path().join("sample.txt"))
             .await
             .unwrap(),
         "before\nkeep\n"
     );
-    tools
-        .call(
-            "search_replace",
-            json!({"file_path":"sample.txt", "old_string":"before", "new_string":"after"}),
-            "edit",
-        )
-        .await
-        .unwrap();
-    let read = tools
-        .call("read_file", json!({"target_file":"sample.txt"}), "read")
-        .await
-        .unwrap();
-    assert!(read.contains("after"));
-    assert!(!read.contains("system-reminder"));
-    let listing = tools
-        .call("list_dir", json!({"target_directory":"."}), "list")
-        .await
-        .unwrap();
-    assert!(listing.contains("sample.txt"));
-    let grep = tools
-        .call(
-            "grep",
-            json!({"pattern":"after", "path":"sample.txt"}),
-            "grep",
-        )
-        .await
-        .unwrap();
-    assert!(grep.contains("after"), "native grep result: {grep}");
-    let invalid_regex = tools
-        .call(
-            "grep",
-            json!({"pattern":"[", "path":"sample.txt"}),
-            "invalid-regex",
-        )
-        .await
-        .unwrap_err();
-    assert!(invalid_regex.to_string().contains("grep failed"));
+    call(
+        &tools,
+        "search_replace",
+        json!({"file_path":"sample.txt", "old_string":"before", "new_string":"after"}),
+    )
+    .await;
+    let read = call(&tools, "read_file", json!({"target_file":"sample.txt"})).await;
+    assert!(read.error.is_none() && read.content.contains("after"));
+    assert!(!read.content.contains("system-reminder"));
+    let listing = call(&tools, "list_dir", json!({"target_directory":"."})).await;
+    assert!(listing.content.contains("sample.txt"));
+    let grep = call(
+        &tools,
+        "grep",
+        json!({"pattern":"after", "path":"sample.txt"}),
+    )
+    .await;
+    assert!(
+        grep.content.contains("after"),
+        "native grep result: {}",
+        grep.content
+    );
+    let invalid_regex = call(&tools, "grep", json!({"pattern":"[", "path":"sample.txt"})).await;
+    assert_eq!(invalid_regex.error, Some(ToolErrorKind::Failed));
+    assert!(invalid_regex.content.contains("grep failed"));
     for filename in ["AGENTS.md", "SKILL.md"] {
         tokio::fs::write(
             dir.path().join(filename),
@@ -147,17 +166,15 @@ async fn files_catalog_and_validation() {
         )
         .await
         .unwrap();
-        let read = tools
-            .call(
-                "read_file",
-                json!({"target_file":filename, "offset":2, "limit":1}),
-                "window",
-            )
-            .await
-            .unwrap();
-        assert!(read.contains("included-middle"));
-        assert!(!read.contains("excluded-first"));
-        assert!(!read.contains("excluded-last"));
+        let read = call(
+            &tools,
+            "read_file",
+            json!({"target_file":filename, "offset":2, "limit":1}),
+        )
+        .await;
+        assert!(read.content.contains("included-middle"));
+        assert!(!read.content.contains("excluded-first"));
+        assert!(!read.content.contains("excluded-last"));
     }
     let png = [
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
@@ -167,108 +184,130 @@ async fn files_catalog_and_validation() {
     tokio::fs::write(dir.path().join("pixel.png"), png)
         .await
         .unwrap();
-    let error = tools
-        .call("read_file", json!({"target_file":"pixel.png"}), "image")
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("non-text"));
-    tools.shutdown().await;
+    let image = call(&tools, "read_file", json!({"target_file":"pixel.png"})).await;
+    assert_eq!(image.error, Some(ToolErrorKind::Failed));
+    assert!(image.content.contains("non-text"));
+    tools.kill_all().await;
+}
+
+#[tokio::test]
+async fn integral_floats_are_honoured_as_integers() {
+    let (_dir, tools) = fixture().await;
+    let started = std::time::Instant::now();
+    let background = call(
+        &tools,
+        "run_terminal_cmd",
+        json!({"command":"sleep 2", "description":"float block", "block_until_ms":0.0}),
+    )
+    .await;
     assert!(
-        tools
-            .call("list_dir", json!({"target_directory":"."}), "closed")
-            .await
-            .is_err()
+        background.content.contains("<task-id>"),
+        "{}",
+        background.content
     );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let started = std::time::Instant::now();
+    let blocked = call(
+        &tools,
+        "run_terminal_cmd",
+        json!({"command":"sleep 3", "description":"float block", "block_until_ms":1000.0}),
+    )
+    .await;
+    assert!(blocked.content.contains("<task-id>"), "{}", blocked.content);
+    assert!(started.elapsed() < Duration::from_millis(2500));
+    let id = blocked.task_id.unwrap();
+    let waited = call(
+        &tools,
+        "get_terminal_command_output",
+        json!({"task_ids":[id], "timeout_ms":10000.0}),
+    )
+    .await;
+    assert!(
+        waited.content.contains("Status: completed"),
+        "{}",
+        waited.content
+    );
+    tools.kill_all().await;
+}
+
+#[tokio::test]
+async fn a_broken_tool_runtime_is_an_internal_error() {
+    let (dir, mut tools) = fixture().await;
+    tools.files = FileTools::new(
+        dir.path().to_path_buf(),
+        None,
+        dir.path().join("no-such-rg"),
+    );
+    let Err(error) = tools.call("grep", r#"{"pattern":"x"}"#).await else {
+        panic!("a missing ripgrep reached the model");
+    };
+    assert!(error.0.starts_with("grep: ripgrep at "), "{error}");
+    tools.kill_all().await;
 }
 
 #[tokio::test]
 async fn todos_merge_and_reset_per_attempt() {
     let (_dir, tools) = fixture().await;
-    tools.call("todo_write", json!({"todos":[{"id":"a", "content":"first"}, {"id":"b", "content":"second"}], "merge":false}), "todos").await.unwrap();
-    tools
-        .call(
-            "todo_write",
-            json!({"todos":[{"id":"a", "status":"completed"}], "merge":true}),
-            "partial",
-        )
-        .await
-        .unwrap();
-    let state = tools.snapshot().await.unwrap();
+    call(&tools, "todo_write", json!({"todos":[{"id":"a", "content":"first"}, {"id":"b", "content":"second"}], "merge":false})).await;
+    call(
+        &tools,
+        "todo_write",
+        json!({"todos":[{"id":"a", "status":"completed"}], "merge":true}),
+    )
+    .await;
+    let state = tools.state().await;
     assert_eq!(state["todos"]["todos"]["a"]["content"], "first");
     assert_eq!(state["todos"]["todos"]["a"]["status"], "completed");
     assert_eq!(state["todos"]["todos"]["b"]["content"], "second");
     let (_other_dir, other) = fixture().await;
-    assert_eq!(other.snapshot().await.unwrap()["todos"]["todos"], json!({}));
-    tools
-        .call("todo_write", json!({"todos":[], "merge":false}), "clear")
-        .await
-        .unwrap();
-    assert_eq!(tools.snapshot().await.unwrap()["todos"]["todos"], json!({}));
-    tools.shutdown().await;
-    other.shutdown().await;
+    assert_eq!(other.state().await["todos"]["todos"], json!({}));
+    call(&tools, "todo_write", json!({"todos":[], "merge":false})).await;
+    assert_eq!(tools.state().await["todos"]["todos"], json!({}));
+    tools.kill_all().await;
+    other.kill_all().await;
 }
 
 #[tokio::test]
 async fn background_wait_kill_and_shutdown() {
     let (dir, tools) = fixture().await;
-    tools.call("run_terminal_cmd", json!({"command":"sleep 0.1; printf finished", "description":"test background waiting", "block_until_ms":1}), "waited").await.unwrap();
-    let tasks = tools.snapshot().await.unwrap();
-    let id = tasks["background_tasks"][0]["task_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let output = tools
-        .call(
-            "get_terminal_command_output",
-            json!({"task_ids":[id], "timeout_ms":2000}),
-            "wait",
-        )
-        .await
-        .unwrap();
-    assert!(output.contains("finished"));
-    assert!(output.contains("completed"));
+    let waited = call(&tools, "run_terminal_cmd", json!({"command":"sleep 0.1; printf finished", "description":"test background waiting", "block_until_ms":1})).await;
+    let id = waited.task_id.unwrap();
+    let output = call(
+        &tools,
+        "get_terminal_command_output",
+        json!({"task_ids":[id], "timeout_ms":2000}),
+    )
+    .await;
+    assert!(output.content.contains("finished"));
+    assert!(output.content.contains("completed"));
     assert!(
-        tools.snapshot().await.unwrap()["background_tasks"]
+        tools.state().await["background_tasks"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|task| task["task_id"] == id && task["completed"] == true)
+            .any(|task| task["task_id"] == id.to_string() && task["completed"] == true)
     );
 
-    tools.call("run_terminal_cmd", json!({"command":"sleep 60", "description":"test explicit cancellation", "block_until_ms":0}), "kill-me").await.unwrap();
-    let tasks = tools.snapshot().await.unwrap();
-    let id = tasks["background_tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|task| task["completed"] == false)
-        .unwrap()["task_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let output = tools
-        .call(
-            "get_terminal_command_output",
-            json!({"task_ids":[id], "timeout_ms":0}),
-            "snapshot",
-        )
-        .await
-        .unwrap();
-    assert!(output.contains("running"));
-    tools
-        .call("kill_terminal_command", json!({"task_id":id}), "kill")
-        .await
-        .unwrap();
+    let running = call(&tools, "run_terminal_cmd", json!({"command":"sleep 60", "description":"test explicit cancellation", "block_until_ms":0})).await;
+    let id = running.task_id.unwrap();
+    let output = call(
+        &tools,
+        "get_terminal_command_output",
+        json!({"task_ids":[id], "timeout_ms":0}),
+    )
+    .await;
+    assert!(output.content.contains("running"));
+    call(&tools, "kill_terminal_command", json!({"task_id":id})).await;
     assert!(
-        tools.snapshot().await.unwrap()["background_tasks"]
+        tools.state().await["background_tasks"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|task| task["task_id"] == id && task["completed"] == true)
+            .any(|task| task["task_id"] == id.to_string() && task["completed"] == true)
     );
 
     let pid = running_pid(&tools, &dir).await;
-    tokio::time::timeout(Duration::from_secs(8), tools.shutdown())
+    tokio::time::timeout(Duration::from_secs(8), tools.kill_all())
         .await
         .unwrap();
     assert_process_exited(&pid).await;

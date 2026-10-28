@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::Mutex;
 
-use super::{list_dir, terminal::capture};
+use super::{internal, list_dir, terminal::capture};
 
 const READ_MAX_BYTES: usize = 100_003;
 const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
@@ -20,14 +20,16 @@ const MAX_LINES: usize = 1_000;
 pub(super) struct FileTools {
     cwd: PathBuf,
     home: Option<PathBuf>,
+    ripgrep: PathBuf,
     todos: Mutex<IndexMap<String, Value>>,
 }
 
 impl FileTools {
-    pub(super) fn new(cwd: PathBuf, home: Option<PathBuf>) -> Self {
+    pub(super) fn new(cwd: PathBuf, home: Option<PathBuf>, ripgrep: PathBuf) -> Self {
         Self {
             cwd,
             home,
+            ripgrep,
             todos: Mutex::new(IndexMap::new()),
         }
     }
@@ -88,10 +90,6 @@ impl FileTools {
             .to_ascii_lowercase();
         let sample = reader.fill_buf().await?;
         if extension == "pdf" || sample.starts_with(b"%PDF-") {
-            ensure!(
-                input.format.as_deref() == Some("text"),
-                "non-text tool output is unsupported; use format=text for PDFs"
-            );
             ensure!(
                 metadata.len() <= MAX_DOCUMENT_BYTES,
                 "PDF exceeds the 50 MB limit"
@@ -375,12 +373,20 @@ impl FileTools {
             "--".into(),
             root.to_string_lossy().into_owned(),
         ]);
-        let program = std::env::var_os("RG_BIN_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "rg".into());
-        let (code, output) = capture(&program, &args, &self.cwd, Duration::from_secs(20), 40_000)
-            .await
-            .context("grep failed; install ripgrep or set RG_BIN_PATH")?;
+        let (code, output) = capture(
+            &self.ripgrep,
+            &args,
+            &self.cwd,
+            Duration::from_secs(20),
+            40_000,
+        )
+        .await
+        .map_err(|error| {
+            internal(format!(
+                "ripgrep at {} could not run: {error:#}",
+                self.ripgrep.display()
+            ))
+        })?;
         ensure!(matches!(code, 0 | 1), "grep failed (exit {code}): {output}");
         if code == 1 || output.is_empty() {
             return Ok("No matches found".into());
@@ -562,7 +568,6 @@ struct ReadInput {
     offset: Option<usize>,
     limit: Option<usize>,
     pages: Option<String>,
-    format: Option<String>,
 }
 
 #[derive(Deserialize)]

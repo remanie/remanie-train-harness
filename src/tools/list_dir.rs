@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail, ensure};
 use ignore::WalkState;
 
+use super::internal;
+
 const MAX_GLOBAL_ITEMS: usize = 100_000;
 const IGNORE_FILES: [&str; 4] = [".ignore", ".gitignore", ".git", ".git/info/exclude"];
 const MAX_OUTPUT_BYTES: usize = 10_000;
@@ -28,7 +30,8 @@ pub(super) async fn list(path: std::path::PathBuf) -> Result<String> {
         let body = budget_expand(&mut tree, MAX_OUTPUT_BYTES, 3, truncated, TRUNCATION_NOTICE);
         Ok(format!("- {}/\n{}", path.display(), body.trim_end()))
     })
-    .await?
+    .await
+    .map_err(internal)?
 }
 
 // The ignore crate opens ignore files with a blocking open, so a FIFO or device hangs it.

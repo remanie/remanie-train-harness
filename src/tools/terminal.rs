@@ -7,11 +7,14 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
+
+use super::internal;
 
 const PREVIEW_BYTES: usize = 20_000;
 const POLL_BYTES: usize = 40_000;
@@ -40,62 +43,76 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskId(u32);
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task-{}", self.0)
+    }
+}
+
+impl Serialize for TaskId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl TaskId {
+    fn parse(id: &str) -> Option<Self> {
+        id.strip_prefix("task-")?.parse().ok().map(Self)
+    }
+}
+
 struct State {
-    closed: bool,
-    next_id: u64,
-    tasks: BTreeMap<String, Arc<Task>>,
+    next_id: u32,
+    tasks: BTreeMap<TaskId, Arc<Task>>,
 }
 
 pub struct TerminalSession {
     cwd: PathBuf,
-    session_dir: PathBuf,
+    log_dir: PathBuf,
     state: Mutex<State>,
 }
 
 impl TerminalSession {
-    pub async fn new(cwd: PathBuf, session_dir: PathBuf) -> Result<Self> {
-        tokio::fs::create_dir(session_dir.join("terminal"))
+    pub async fn new(cwd: PathBuf, log_dir: PathBuf) -> Result<Self> {
+        tokio::fs::create_dir_all(&log_dir)
             .await
-            .context("create attempt terminal")?;
+            .context("create command log directory")?;
         Ok(Self {
             cwd,
-            session_dir,
+            log_dir,
             state: Mutex::new(State {
-                closed: false,
                 next_id: 0,
                 tasks: BTreeMap::new(),
             }),
         })
     }
 
-    pub async fn call(&self, name: &str, args: &Value, call_id: &str) -> Result<String> {
-        ensure!(!lock(&self.state).closed, "tool session has ended");
-        match name {
-            "run_terminal_cmd" => self.run(args, call_id).await,
-            "get_terminal_command_output" => self.output(args).await,
-            "kill_terminal_command" => {
-                let id = args["task_id"].as_str().context("missing task_id")?;
-                let task = lock(&self.state).tasks.get(id).cloned();
-                let Some(task) = task else {
-                    return Ok(format!("Task {id} not found."));
-                };
-                let running = task.stop("cancelled", true);
-                if running {
-                    tokio::time::timeout(REAP_TIMEOUT, task.wait())
-                        .await
-                        .context("timed out reaping cancelled command")?;
-                }
-                Ok(if running {
-                    format!("killed: Task {id} was terminated.")
-                } else {
-                    format!("already_exited: Task {id} has already exited.")
-                })
-            }
-            _ => bail!("unknown terminal tool: {name}"),
-        }
+    fn task(&self, id: &str) -> Option<Arc<Task>> {
+        TaskId::parse(id).and_then(|id| lock(&self.state).tasks.get(&id).cloned())
     }
 
-    async fn run(&self, args: &Value, call_id: &str) -> Result<String> {
+    pub async fn kill(&self, args: &Value) -> Result<String> {
+        let id = args["task_id"].as_str().context("missing task_id")?;
+        let Some(task) = self.task(id) else {
+            return Ok(format!("Task {id} not found."));
+        };
+        let running = task.stop("cancelled", true);
+        if running {
+            tokio::time::timeout(REAP_TIMEOUT, task.wait())
+                .await
+                .context("timed out reaping cancelled command")?;
+        }
+        Ok(if running {
+            format!("killed: Task {id} was terminated.")
+        } else {
+            format!("already_exited: Task {id} has already exited.")
+        })
+    }
+
+    pub async fn run(&self, args: &Value) -> Result<(String, TaskId)> {
         let started = tokio::time::Instant::now();
         let command = args["command"].as_str().context("missing command")?;
         let description = args["description"]
@@ -107,33 +124,27 @@ impl TerminalSession {
             block == 0 || !unwaited_background(command),
             "Do not use an unwaited background '&'; use block_until_ms=0 instead."
         );
-        let log_path = {
+        let id = {
             let mut state = lock(&self.state);
-            ensure!(!state.closed, "tool session has ended");
             state.next_id += 1;
-            let local = format!("terminal-{}", state.next_id);
-            self.session_dir
-                .join("terminal")
-                .join(format!("{local}.log"))
+            TaskId(state.next_id)
         };
+        let log_path = self.log_dir.join(format!("{id}.log"));
         let log = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&log_path)
             .await
-            .context("create command output log")?;
-        let id = call_id.to_owned();
+            .map_err(|error| internal(format!("create command output log: {error}")))?;
         let mut cmd = clean_command(Path::new("/bin/bash"), &self.cwd);
         cmd.args(["--noprofile", "--norc", "-c", command])
             .envs(NON_INTERACTIVE_ENV);
         let task = {
             let mut state = lock(&self.state);
-            ensure!(!state.closed, "tool session has ended");
-            ensure!(!state.tasks.contains_key(&id), "duplicate terminal task id");
             let task = spawn(
                 cmd,
                 TaskState::new(
-                    id.clone(),
+                    id,
                     command,
                     description,
                     &self.cwd,
@@ -144,7 +155,7 @@ impl TerminalSession {
                 MAX_LOG_BYTES,
                 MAX_RUNTIME,
             )?;
-            state.tasks.insert(id.clone(), task.clone());
+            state.tasks.insert(id, task.clone());
             task
         };
         let mut abort = AbortOnDrop(Some(task.clone()));
@@ -157,18 +168,21 @@ impl TerminalSession {
             lock(&self.state).tasks.remove(&id);
             let state = lock(&task.state);
             state.check_error()?;
-            Ok(state.foreground())
+            Ok((state.foreground(), id))
         } else {
             let mut state = lock(&task.state);
             state.background = true;
-            Ok(format!(
-                "<task-id>{id}</task-id>\n<task-type>bash</task-type>\n<output-file>{}</output-file>\n<status>running</status>\n<summary>Background task {id} started</summary>\nUse get_terminal_command_output with task_ids=[\"{id}\"] when you need the output.",
-                state.output_file.as_ref().unwrap().display()
+            Ok((
+                format!(
+                    "<task-id>{id}</task-id>\n<task-type>bash</task-type>\n<output-file>{}</output-file>\n<status>running</status>\n<summary>Background task {id} started</summary>\nUse get_terminal_command_output with task_ids=[\"{id}\"] when you need the output.",
+                    state.output_file.as_ref().unwrap().display()
+                ),
+                id,
             ))
         }
     }
 
-    async fn output(&self, args: &Value) -> Result<String> {
+    pub async fn output(&self, args: &Value) -> Result<String> {
         let ids = args["task_ids"].as_array().context("missing task_ids")?;
         ensure!(
             !ids.is_empty() && ids.len() <= 20,
@@ -176,15 +190,13 @@ impl TerminalSession {
         );
         let timeout = args["timeout_ms"].as_u64().unwrap_or(0);
         ensure!(timeout <= 300_000, "timeout_ms exceeds 300000");
-        let tasks = {
-            let state = lock(&self.state);
-            ids.iter()
-                .map(|id| {
-                    let id = id.as_str().context("task_id must be a string")?;
-                    Ok((id.to_owned(), state.tasks.get(id).cloned()))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+        let tasks = ids
+            .iter()
+            .map(|id| {
+                let id = id.as_str().context("task_id must be a string")?;
+                Ok((id.to_owned(), self.task(id)))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
         if timeout > 0 {
             for (_, task) in &tasks {
@@ -222,7 +234,7 @@ impl TerminalSession {
         Ok(output)
     }
 
-    pub async fn snapshot(&self) -> Value {
+    pub fn background_tasks(&self) -> Value {
         let state = lock(&self.state);
         Value::Array(state.tasks.values().filter_map(|task| {
             let state = lock(&task.state);
@@ -237,7 +249,7 @@ impl TerminalSession {
         }).collect())
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn kill_all(self) {
         let tasks = self.close();
         let deadline = tokio::time::Instant::now() + REAP_TIMEOUT;
         for task in tasks {
@@ -246,9 +258,11 @@ impl TerminalSession {
     }
 
     fn close(&self) -> Vec<Arc<Task>> {
-        let mut state = lock(&self.state);
-        state.closed = true;
-        let tasks = state.tasks.values().cloned().collect::<Vec<_>>();
+        let tasks = lock(&self.state)
+            .tasks
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         for task in &tasks {
             task.stop("cancelled", false);
         }
@@ -268,7 +282,7 @@ struct Task {
 }
 
 struct TaskState {
-    id: String,
+    id: TaskId,
     command: String,
     description: Option<String>,
     cwd: PathBuf,
@@ -291,7 +305,7 @@ struct TaskState {
 
 impl TaskState {
     fn new(
-        id: String,
+        id: TaskId,
         command: &str,
         description: &str,
         cwd: &Path,
@@ -323,7 +337,7 @@ impl TaskState {
 
     fn check_error(&self) -> Result<()> {
         if let Some(error) = &self.error {
-            bail!("terminal command failed: {error}");
+            return Err(internal(format!("terminal command failed: {error}")));
         }
         Ok(())
     }
@@ -700,7 +714,7 @@ pub async fn capture(
     command.args(args);
     let task = spawn(
         command,
-        TaskState::new(String::new(), "", "", cwd, None, max_bytes),
+        TaskState::new(TaskId(0), "", "", cwd, None, max_bytes),
         None,
         0,
         timeout,
