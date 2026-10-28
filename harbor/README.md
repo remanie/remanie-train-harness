@@ -18,7 +18,7 @@ The output directory must be new. It holds the runner, `rg`, their Linux loader 
 | Setting | Meaning |
 |---|---|
 | `model_name` | Required. The adapter refuses a job without one. |
-| `base_url` | Optional. Without it, Harbor's model connection supplies OpenRouter's URL and requires `OPENROUTER_API_KEY`. It must be reachable from the sandbox. |
+| `base_url` | Optional. Without it, Harbor's model connection supplies OpenRouter's URL and requires `OPENROUTER_API_KEY`. The URL must be reachable from the sandbox. |
 | `model_api_key_name` | Optional. Names the host variable that holds the key. With a custom `base_url` and no key name, the runner sends no key. |
 | `kwargs.runtime_dir` | The bundle directory. |
 | other `kwargs` | Runner settings from [the input table](../README.md#input), such as `max_turns`, `deadline_secs`, `sampling_params`, and `compaction`. |
@@ -26,9 +26,10 @@ The output directory must be new. It holds the runner, `rg`, their Linux loader 
 Harbor supplies `model`, `base_url`, `api_key_env`, `user_query`, `workspace`, and `session_dir`, so `kwargs` must not set them. Before any sandbox starts, the adapter refuses the job in these cases:
 
 - The runner settings fail the input schema in the bundle's `contract.json`.
-- The selected key has no value on the host.
 - The job sets a prompt template.
 - The bundle lacks `remanie-train-harness`, `rg`, `manifest.json`, or `contract.json`.
+
+When the selected key has no value on the host, `run` raises before it executes anything in the sandbox.
 
 `terminal-bench-2.1-smoke.json` is a complete job. `harbor/test_remanie_agent.py` checks every job file in the repository against `assets/contract.json`.
 
@@ -47,7 +48,7 @@ Harbor supplies `model`, `base_url`, `api_key_env`, `user_query`, `workspace`, a
 
 On every path the adapter sets `context.metadata["remanie"]` to the runner's `exit_code`, the bundle's `bundle_sha256`, and `result`, the parsed `result.json` or null when there is none. When `usage.complete` is true it also sets `n_input_tokens`, `n_output_tokens`, and `n_cache_tokens`.
 
-Each trial directory holds `agent/result.json`, `agent/remanie/trace.jsonl`, and `agent/runtime-stderr.txt`. The stderr file is for diagnostics and has no fixed format.
+Each trial directory holds `agent/input.json`, `agent/result.json` (the runner's stdout), `agent/remanie/trace.jsonl`, `agent/remanie/result.json`, and `agent/runtime-stderr.txt`. The stderr file is empty unless the runner panicked or failed to start.
 
 ## Train with Miles
 
@@ -63,7 +64,7 @@ Leave `compaction` unset under the v1 linear session server. A compaction opens 
 import remanie_trace
 
 trace = remanie_trace.read("eval-results/<job>/<trial>/agent/remanie")
-trace.outcome                            # "completed", ..., or None when the runner died
+trace.outcome                            # "completed", ..., or None when the trace has no result event
 body = trace.request_body(trace.calls[0])  # the chat-completions body of the first call
 trace.usage()                            # token totals, with complete False when any are missing
 ```
