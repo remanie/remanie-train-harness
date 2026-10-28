@@ -54,8 +54,8 @@ CI
 
 .github/workflows/checks.yml runs on every pull request and every push to
 main. It runs cargo fmt --check, cargo clippy, cargo test, and licenses.py
---check, then builds and packages the bundle, rerecords the trace fixture
-and fails when harbor/fixtures/requests.jsonl differs, runs pytest with
-REMANIE_BUNDLE set, and compiles every tracked Python file. It does not run
-check_harbor.py, so run that by hand after a change to the adapter, the
+--check, then builds and packages the bundle. Next it rerecords the trace
+fixture and fails when harbor/fixtures/requests.jsonl differs, runs pytest
+with REMANIE_BUNDLE set, and compiles every tracked Python file. It does not
+run check_harbor.py, so run that by hand after a change to the adapter, the
 launch or stop scripts, the exit codes, or the background-task rules.
