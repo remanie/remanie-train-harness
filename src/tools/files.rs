@@ -16,6 +16,7 @@ use super::{internal, invalid, list_dir, terminal::capture};
 const READ_MAX_BYTES: usize = 100_003;
 const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_LINES: usize = 1_000;
+const GREP_MAX_BYTES: usize = 40_000;
 
 pub(super) struct FileTools {
     cwd: PathBuf,
@@ -388,7 +389,7 @@ impl FileTools {
             &args,
             &self.cwd,
             Duration::from_secs(20),
-            40_000,
+            GREP_MAX_BYTES,
         )
         .await
         .map_err(|error| {
@@ -412,8 +413,17 @@ impl FileTools {
             text.push_str("\n... [output truncated. Narrow the path or pattern.] ...");
         }
         if unread {
+            let messages: Vec<_> = errors.lines().collect();
             text.push_str("\n\n");
-            text.push_str(errors.trim_end());
+            text.push_str(&messages[..messages.len().min(3)].join("\n"));
+            if messages.len() > 3 {
+                let cut = if errors.len() >= GREP_MAX_BYTES {
+                    "at least "
+                } else {
+                    ""
+                };
+                write!(text, "\n({cut}{} more rg errors)", messages.len() - 3)?;
+            }
         }
         Ok(text)
     }

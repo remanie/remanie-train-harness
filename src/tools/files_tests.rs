@@ -949,14 +949,16 @@ async fn a_missing_ripgrep_is_internal_and_a_bad_pattern_is_not() {
 }
 
 #[tokio::test]
-async fn grep_returns_its_matches_when_some_file_is_unreadable() {
+async fn grep_returns_its_matches_and_three_errors_when_files_are_unreadable() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "needle here\n").unwrap();
-    let locked = dir.path().join("b.txt");
-    std::fs::write(&locked, "needle too\n").unwrap();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    if std::fs::read(&locked).is_ok() {
+    for n in 0..5 {
+        let locked = dir.path().join(format!("locked-{n}.txt"));
+        std::fs::write(&locked, "needle too\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    if std::fs::read(dir.path().join("locked-0.txt")).is_ok() {
         eprintln!("skipping: this user can read a mode-000 file");
         return;
     }
@@ -969,8 +971,29 @@ async fn grep_returns_its_matches_when_some_file_is_unreadable() {
         matches.contains("a.txt") && matches.contains("needle here"),
         "{output}"
     );
+    let note: Vec<_> = note.lines().collect();
+    assert_eq!(note.len(), 4, "{output}");
     assert!(
-        note.starts_with("rg: ") && note.contains("b.txt"),
+        note[..3]
+            .iter()
+            .all(|line| line.contains("locked-") && line.contains("Permission denied")),
         "{output}"
+    );
+    assert_eq!(note[3], "(2 more rg errors)");
+    for n in 5..600 {
+        let locked = dir
+            .path()
+            .join(format!("locked-{n}-{}.txt", "x".repeat(60)));
+        std::fs::write(&locked, "needle too\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let output = file_tools(dir.path())
+        .call("grep", &json!({"pattern":"needle"}))
+        .await
+        .unwrap();
+    let last = output.lines().last().unwrap();
+    assert!(
+        last.starts_with("(at least ") && last.ends_with(" more rg errors)"),
+        "{last}"
     );
 }
