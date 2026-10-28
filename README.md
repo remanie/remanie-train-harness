@@ -14,18 +14,17 @@ It is a training runtime, not a coding assistant. It has no interactive mode, no
 |---|---|---|
 | `base_url` | yes | `http` or `https` URL whose path ends in `/v1`, with no credentials, query, or fragment. |
 | `model` | yes | Model name sent with every request. |
-| `api_key_env` | no | Environment variable that holds the key. The runner reads it and removes it before any tool starts. Without it, requests carry no `Authorization` header. |
+| `api_key_env` | no | Environment variable that holds the key. The runner reads it and removes it before any tool starts. When it is null or absent, requests carry no `Authorization` header. |
 | `user_query` | yes | The task text. |
 | `workspace` | yes | Existing absolute directory. Commands start here. |
 | `session_dir` | yes | Absolute path that must not exist yet. Its parent must exist. It receives `trace.jsonl`, `result.json`, and the command logs. |
-| `sampling_params` | yes | Forwarded verbatim. Must contain `max_tokens`. Must not set `model`, `messages`, `tools`, `tool_choice`, `stream`, `stream_options`, `n`, `logprobs`, or `input_ids`. |
+| `sampling_params` | yes | Forwarded verbatim. Must contain `max_tokens`, 1 to 4294967295. Must not set `model`, `messages`, `tools`, `tool_choice`, or `stream`. |
 | `max_turns` | yes | Model calls allowed, 1 to 512. |
 | `deadline_secs` | yes | Wall-clock limit, 1 to 86400. Set it below Harbor's agent timeout. |
-| `compaction` | no | `{threshold_tokens, max_tokens}`. Without it the runner never compacts. |
-| `retry` | no | `{attempts, base_backoff_ms, max_backoff_ms}`, default 6, 2000, and 30000. |
-| `keep_background_tasks` | no | Default `true`. |
+| `context_window_tokens` | no | The model's context size. The runner ends the attempt as `context_overflow` before sending a request that cannot fit. |
+| `compaction` | no | `{threshold_tokens, max_tokens}`. When it is null or absent, the runner never compacts. |
 
-With compaction on, the runner asks for a summary once the last reported prompt size plus the bytes of new tool output plus the response reserve reaches `threshold_tokens`. The summary request sends `tool_choice: "none"` and `max_tokens` from `compaction`. The next request starts a new history of the system prompt, the task, and a continuation message with the summary, the todo list, and the background tasks.
+With compaction on, the runner asks for a summary once the last reported prompt size plus the bytes of new tool output plus the response reserve reaches `threshold_tokens`. The summary request sends `tool_choice: "none"` and `max_tokens` from `compaction`. The next segment starts with the system prompt, the task, and a continuation message that carries the summary and the todo list, followed by the last two assistant turns and their tool results.
 
 ## Exit codes and result
 
@@ -35,39 +34,39 @@ With compaction on, the runner asks for a summary once the last reported prompt 
 | 70 | Infrastructure failure. Do not grade. |
 | anything else | The process died, for example a panic (101) or a signal. Do not grade. |
 
-Exit 0 ends with one of these outcomes:
+`contract.json` lists each outcome and the `cause.kind` values it can carry.
 
-| `outcome` | When |
-|---|---|
-| `completed` | The model replied without tool calls. |
-| `max_turns` | The runner made `max_turns` model calls. The last turn's tools ran. |
-| `max_tokens` | The reply ended with `finish_reason: "length"`. |
-| `context_overflow` | The endpoint returned 400 with a body that names the context length. |
-| `invalid_response` | An empty reply, a tool call that is not a function, two tool calls in one reply sharing an id, or an unusable summary. |
-| `deadline` | `deadline_secs` passed. |
-| `cancelled` | The runner received SIGTERM or SIGINT. |
+| `outcome` | Exit | When |
+|---|---|---|
+| `completed` | 0 | The model replied without tool calls. |
+| `max_turns` | 0 | The runner made `max_turns` model calls. The last turn's tools ran. |
+| `max_tokens` | 0 | The reply ended with `finish_reason: "length"`. |
+| `context_overflow` | 0 | The next request would not fit `context_window_tokens` (`context_window`), exceeds 16 MiB (`request_size`), or the endpoint refused it for its length (`endpoint_rejected`). |
+| `invalid_response` | 0 | `empty_turn`, `malformed_message`, `malformed_tool_call`, `duplicate_call_id` within one reply, `unexpected_finish`, or `invalid_summary`. |
+| `deadline` | 0 | `deadline_secs` passed. `cause.request_in_flight` says whether a model request was abandoned. |
+| `cancelled` | 0 | The runner received SIGTERM or SIGINT. |
+| `infrastructure` | 70 | `config`, `endpoint_unavailable`, `endpoint_status`, `connection_lost`, `endpoint_response`, `tool_runtime`, or `internal`. |
 
-Exit 70 covers an endpoint that still fails after the retries, an endpoint status the runner does not retry, a response the runner cannot parse, a configuration error, a tool runtime failure, and a missing runtime dependency. The runner resends a request with identical bytes only when the endpoint did not process it: a connection failure before the request was sent, 429, and 503. Backoff starts at 2 s, doubles with jitter up to 30 s, honors `Retry-After`, and stops at the deadline.
+The runner resends a request with identical bytes only when the endpoint did not process it.
 
-The runner writes `<session_dir>/result.json` atomically on every exit it controls and prints the same object on stdout. Its fields are `schema`, `outcome`, `cause` (exit 70 only, with up to 64 KiB of the endpoint's error body), `gradable`, `final_answer`, `turns`, `compactions`, `model_calls`, `usage` (`prompt_tokens`, `completion_tokens`, `cached_tokens`, and `complete`, false when any response lacked usage), `tool_calls` (`total`, `ok`, `tool_error`, `invalid_arguments`, `unknown_tool`), `background_tasks_left_running` (`task_id`, `pid`, `command`), `trace` (`path`, `events`, `truncated`), and `wall_time`.
+The runner writes `<session_dir>/result.json` atomically on every exit it controls and prints the same object on stdout. Its fields are `contract`, `outcome`, `cause`, `gradable`, `final_answer`, `turns`, `compactions`, `model_calls`, `usage` (`prompt_tokens`, `completion_tokens`, `cached_tokens`, and `complete`, false when any response lacked usage), `tool_calls` (`total`, `ok`, `failed`, `invalid_arguments`, `unknown_tool`), `background_tasks_left_running` (`task_id`, `pid`, `command`), `trace_truncated`, and `wall_time_ms`.
 
 On exit 0 background tasks keep running so the verifier can reach them. On exit 70 the runner kills them.
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line. Each message appears once, so its size grows linearly with the conversation. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once, so the file grows linearly with the conversation. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
 
 | `event` | Written | Fields |
 |---|---|---|
-| `header` | once, first | `config` without secrets, `tools`, `prompts_sha256`, `bundle_sha256` |
-| `message` | when a message is appended | `segment`, `index`, `message` |
-| `model_call` | per accepted response | `call`, `kind` (`turn` or `compaction`), `prompt` (`segment`, `end`), `max_tokens_override`, `request_sha256`, `response` verbatim, `attempts`, `latency_ms` |
-| `endpoint_error` | per failed attempt | `call`, `attempt`, `status`, `body_excerpt` (up to 64 KiB), `verdict`, `retry_after_ms` |
-| `tool_call` | per tool call | `call_id`, `name`, `class` (`ok`, `tool_error`, `invalid_arguments`, `unknown_tool`), `latency_ms`, `output_bytes` |
-| `compaction` | per compaction | `from`, `to`, `summary_call`, `estimated_tokens` |
+| `header` | once, first | `contract`, `started_at_unix_ms`, `input` without secrets, `tools` |
+| `message` | when a message is appended | `segment`, `index`, `message`, and for a tool result `tool` (`name`, `error`, `task_id`, `latency_ms`) |
+| `model_call` | per accepted response | `call`, `turn`, `kind` (`turn` or `compaction`), `prompt` (`segment`, `end`), `tool_choice`, `max_tokens`, `attempts`, `latency_ms`, `response` verbatim |
+| `endpoint_error` | per failed attempt | `call`, `turn`, `attempt`, `failure`, `retry_in_ms` |
+| `compaction` | per compaction | `from_segment`, `to_segment`, `summary_call`, `kept_messages` |
 | `result` | once, last | the `result.json` object |
 
-When a write fails or the trace reaches 256 MiB, the runner stops tracing, finishes the attempt, and sets `trace.truncated`.
+When a write fails or the trace would pass 256 MiB, the runner stops tracing, finishes the attempt, and sets `trace_truncated`.
 
 ## Tools
 
@@ -111,6 +110,6 @@ The Rust tests run on Linux and macOS. The runtime bundle and the Harbor trials 
 - Code in the sandbox can read the key from the runner's process through `/proc`. Use a key with a spending cap, or an endpoint that needs none.
 - The file tools and commands can reach any path the sandbox user can.
 - Harbor's local Docker environment does not enforce a task's disk quota.
-- A model request or response over 16 MiB ends the attempt with exit 70.
+- A model response over 16 MiB ends the attempt with exit 70.
 
 This project derives from Grok Build. [NOTICE](NOTICE) names the source and the retained code.
