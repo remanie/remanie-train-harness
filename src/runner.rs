@@ -397,23 +397,28 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
         .calls
         .iter()
         .zip(locks)
-        .map(|(call, lock)| async move {
+        .enumerate()
+        .map(|(index, (call, lock))| async move {
             let started = Instant::now();
             let _guard = match &lock {
                 Some(lock) => Some(lock.lock().await),
                 None => None,
             };
             let output = tools.call(&call.name, &call.arguments).await;
-            (call, output, started.elapsed())
+            (index, output, started.elapsed())
         })
         .collect();
-    while let Some((call, output, latency)) = running.next().await {
+    let mut outputs: Vec<_> = reply.calls.iter().map(|_| None).collect();
+    while let Some((index, output, latency)) = running.next().await {
         let output = proceed(output.map_err(|error| {
             Outcome::Infrastructure(Cause::ToolRuntime {
-                tool: call.name.clone(),
+                tool: reply.calls[index].name.clone(),
                 detail: error.0,
             })
         }))?;
+        outputs[index] = Some((output, latency));
+    }
+    for (call, (output, latency)) in reply.calls.iter().zip(outputs.into_iter().flatten()) {
         cx.tally.tool_calls.count(output.error);
         let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
         cx.budget.append(&message);

@@ -547,12 +547,12 @@ async fn tool_contract_errors_return_to_the_model_without_side_effects() {
 }
 
 #[tokio::test]
-async fn tool_results_arrive_in_completion_order_and_one_file_is_edited_in_turn() {
+async fn tool_results_keep_call_order_while_the_calls_run_at_once() {
     let calls = vec![
         call(
-            "slow",
+            "wait",
             "run_terminal_cmd",
-            json!({"command": "sleep 0.5; printf slow", "description": "slow", "block_until_ms": 10000}),
+            json!({"command": "until [ -e order.txt ]; do sleep 0.05; done; sleep 0.3; printf waited", "description": "wait for the file", "block_until_ms": 5000}),
         ),
         call(
             "create",
@@ -580,14 +580,19 @@ async fn tool_results_arrive_in_completion_order_and_one_file_is_edited_in_turn(
         .iter()
         .map(|message| message["tool_call_id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["create", "edit", "read", "slow"]);
+    assert_eq!(ids, ["wait", "create", "edit", "read"]);
     assert!(tools.iter().all(|message| {
         !message["content"]
             .as_str()
             .unwrap()
             .starts_with("Tool error")
     }));
-    assert_eq!(tools[2]["content"], "1→second\n");
+    assert!(
+        tools[0]["content"].as_str().unwrap().contains("waited"),
+        "{}",
+        tools[0]["content"]
+    );
+    assert_eq!(tools[3]["content"], "1→second\n");
     let traced: Vec<_> = f
         .events("tool_call")
         .iter()
