@@ -30,7 +30,7 @@ CONNECTION_FIELDS = ("model", "base_url", "api_key_env")
 
 
 class RemanieInfrastructureError(RuntimeError):
-    """It is not a NonZeroAgentExitCodeError, so Harbor skips the verifier."""
+    """Harbor skips the verifier for this error, unlike for a NonZeroAgentExitCodeError."""
 
 
 @dataclass(frozen=True)
@@ -192,7 +192,7 @@ class RemanieAgent(BaseInstalledAgent):
             if identity is None and stream == "stdout" and (match := IDENTITY.search(text)):
                 identity = match.groups()
 
-        # The task copies the context, and with it the callback, when it is created.
+        # asyncio copies the context, callback included, when it creates the task.
         with environment.scoped_output_callback(capture_identity):
             execution = asyncio.create_task(environment.exec(
                 command=f"exec setsid --wait bash -c {shlex.quote(script)}"
@@ -224,7 +224,10 @@ class RemanieAgent(BaseInstalledAgent):
 
     async def _stop_runtime(self, environment, identity, execution):
         if identity is None:
-            raise RuntimeError("Runtime identity was not captured. Tear down the container")
+            raise RuntimeError(
+                "The launch script's REMANIE_PROCESS line did not arrive, so the adapter cannot stop the runner. "
+                "Tear down the container"
+            )
         pid, started = identity
         script = f"""
 pid={pid}
@@ -246,7 +249,7 @@ exit 1
             await self.exec_as_agent(environment, f"bash -c {shlex.quote(script)}", timeout_sec=10)
             result = await asyncio.wait_for(asyncio.shield(execution), timeout=10)
         except Exception as exc:
-            raise RuntimeError("Runtime shutdown was not confirmed. Tear down the container") from exc
+            raise RuntimeError("The stop script could not confirm that the runner exited. Tear down the container") from exc
         self.exit_code = result.return_code
         if self.exit_code != self.bundle.exit_gradable:
             raise RuntimeError(f"Runner exited {self.exit_code} after the stop signal. Tear down the container")
@@ -258,7 +261,7 @@ exit 1
             with os.fdopen(descriptor, "rb") as file:
                 info = os.fstat(file.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RESULT_BYTES:
-                    raise ValueError("result.json must be a bounded regular file")
+                    raise ValueError("result.json must be a regular file of at most 16 MiB")
                 result = json.loads(file.read(MAX_RESULT_BYTES + 1))
             if not isinstance(result, dict):
                 raise ValueError("result.json must hold an object")

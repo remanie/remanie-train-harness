@@ -50,10 +50,10 @@ def launcher_script(name: str, loader: str) -> str:
 
 def package(binary: Path, destination: Path) -> None:
     if sys.platform != "linux" or not shutil.which("dpkg-query"):
-        raise RuntimeError("Run packaging on Debian/Ubuntu on the same architecture as the build")
+        raise RuntimeError("Run packaging on Debian or Ubuntu on the same architecture as the build")
     rg = shutil.which("rg")
     if not binary.is_file() or not rg:
-        raise RuntimeError("Provide the built harness and install ripgrep")
+        raise RuntimeError("Provide the built runner and install ripgrep")
     executables = []
     redistributed = {Path(rg)}
     for name, source in (("remanie-train-harness", binary), ("rg", Path(rg))):

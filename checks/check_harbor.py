@@ -1,4 +1,4 @@
-"""Run real Harbor/Docker trials against a local scripted model; no paid API calls."""
+"""Run real Harbor trials in Docker against a local scripted model, with no paid API calls."""
 
 import argparse
 import asyncio
@@ -213,7 +213,7 @@ async def check(mode, runtime_dir, output_dir, model_host):
         assert not (output_dir / mode / "verifier/reward.txt").exists()
         return {"mode": mode, "reward": None, "verification_skipped": True}
     assert result.verifier_result and result.verifier_result.rewards == {"reward": 1.0}, (
-        f"Harbor verifier did not pass; inspect {output_dir / mode}. "
+        f"Harbor verifier did not pass. Inspect {output_dir / mode}. "
         f"Error: {result.exception_info.exception_type if result.exception_info else 'none'}"
     )
     if mode == "timeout":

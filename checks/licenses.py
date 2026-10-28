@@ -1,4 +1,4 @@
-"""Rebuild notices for the locked Linux/macOS normal and build dependencies."""
+"""Rebuild THIRD-PARTY-NOTICES from the locked normal and build dependencies for Linux and macOS."""
 
 import argparse
 import json
@@ -95,7 +95,7 @@ def license_files(package):
         vcs = json.loads((directory / ".cargo_vcs_info.json").read_text())
         if vcs["git"]["sha1"] == SIMD_REV:
             return [(SIMD_LICENSE_URL, SIMD_LICENSE)]
-    raise ValueError(f"Missing license text for {key[0]} {key[1]}; inspect its pinned upstream source")
+    raise ValueError(f"Missing license text for {key[0]} {key[1]}. Inspect its pinned upstream source")
 
 
 def render(packages):
@@ -148,7 +148,7 @@ def main():
         destination = ROOT / "THIRD-PARTY-NOTICES"
         if args.check:
             if not destination.is_file() or destination.read_text() != content:
-                raise ValueError("THIRD-PARTY-NOTICES is stale; run python3 checks/licenses.py")
+                raise ValueError("THIRD-PARTY-NOTICES is stale. Run python3 checks/licenses.py")
         else:
             destination.write_text(content)
         print(f"{'Checked' if args.check else 'Wrote'} notices for {len(packages)} dependencies")
