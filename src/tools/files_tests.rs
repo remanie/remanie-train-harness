@@ -740,6 +740,39 @@ async fn grep_honors_paths_filters_regex_flags_and_output_limit() {
 }
 
 #[tokio::test]
+async fn image_reads_return_the_vision_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = file_tools(dir.path());
+    for (name, bytes, format) in [
+        (
+            "shot.png",
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".as_slice(),
+            None,
+        ),
+        (
+            "photo.jpg",
+            b"\xff\xd8\xff\xe0\0\x10JFIF\0".as_slice(),
+            None,
+        ),
+        ("anim.gif", b"GIF89a\x01\0\x01\0\0".as_slice(), Some("text")),
+        ("pic.webp", b"RIFF\x24\0\0\0WEBPVP8 ".as_slice(), None),
+        ("screenshot", b"\x89PNG\r\n\x1a\n".as_slice(), None),
+    ] {
+        tokio::fs::write(dir.path().join(name), bytes)
+            .await
+            .unwrap();
+        let read = tools
+            .call("read_file", &json!({"target_file": name, "format": format}))
+            .await;
+        assert_eq!(
+            read.unwrap(),
+            "Vision is not available in this environment.",
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn pdfs_are_read_as_text_and_page_ranges_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let tools = file_tools(dir.path());

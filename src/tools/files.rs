@@ -99,10 +99,11 @@ impl FileTools {
             .unwrap_or("")
             .to_ascii_lowercase();
         let sample = reader.fill_buf().await?;
-        if extension == "pdf" || sample.starts_with(b"%PDF-") {
-            if input.format.as_deref() != Some("text") {
-                return Ok("Vision is not available in this environment.".into());
-            }
+        let pdf = extension == "pdf" || sample.starts_with(b"%PDF-");
+        if is_image(sample) || (pdf && input.format.as_deref() != Some("text")) {
+            return Ok("Vision is not available in this environment.".into());
+        }
+        if pdf {
             ensure!(
                 metadata.len() <= MAX_DOCUMENT_BYTES,
                 "PDF exceeds the 50 MB limit"
@@ -709,6 +710,14 @@ async fn resolve_file(path: PathBuf) -> PathBuf {
         }
     }
     found.unwrap_or(path)
+}
+
+fn is_image(bytes: &[u8]) -> bool {
+    const SIGNATURES: [&[u8]; 4] = [b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"];
+    SIGNATURES
+        .iter()
+        .any(|signature| bytes.starts_with(signature))
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12).is_some_and(|tag| tag == b"WEBP"))
 }
 
 fn is_binary(extension: &str, bytes: &[u8]) -> bool {

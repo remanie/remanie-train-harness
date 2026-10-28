@@ -195,8 +195,11 @@ async fn files_catalog_and_validation() {
         .await
         .unwrap();
     let image = call(&tools, "read_file", json!({"target_file":"pixel.png"})).await;
-    assert_eq!(image.error, Some(ToolErrorKind::Failed));
-    assert!(image.content.contains("non-text"));
+    assert_eq!(image.error, None);
+    assert_eq!(
+        image.content,
+        "Vision is not available in this environment."
+    );
     tools.kill_all().await;
 }
 
