@@ -128,7 +128,7 @@ impl FileTools {
                     saw_bytes = true;
                     last_newline = segment.ends_with(b"\n");
                     if line_number >= start {
-                        ensure!(raw.len().saturating_add(segment.len()) <= READ_MAX_BYTES + MAX_LINES + 1, "file content exceeds 25000 tokens. Use offset and limit to read a shorter range");
+                        ensure!(raw.len().saturating_add(segment.len()) <= READ_MAX_BYTES + MAX_LINES + 1, "file content exceeds 100000 bytes. Use offset and limit to read a shorter range");
                         raw.extend_from_slice(segment);
                     }
                     consumed += segment.len();
@@ -172,7 +172,7 @@ impl FileTools {
         }
         ensure!(
             output.len() <= READ_MAX_BYTES,
-            "file content exceeds 25000 tokens. Use offset and limit to read a shorter range"
+            "file content exceeds 100000 bytes. Use offset and limit to read a shorter range"
         );
         if more && input.limit.is_none_or(|limit| limit >= MAX_LINES) {
             write!(
@@ -232,7 +232,7 @@ impl FileTools {
         let (text, created, count) = if input.old_string.is_empty() {
             ensure!(
                 old.as_deref().is_none_or(str::is_empty),
-                "old_string is empty, which is only allowed when creating a new file or when the file is empty"
+                "old_string may be empty only when creating a new file or when the file is empty"
             );
             (input.new_string, old.is_none(), 1)
         } else {
@@ -410,7 +410,7 @@ impl FileTools {
             40_000,
         )
         .await
-        .context("PDF text requires the optional Poppler utilities pdfinfo and pdftotext")?;
+        .context("reading a PDF requires the Poppler utilities pdfinfo and pdftotext")?;
         ensure!(code == 0, "pdfinfo failed (exit {code}): {info}");
         ensure!(
             !info.ends_with("\n[output truncated]"),
@@ -453,11 +453,11 @@ impl FileTools {
                 READ_MAX_BYTES,
             )
             .await
-            .context("PDF text requires the optional Poppler utilities pdfinfo and pdftotext")?;
+            .context("reading a PDF requires the Poppler utilities pdfinfo and pdftotext")?;
             ensure!(code == 0, "pdftotext failed (exit {code}): {text}");
             ensure!(
                 !text.ends_with("\n[output truncated]"),
-                "PDF text exceeds 25000 tokens. Select fewer pages"
+                "PDF text exceeds 100000 bytes. Select fewer pages"
             );
             if !output.is_empty() {
                 output.push('\n');
@@ -466,7 +466,7 @@ impl FileTools {
             output.push_str(&text);
             ensure!(
                 output.len() <= READ_MAX_BYTES,
-                "PDF text exceeds 25000 tokens. Select fewer pages"
+                "PDF text exceeds 100000 bytes. Select fewer pages"
             );
         }
         let output = output
@@ -477,7 +477,7 @@ impl FileTools {
             .join("\n");
         ensure!(
             output.len() <= READ_MAX_BYTES,
-            "PDF text exceeds 25000 tokens. Select fewer pages"
+            "PDF text exceeds 100000 bytes. Select fewer pages"
         );
         Ok(output)
     }

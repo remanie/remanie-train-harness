@@ -39,21 +39,23 @@ python3 checks/make_trace_fixture.py target/debug/remanie-train-harness
   under a path the VM shares, such as $HOME. --model-host is the host's
   address as a container sees it. It defaults to host.docker.internal. On
   Linux Docker, pass the docker0 bridge address, usually 172.17.0.1.
-  It runs five trials:
+  The script runs five trials:
     completed       all eight tools and one compaction, graded with reward 1
     timeout         Harbor's timeout cancels the runner, still graded
     cleanup_error   the stop is never confirmed, verifier skipped
     crash           the runner is killed, verifier skipped
     infrastructure  the endpoint returns 401, exit 70, verifier skipped
-  In the graded trials the verifier also checks that a killed background
-  task is gone and a running one is still alive. A passing reward means the
-  integration works. It is not a Terminal-Bench score.
+  In the graded trials the verifier also checks that a running background
+  task is still alive, and in the completed trial that the killed one is
+  gone. A passing reward means the integration works. It is not a
+  Terminal-Bench score.
 
 CI
 
 .github/workflows/checks.yml runs on every pull request and every push to
 main. It runs cargo fmt --check, cargo clippy, cargo test, and licenses.py
---check, then builds and packages the bundle, runs pytest with
+--check, then builds and packages the bundle, rerecords the trace fixture
+and fails when harbor/fixtures/requests.jsonl differs, runs pytest with
 REMANIE_BUNDLE set, and compiles every tracked Python file. It does not run
 check_harbor.py, so run that by hand after a change to the adapter, the
 launch or stop scripts, the exit codes, or the background-task rules.

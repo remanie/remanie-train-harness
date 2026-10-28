@@ -300,7 +300,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_without_identity_requires_teardown(self):
         _, task = await self.cancel_running(None)
-        with self.assertRaisesRegex(RuntimeError, "identity was not captured"):
+        with self.assertRaisesRegex(RuntimeError, "REMANIE_PROCESS line did not arrive"):
             await task
 
     async def test_cancelled_runner_that_dies_badly_requires_teardown(self):
@@ -329,7 +329,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         await agent._stop_runtime(environment, ("123", "456"), execution)
         fields = ["S", "1", "123", "123", *(["0"] * 15), "789"]
         stat_file.write_text("123 (runtime) " + " ".join(fields) + "\n")
-        with self.assertRaisesRegex(RuntimeError, "shutdown was not confirmed"):
+        with self.assertRaisesRegex(RuntimeError, "could not confirm that the runner exited"):
             await agent._stop_runtime(environment, ("123", "456"), execution)
 
     async def test_install_refuses_a_bundle_for_another_architecture(self):

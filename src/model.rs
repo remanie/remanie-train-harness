@@ -24,7 +24,7 @@ const CONTEXT_LENGTH_PATTERNS: [&str; 5] = [
 
 pub fn bearer_header(key: &str) -> Result<HeaderValue, &'static str> {
     const INVALID: &str =
-        "API key must be nonempty and contain no whitespace or control characters";
+        "API key must be nonempty and contain only printable ASCII characters other than space";
     if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(INVALID);
     }
@@ -184,9 +184,9 @@ pub fn http_client() -> Result<reqwest::Client, Cause> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
-        // A pooled connection that the server closed while tools ran would fail after the send,
-        // and the runner never retries such a failure. One connection per request keeps it from
-        // looking like a lost reply.
+        // A request on a pooled connection that the server closed while tools ran fails after the
+        // send, and the runner never retries that class of failure. A new connection per request
+        // avoids it.
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|error| Cause::Internal {
