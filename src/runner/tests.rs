@@ -1071,6 +1071,7 @@ async fn command_logs_leave_a_workspace_that_is_the_temp_dir() {
     let log = PathBuf::from(left["output_file"].as_str().unwrap());
     assert!(log.starts_with("/var/tmp/.remanie-terminal"), "{log:?}");
     assert!(log.exists());
+    std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
 }
 
 #[tokio::test]
