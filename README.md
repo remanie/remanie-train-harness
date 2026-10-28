@@ -72,5 +72,3 @@ Run one attempt per disposable sandbox. Keep private grading material outside th
 Each model request/response is capped at 16 MiB, each command log at 16 MiB, and the trace at 256 MiB. The launcher owns CPU, memory, disk and network limits. Harbor's selected environment provider must enforce those limits. The local Docker backend does not enforce per-task disk quotas.
 
 This project derives from Grok Build. [NOTICE](NOTICE) identifies the original source and retained code. The source tree contains one Rust package, the Harbor adapter, runtime packaging and their checks.
-
-See [validation](reviews/validation.txt) for the extraction checks. The [earlier smoke report](reviews/terminal-bench-2.1-smoke-2026-10-27.txt) tested the larger predecessor, not this extracted implementation.

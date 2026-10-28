@@ -81,4 +81,4 @@ The task can modify its own files and logs. Treat logs as evidence to inspect, n
 
 Sources: [Terminal-Bench 2.1](https://hub.harborframework.com/datasets/terminal-bench/terminal-bench-2-1), [Harbor custom agents](https://docs.harborframework.com/agents/custom-agents), [OpenRouter Grok 4.7](https://openrouter.ai/x-ai/grok-4.7).
 
-Local verification results are in [validation.txt](../reviews/validation.txt). The reproducible integration check is in [checks/](../checks/README.txt). The [earlier Grok 4.7 smoke report](../reviews/terminal-bench-2.1-smoke-2026-10-27.txt) tested the larger predecessor, before extraction.
+The reproducible integration check is in [checks/](../checks/README.txt).
