@@ -2,7 +2,7 @@
 
 `remanie-train-harness` is the agent runtime a model trains through on Harbor tasks. One process runs one attempt inside the task sandbox. It reads one JSON object on stdin, sends every model call to one OpenAI-compatible `/v1/chat/completions` endpoint, runs the tool calls, and exits with a code that tells Harbor whether to grade the sandbox. In training the endpoint is Miles' session server, which records token ids and log-probs. The runner never sees them and never computes a reward.
 
-Each request carries the two-sentence system prompt from `assets/system_prompt.jinja2`, the task wrapped once in `<user_query>` tags by `assets/user_query.jinja2`, and the eight tool definitions from `assets/tools.json`. Turn requests send `tool_choice: "auto"`, and compaction requests send `tool_choice: "none"`. The endpoint applies the chat template and parses the tool calls. Until a compaction, the history only grows. The runner appends each assistant message exactly as the endpoint returned it, runs its tool calls at the same time, and appends one tool message per call in the order the calls finish. Calls whose `file_path`, `path`, or `target_file` names a file that a writing call in the same reply also names run one at a time, in the order listed. Compaction runs only when the input sets `compaction`. The runner records every message, model call, and tool call in `trace.jsonl` during the attempt.
+Each request carries the two-sentence system prompt from `assets/system_prompt.jinja2`, the task wrapped once in `<user_query>` tags by `assets/user_query.jinja2`, and the eight tool definitions from `assets/tools.json`. Turn requests send `tool_choice: "auto"`, and compaction requests send `tool_choice: "none"`. The endpoint applies the chat template and parses the tool calls. Until a compaction, the history only grows. The runner appends each assistant message exactly as the endpoint returned it, runs its tool calls at the same time, and appends one tool message per call in the order the calls finish. Calls in one reply that name the same file in `file_path`, `path`, or `target_file` run one at a time, in the order listed, if any of them writes. Compaction runs only when the input sets `compaction`. The runner records every message, model call, and tool call in `trace.jsonl` during the attempt.
 
 It has no interactive mode, no permission prompts, and no workspace confinement. The sandbox isolates the task.
 
@@ -24,7 +24,7 @@ It has no interactive mode, no permission prompts, and no workspace confinement.
 | `context_window_tokens` | no | The model's context size. After the first reply, the runner ends the attempt as `context_overflow` before sending a turn request that cannot fit. Before the first reply, such a request ends the attempt as `infrastructure` with cause `config`. Compaction requests skip this check. |
 | `compaction` | no | `{max_tokens, threshold_tokens}`. `threshold_tokens` is optional, and without it `context_window_tokens` is required. When `compaction` is null or absent, the runner never compacts. |
 
-With compaction on, the runner compacts before a turn request once its estimate reaches `threshold_tokens`, or 85% of `context_window_tokens` when `threshold_tokens` is absent, or when the request would not fit `context_window_tokens`. The estimate is the endpoint's last `usage.total_tokens` plus a quarter of the bytes of the tool messages appended since. The summary request appends Grok Build's summary prompt from `assets/compaction.jinja2` as a user message, sends `tool_choice: "none"`, and takes `max_tokens` from `compaction`. The reply's `<summary>` block becomes a `Summary:` heading. The next segment holds the system prompt, the task, and one user message from `assets/continuation.jinja2`: Grok Build's sentence saying the session continues, the summary, and a `<system-reminder>` with the running background tasks and the open todos. No earlier turn is kept. The estimate then restarts at a quarter of the new segment's bytes.
+The runner estimates a turn request's prompt tokens as the endpoint's last `usage.total_tokens` plus a quarter of the bytes of the tool messages appended since. The request fits when the estimate plus `sampling_params.max_tokens` is at most `context_window_tokens`. With compaction on, the runner compacts before a turn request once the estimate reaches `threshold_tokens`, or 85% of `context_window_tokens` when `threshold_tokens` is absent. It also compacts before a request that would not fit. For the compaction request, the runner appends Grok Build's summary prompt from `assets/compaction.jinja2` as a user message and replaces `sampling_params.max_tokens` with `compaction.max_tokens`. The reply's `<summary>` block becomes a `Summary:` heading. The next segment holds the system prompt, the task, and one user message from `assets/continuation.jinja2`. That message holds Grok Build's preamble saying the session continues, followed by the summary. When background tasks are still running or todos are open, the message ends with a `<system-reminder>` that lists them. No earlier turn is kept. The estimate then restarts at a quarter of the new segment's bytes.
 
 ## Exit codes and result
 
@@ -47,7 +47,7 @@ With compaction on, the runner compacts before a turn request once its estimate 
 | `cancelled` | 0 | The runner received SIGTERM or SIGINT. |
 | `infrastructure` | 70 | `config`, `endpoint_unavailable`, `endpoint_status`, `connection_lost`, `endpoint_response`, `tool_runtime`, or `internal`. |
 
-Before the first reply, a request that does not fit ends as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` ends as `infrastructure` with cause `endpoint_response`, and the runner does not resend it.
+Before the first reply, a request that does not fit ends the attempt as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` ends the attempt as `infrastructure` with cause `endpoint_response`, and the runner does not resend the request.
 
 The runner resends a request with identical bytes only when the endpoint did not process it. It keeps resending while the next wait, at most 30 s, ends before `deadline_secs`.
 
@@ -57,7 +57,7 @@ On exit 0 background tasks keep running so the verifier can reach them. On exit 
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `harbor/remanie_trace.py` reads the file and rebuilds the body of any request from the `header` and a message range.
 
 | `event` | Written | Fields |
 |---|---|---|
@@ -73,18 +73,18 @@ When a write fails or the trace would pass 256 MiB, the runner stops tracing, fi
 
 ## Tools
 
-`assets/tools.json` holds Grok Build's tool descriptions without their usage notes, and its parameter names, types, descriptions, required lists, and defaults, with no added bounds. An unknown tool name, arguments that are not JSON or fail the schema, a bound the runner checks, and a tool's own error go back to the model as the tool message. They do not end the attempt.
+`assets/tools.json` holds Grok Build's tool descriptions without their usage notes. Its parameter names, types, descriptions, required lists, defaults, and bounds are Grok Build's too, except that `read_file`'s `format` accepts only `image` or `text` and defaults to `image`. An unknown tool name, arguments that are not JSON or fail the schema, a bound the runner checks, and a tool's own error go back to the model as the tool message. They do not end the attempt.
 
 | Tool | Enforced limits |
 |---|---|
-| `run_terminal_cmd` | Runs `/bin/bash --noprofile --norc -c` in `workspace` with the runner's environment, after setting 13 variables such as `TERM=dumb` and `PAGER=cat`. `block_until_ms` defaults to 30000, and a larger value is cut to 36,000,000. A wait that outlasts `deadline_secs` ends the attempt as `deadline` and kills the command. A command still running then becomes a background task with an id the runner assigns, such as `task-1`. An unwaited `&` is refused. To run a command in the background, pass `block_until_ms` 0. The reply shows at most 20,000 bytes of output, taken from its start and end. Each command logs to `.remanie-terminal/<pid>-<n>/task-N.log` under the sandbox's temp dir, or under `/var/tmp` when `workspace` is or holds the temp dir. The log keeps every byte with no size cap, so a command that never stops writing can fill the sandbox's disk. A command runs at most 36,000 s. |
-| `get_terminal_command_output` | 1 to 20 task ids. `timeout_ms` at most 3,600,000, and 0 or none returns a snapshot. Up to 40,000 bytes per task. |
+| `run_terminal_cmd` | Runs `/bin/bash --noprofile --norc -c` in `workspace` with the runner's environment, after setting 13 variables such as `TERM=dumb` and `PAGER=cat`. `block_until_ms` defaults to 30000 and is capped at 36,000,000. A command still running after `block_until_ms` becomes a background task with an id the runner assigns, such as `task-1`. If `deadline_secs` passes while the tool waits, the attempt ends as `deadline` and the runner kills the command. An unwaited `&` is refused. To run a command in the background, pass `block_until_ms` 0. The reply shows at most 20,000 bytes of output, taken from its start and end. Each command logs to `.remanie-terminal/<pid>-<n>/task-N.log` under the sandbox's temp dir, or under `/var/tmp` when `workspace` is or holds the temp dir. The log keeps every byte with no size cap, so a command that never stops writing can fill the sandbox's disk. A command runs at most 36,000 s. |
+| `get_terminal_command_output` | 1 to 20 task ids. `timeout_ms` at most 3,600,000, and 0 or no `timeout_ms` returns a snapshot. Up to 40,000 bytes per task. |
 | `kill_terminal_command` | Sends SIGTERM to every process in one task's session, then SIGKILL after 1 s, and waits up to 5 s for the task to exit. |
-| `read_file` | At most 1000 lines and about 100,000 bytes per call. When a full 1000-line window leaves lines unread, the output ends with a note naming the next `offset`. A window over about 100,000 bytes is a tool error. A text read stops after 30 s and a PDF read after 60 s. A PDF read returns "Vision is not available in this environment." unless `format` is `text`. A text read of a PDF needs Poppler, and the PDF may be at most 50 MiB. A PDF over 10 pages needs `pages`, at most 20 per call. |
+| `read_file` | At most 1000 lines and about 100,000 bytes per call. When a full 1000-line window leaves lines unread, the output ends with a note naming the next `offset`. A window over about 100,000 bytes is a tool error. A read stops after 30 s. A PDF read returns `Vision is not available in this environment.` unless `format` is `text`. When `format` is `text`, the tool reads a PDF of at most 50 MiB through Poppler and stops after 60 s. A PDF over 10 pages needs `pages`, at most 20 per call. |
 | `search_replace` | `old_string` must match exactly once, overlapping matches included, unless `replace_all`. The tool edits UTF-8 files up to 50 MiB, writes in place, and keeps the file's line endings. |
 | `list_dir` | Hides ignored and dot files. Scans up to 100,000 entries and stops the listing at about 10,000 bytes. |
-| `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. The tool keeps at most 40,000 bytes of `rg` output and then at most `head_limit` lines. `rg` cuts lines at 1000 columns and skips files over 5 MiB. A search stops after 20 s. When `rg` could not read some file but found matches, the tool returns the matches followed by `rg`'s messages. |
-| `todo_write` | `merge` defaults to `true` and updates by `id`. Each `id` may appear once per call. The open todos reappear after a compaction. |
+| `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. The tool keeps at most 40,000 bytes of `rg` output and then at most `head_limit` lines. `rg` cuts lines at 1000 columns and skips files over 5 MiB. A search stops after 20 s. When `rg` cannot read a file but finds matches, the tool returns the matches followed by `rg`'s error messages. |
+| `todo_write` | `merge` defaults to `true` and updates by `id`. Each `id` may appear once per call. The list survives a compaction, and the continuation message shows the open todos. |
 
 Paths may be absolute and may point outside `workspace`. `~` expands to the sandbox's `$HOME`.
 
@@ -106,7 +106,7 @@ The Rust tests run on Linux and macOS. The runtime bundle and the Harbor trials 
 - `/bin/bash` and `setsid`.
 - `rg`, which the Harbor bundle carries.
 - Network access to `base_url`.
-- `pdfinfo` and `pdftotext` from Poppler, only for reading PDFs.
+- `pdfinfo` and `pdftotext` from Poppler, only for reading a PDF as text.
 
 ## Known limits
 
