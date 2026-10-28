@@ -194,8 +194,6 @@ impl ToolSession {
         }
     }
 
-    /// Grok Build's per-path locks for one reply's calls: a path a writing call targets gets a
-    /// lock, and every call on that path takes it.
     pub fn path_locks<'c>(
         &self,
         calls: impl IntoIterator<Item = (&'c str, &'c str)>,
@@ -248,7 +246,7 @@ impl ToolSession {
     }
 }
 
-// JSON Schema's "integer" accepts 1000.0 and -1, which as_u64 and serde's usize reject.
+// JSON Schema's "integer" accepts 1000.0, which as_u64 and serde's usize reject.
 fn whole_numbers(args: &mut Value) -> Result<(), String> {
     for (key, value) in args.as_object_mut().into_iter().flatten() {
         match value.as_f64() {
