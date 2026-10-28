@@ -58,7 +58,7 @@ import remanie_trace
 trace = remanie_trace.read("eval-results/<job>/<trial>/agent/remanie")
 trace.outcome                            # "completed", ..., or None when the runner died
 body = trace.request_body(trace.calls[0])  # the chat-completions body of the first call
-trace.usage()                            # token totals; complete is False when any are missing
+trace.usage()                            # token totals, with complete False when any are missing
 ```
 
 ## Run the smoke job
