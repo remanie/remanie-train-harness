@@ -901,7 +901,7 @@ async fn gradable_outcomes_leave_background_processes_running() {
     assert!(survived);
     assert_eq!(
         result["background_tasks_left_running"][0]["task_id"],
-        "server"
+        "task-1"
     );
 }
 
