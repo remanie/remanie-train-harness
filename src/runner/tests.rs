@@ -502,3 +502,52 @@ async fn deadline_kills_background_processes() {
     );
     assert_eq!(trace(&dir).last().unwrap()["body"]["status"], "deadline");
 }
+
+fn minify(json: &str) -> String {
+    let (mut out, mut in_string, mut escaped) = (String::new(), false, false);
+    for c in json.chars() {
+        if in_string {
+            out.push(c);
+            (escaped, in_string) = match (escaped, c) {
+                (true, _) => (false, true),
+                (false, '\\') => (true, true),
+                (false, '"') => (false, false),
+                _ => (false, true),
+            };
+        } else if !c.is_whitespace() {
+            in_string = c == '"';
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn tool_schemas_reach_the_wire_byte_for_byte_in_file_order() {
+    let (_dir, server, config) = fixture(vec![final_reply()]).await;
+    run(config, None).await.unwrap();
+    let request = &server.received_requests().await.unwrap()[0];
+    let raw = String::from_utf8(request.body.clone()).unwrap();
+    let wire: Value = serde_json::from_str(&raw).unwrap();
+    let file = minify(include_str!("../../assets/tools.json"));
+    let mut positions = Vec::new();
+    for tool in wire["tools"].as_array().unwrap() {
+        let function = &tool["function"];
+        let (name, description, parameters) = (
+            function["name"].as_str().unwrap(),
+            function["description"].to_string(),
+            function["parameters"].to_string(),
+        );
+        assert!(raw.contains(&format!(
+            r#"{{"type":"function","function":{{"name":"{name}","description":{description},"parameters":{parameters}}}}}"#
+        )));
+        let entry =
+            format!(r#""{name}":{{"description":{description},"parameters":{parameters}}}"#);
+        positions.push(
+            file.find(&entry)
+                .expect("tool differs from assets/tools.json"),
+        );
+    }
+    assert_eq!(positions.len(), 8);
+    assert!(positions.is_sorted());
+}
