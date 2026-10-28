@@ -7,7 +7,7 @@ The upstream source used by the harness is pinned at commit
 
 Retained material includes the compaction summary formatter, directory-listing
 core, todo and edit behavior, POSIX background/heredoc token helpers, terminal
-tool contracts, and prompt assets. The source has been adapted into a standalone
+tool contracts, the per-path tool-call lock key, and prompt assets. The source has been adapted into a standalone
 eight-tool harness; the application, registry, remote tool runtime, and unused
 tools have been removed. See LICENSE for the Apache License text.
 
