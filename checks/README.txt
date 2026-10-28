@@ -23,7 +23,7 @@ python3 checks/licenses.py --check
   to a bundle directory to also check that the bundle carries contract.json
   and a working rg. That part needs Linux.
 
-python3 checks/make_trace_fixture.py target/debug/remanie-train-harness
+python3 checks/make_trace_fixture.py target/debug/remanie-train-harness   (on Linux; the script prints the Docker one-liner for a Mac)
   Rewrites harbor/fixtures/trace.jsonl and harbor/fixtures/requests.jsonl
   from one run against a scripted endpoint: a 503 retry, two tool calls, and
   a compaction. The trace reader tests read both files. Rerun it after any

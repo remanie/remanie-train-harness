@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 import shutil
 import subprocess
 import threading
@@ -11,6 +12,9 @@ from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "harbor/fixtures"
 
+
+if sys.platform != "linux":
+    sys.exit("Record the fixture on Linux, where CI checks it: the first user message names the OS. On a Mac: docker run --rm -v \"$PWD\":/w -w /w rust:1.94-slim-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq ripgrep python3 >/dev/null && cargo build -q && python3 checks/make_trace_fixture.py target/debug/remanie-train-harness'")
 
 def reply(message, finish, prompt_tokens, completion_tokens, cached_tokens):
     return {
@@ -91,7 +95,7 @@ def main():
             "context_window_tokens": 20000,
             "compaction": {"max_tokens": 256},
         }
-        run = subprocess.run([str(args.runner.resolve())], input=json.dumps(job).encode(), capture_output=True, timeout=120, env={**os.environ, "SOURCE_DATE_EPOCH": "0"})
+        run = subprocess.run([str(args.runner.resolve())], input=json.dumps(job).encode(), capture_output=True, timeout=120, env={**os.environ, "SOURCE_DATE_EPOCH": "0", "SHELL": "/bin/bash"})
         server.shutdown()
         result = json.loads(run.stdout)
         assert run.returncode == 0 and result["outcome"] == "completed", (run.returncode, run.stdout, run.stderr)
