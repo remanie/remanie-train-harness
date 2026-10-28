@@ -21,10 +21,10 @@ It has no interactive mode, no permission prompts, and no workspace confinement.
 | `sampling_params` | yes | Forwarded verbatim. Must contain `max_tokens`, 1 to 4294967295. Must not set `model`, `messages`, `tools`, `tool_choice`, or `stream`. |
 | `max_turns` | yes | Turn requests allowed, 1 to 512. Compaction requests do not count. |
 | `deadline_secs` | yes | Wall-clock limit, 1 to 86400. Set it below Harbor's agent timeout. |
-| `context_window_tokens` | no | The model's context size. After the first reply, the runner ends the attempt as `context_overflow` before sending a turn request that cannot fit. Before the first reply, that ends as `infrastructure` with cause `config`. Compaction requests skip this check. |
+| `context_window_tokens` | no | The model's context size. After the first reply, the runner ends the attempt as `context_overflow` before sending a turn request that cannot fit. Before the first reply, such a request ends the attempt as `infrastructure` with cause `config`. Compaction requests skip this check. |
 | `compaction` | no | `{threshold_tokens, max_tokens}`. When it is null or absent, the runner never compacts. |
 
-With compaction on, the runner asks for a summary once its estimate of the next request reaches `threshold_tokens`. The estimate is the endpoint's last `usage.total_tokens`, plus the bytes of the tool messages appended since, plus the larger of the two `max_tokens` values. After a compaction it restarts from the smaller of two numbers. One is the new segment's bytes. The other is the summary call's `usage.prompt_tokens`, minus the `prompt_tokens` of the turn request that produced the first kept assistant message, plus the bytes of the system prompt, the task, and the continuation message. When that turn came before the previous compaction, the other number is the summary call's `usage.total_tokens` plus the continuation message's bytes. The summary request sends `tool_choice: "none"` and `max_tokens` from `compaction`. The next segment starts with the system prompt, the task, and a continuation message that carries the summary, the todo list, and the background tasks, followed by the last two assistant turns and their tool results.
+With compaction on, the runner asks for a summary once its estimate of the next request reaches `threshold_tokens`. The estimate is the endpoint's last `usage.total_tokens`, plus the bytes of the tool messages appended since, plus the larger of the two `max_tokens` values. After a compaction the estimate restarts from the smaller of two numbers. One is the new segment's bytes. The other is the summary call's `usage.prompt_tokens`, minus the `prompt_tokens` of the turn request that produced the first kept assistant message, plus the bytes of the system prompt, the task, and the continuation message. When that turn came before the previous compaction, the other number is the summary call's `usage.total_tokens` plus the continuation message's bytes. The summary request sends `tool_choice: "none"` and `max_tokens` from `compaction`. The next segment starts with the system prompt, the task, and a continuation message that carries the summary, the todo list, and the background tasks, followed by the last two assistant turns and their tool results.
 
 ## Exit codes and result
 
@@ -41,7 +41,7 @@ With compaction on, the runner asks for a summary once its estimate of the next 
 | `completed` | 0 | The model replied without tool calls. |
 | `max_turns` | 0 | The runner sent `max_turns` turn requests. The last turn's tools ran. |
 | `max_tokens` | 0 | The reply ended with `finish_reason: "length"`. |
-| `context_overflow` | 0 | After the first reply, the next request would not fit `context_window_tokens` (`context_window`), exceeds 16 MiB (`request_size`), or the endpoint refused it for its length (`endpoint_rejected`). |
+| `context_overflow` | 0 | After the first reply, the next request does not fit `context_window_tokens` (`context_window`) or exceeds 16 MiB (`request_size`), or the endpoint refuses it for its length (`endpoint_rejected`). |
 | `invalid_response` | 0 | `empty_turn`, `malformed_message`, `malformed_tool_call`, `duplicate_call_id` within one reply, `unexpected_finish`, or `invalid_summary`. |
 | `deadline` | 0 | `deadline_secs` passed. `cause.request_in_flight` says whether a model request was abandoned. |
 | `cancelled` | 0 | The runner received SIGTERM or SIGINT. |
@@ -53,19 +53,19 @@ The runner resends a request with identical bytes only when the endpoint did not
 
 Once the runner has created `session_dir`, it writes `<session_dir>/result.json` atomically on every exit it controls. It prints the same object on stdout. Its fields are `contract`, `outcome`, `cause`, `gradable`, `final_answer`, `turns`, `compactions`, `model_calls`, `usage`, `tool_calls`, `background_tasks_left_running`, `trace_truncated`, and `wall_time_ms`. `usage` holds `prompt_tokens`, `completion_tokens`, `cached_tokens`, and `complete`, which is false when any response lacked usage. `tool_calls` holds `total`, `ok`, `failed`, `invalid_arguments`, and `unknown_tool`. Each `background_tasks_left_running` entry holds `task_id`, `pid`, `command`, and `output_file`.
 
-On exit 0 background tasks keep running so the verifier can reach them. On exit 70 the runner kills them, except when writing `result.json` fails after a gradable outcome, which exits 70 with them still running.
+On exit 0 background tasks keep running so the verifier can reach them. On exit 70 the runner kills them. When writing `result.json` fails after a gradable outcome, the runner exits 70 with them still running.
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, so the file grows linearly with the conversation. A compaction writes the system prompt, the task, and the kept turns again under the new segment. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. A compaction writes the system prompt, the task, and the kept turns again under the new segment. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
 
 | `event` | Written | Fields |
 |---|---|---|
-| `header` | once, first | `contract`, `started_at_unix_ms`, `config` (the input without secrets), `tools` |
+| `header` | once, first | `contract`, `started_at_unix_ms`, `config` (the input object), `tools` |
 | `message` | when a message is appended | `segment`, `index`, `message` |
 | `tool_call` | after each tool message | `call_id`, `name`, `class` (`ok`, `unknown_tool`, `invalid_arguments`, or `failed`), `task_id`, `latency_ms` |
 | `model_call` | per accepted response | `call`, `turn`, `kind` (`turn` or `compaction`), `prompt` (`segment`, `end`), `max_tokens_override` (compaction calls only), `attempts`, `latency_ms`, `response` verbatim |
-| `endpoint_error` | per failed attempt | `call`, `turn`, `attempt`, `failure`, `retry_in_ms` |
+| `endpoint_error` | per failed attempt | `call`, `turn`, `attempt`, `failure` (`connect`, `lost`, `status`, or `response`) with that failure's fields, `retry_in_ms` |
 | `compaction` | per compaction | `from_segment`, `to_segment`, `summary_call`, `kept_messages` |
 | `result` | once, last | the `result.json` object |
 
@@ -77,20 +77,20 @@ An unknown tool name, arguments that are not JSON or fail the schema, and a tool
 
 | Tool | Enforced limits |
 |---|---|
-| `run_terminal_cmd` | Runs `/bin/bash --noprofile --norc -c` in `workspace` with the runner's environment, after setting 13 variables such as `TERM=dumb` and `PAGER=cat`. `block_until_ms` defaults to 30000, at most 300000. A command still running then becomes a background task with a runner-minted id such as `task-1`. An unwaited `&` is refused. To run a command in the background, pass `block_until_ms` 0. The reply shows at most 20,000 bytes of output, taken from its start and end. Each command logs to `.remanie-terminal/<pid>-<n>/task-N.log` under the sandbox's temp dir, or under `/var/tmp` when `workspace` is or holds the temp dir, so the log stays outside `workspace` and `session_dir`. The log keeps every byte with no size cap, so a command that never stops writing can fill the sandbox's disk. A command runs at most 36,000 s. |
+| `run_terminal_cmd` | Runs `/bin/bash --noprofile --norc -c` in `workspace` with the runner's environment, after setting 13 variables such as `TERM=dumb` and `PAGER=cat`. `block_until_ms` defaults to 30000, at most 300000. A command still running then becomes a background task with an id the runner assigns, such as `task-1`. An unwaited `&` is refused. To run a command in the background, pass `block_until_ms` 0. The reply shows at most 20,000 bytes of output, taken from its start and end. Each command logs to `.remanie-terminal/<pid>-<n>/task-N.log` under the sandbox's temp dir, or under `/var/tmp` when `workspace` is or holds the temp dir. The log keeps every byte with no size cap, so a command that never stops writing can fill the sandbox's disk. A command runs at most 36,000 s. |
 | `get_terminal_command_output` | 1 to 20 task ids. `timeout_ms` at most 300000, and 0 returns a snapshot. Up to 40,000 bytes per task. |
 | `kill_terminal_command` | Sends SIGTERM to every process in one task's session, then SIGKILL after 1 s, and waits up to 5 s for the task to exit. |
 | `read_file` | At most 1000 lines and about 100,000 bytes per call. When a full 1000-line window leaves lines unread, the output ends with a note naming the next `offset`. A window over about 100,000 bytes is a tool error. A text read stops after 30 s and a PDF read after 60 s. A PDF needs Poppler and may be at most 50 MiB. A PDF over 10 pages needs `pages`, at most 20 per call. |
-| `search_replace` | `old_string` must match exactly once, overlapping matches included, unless `replace_all`. Files up to 50 MiB. The tool keeps untouched bytes and line endings. |
+| `search_replace` | `old_string` must match exactly once, overlapping matches included, unless `replace_all`. The tool edits UTF-8 files up to 50 MiB, writes in place, and keeps the file's line endings. |
 | `list_dir` | Hides ignored and dot files. Scans up to 100,000 entries and returns at most 10,000 bytes. |
-| `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. `rg` cuts lines at 1000 columns and skips files over 5 MiB. A search stops after 20 s. |
+| `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. The tool keeps at most 40,000 bytes of `rg` output and then at most `head_limit` lines. `rg` cuts lines at 1000 columns and skips files over 5 MiB. A search stops after 20 s. |
 | `todo_write` | `merge` defaults to `true` and updates by `id`. The list survives compaction. |
 
 Paths may be absolute and may point outside `workspace`. `~` expands to the sandbox's `$HOME`.
 
 ## Build and test
 
-`rust-toolchain.toml` pins Rust 1.94.0 with rustfmt and clippy. Install ripgrep. The tools find `rg` on `PATH`, or at the absolute path in `RG_BIN_PATH`.
+`rust-toolchain.toml` pins Rust 1.94.0 with rustfmt and clippy. Install ripgrep. The tools run `rg` from `PATH`, or from the path in `RG_BIN_PATH` when it is set.
 
 ```sh
 cargo build --release --locked
