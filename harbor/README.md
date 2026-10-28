@@ -18,12 +18,12 @@ The output directory must be new. It holds the runner, `rg`, their Linux loader 
 | Setting | Meaning |
 |---|---|
 | `model_name` | Required. The adapter refuses a job without one. |
-| `base_url` | Optional. Defaults to Harbor's model connection. It must be reachable from the sandbox. |
-| `model_api_key_name` | Optional. Names the host variable that holds the key. When it is unset, the runner sends no key. |
+| `base_url` | Optional. Without it, Harbor's model connection supplies OpenRouter's URL and requires `OPENROUTER_API_KEY`. It must be reachable from the sandbox. |
+| `model_api_key_name` | Optional. Names the host variable that holds the key. With a custom `base_url` and no key name, the runner sends no key. |
 | `kwargs.runtime_dir` | The bundle directory. |
-| other `kwargs` | Runner options from [the input table](../README.md#input): `max_turns`, `deadline_secs`, `sampling_params`, `compaction`, `retry`, `keep_background_tasks`. |
+| other `kwargs` | Runner settings from [the input table](../README.md#input), such as `max_turns`, `deadline_secs`, `sampling_params`, and `compaction`. |
 
-Before any sandbox starts, the adapter refuses the job when the runner options fail `assets/contract.json`, when a key name is set and the host has no value for it, or when the bundle lacks `manifest.json` or an executable. `terminal-bench-2.1-smoke.json` is a complete job.
+Harbor supplies `model`, `base_url`, `api_key_env`, `user_query`, `workspace`, and `session_dir`, so `kwargs` must not set them. Before any sandbox starts, the adapter refuses the job when the runner settings fail the input schema in the bundle's `contract.json`, when the selected key has no value on the host, when the job sets a prompt template, or when the bundle lacks `remanie-train-harness`, `rg`, `manifest.json`, or `contract.json`. `terminal-bench-2.1-smoke.json` is a complete job.
 
 ## Install and launch
 
@@ -35,10 +35,10 @@ Before any sandbox starts, the adapter refuses the job when the runner options f
 
 - Exit 0. The adapter returns and Harbor runs the verifier.
 - Exit 70. The adapter raises `RemanieInfrastructureError` and Harbor skips the verifier.
-- Any other exit. The adapter sends TERM to the runner's process group, then KILL after 5 s, and raises `RemanieInfrastructureError`.
-- Harbor's agent timeout. The adapter stops the process group the same way and re-raises the cancellation. Harbor records `AgentTimeoutError` and still runs the verifier.
+- Any other exit. The runner died. The adapter raises an error with the exit code and Harbor skips the verifier.
+- Harbor's agent timeout. The adapter sends TERM to the runner's process group, waits up to 5 s, sends KILL, and re-raises the cancellation. Harbor records `AgentTimeoutError` and still runs the verifier. If the adapter cannot confirm the stop, it raises an error instead and Harbor skips the verifier.
 
-On every path the adapter copies `result.json` into `context.metadata["remanie"]`. When `usage.complete` is true it also sets `n_input_tokens`, `n_output_tokens`, and `n_cache_tokens`.
+On every path the adapter sets `context.metadata["remanie"]` to the runner's `exit_code`, the bundle's `bundle_sha256`, and `result`, the parsed `result.json` or null when there is none. When `usage.complete` is true it also sets `n_input_tokens`, `n_output_tokens`, and `n_cache_tokens`.
 
 Each trial directory holds `agent/result.json`, `agent/remanie/trace.jsonl`, and `agent/runtime-stderr.txt`. The stderr file is for diagnostics and has no fixed format.
 
