@@ -11,8 +11,6 @@ pub const CONTRACT_VERSION: u32 = 1;
 // finished its own shutdown and reported infrastructure.
 const EXIT_INFRASTRUCTURE: u8 = 70;
 
-/// How the attempt ended. Every variant except `Infrastructure` leaves the sandbox as the
-/// policy's product, so Harbor grades it.
 #[derive(Debug, Serialize)]
 #[serde(tag = "outcome", content = "cause", rename_all = "snake_case")]
 pub enum Outcome {
@@ -69,7 +67,6 @@ pub enum Cause {
         status: u16,
         body_excerpt: String,
     },
-    /// Sent without a complete reply; the endpoint may have recorded the generation.
     ConnectionLost {
         detail: String,
     },
@@ -174,7 +171,6 @@ impl Tally {
     }
 }
 
-/// `result.json`, the trace's last line and the runner's stdout, all the same object.
 #[derive(Debug, Serialize)]
 pub struct RunResult {
     pub contract: u32,
@@ -259,7 +255,6 @@ mod tests {
             Outcome::Infrastructure(Cause::Internal { detail: text() }),
         ];
         for outcome in &outcomes {
-            // A new variant fails to compile here until it is added above and to contract.json.
             match outcome {
                 Outcome::Completed
                 | Outcome::MaxTurns

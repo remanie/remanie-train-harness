@@ -47,7 +47,6 @@ pub enum ToolErrorKind {
     Failed,
 }
 
-/// The runner's tool machinery broke or a program it needs is missing; nothing the model did.
 #[derive(Debug)]
 pub struct InternalError(pub String);
 

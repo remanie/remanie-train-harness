@@ -1,5 +1,3 @@
-"""Read a runner's trace.jsonl. Standard library only, so a trainer can vendor this file."""
-
 import json
 import os
 import stat

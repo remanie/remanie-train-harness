@@ -338,8 +338,6 @@ async fn kill_and_kill_all_stop_every_process_in_the_session() {
     }
 }
 
-// Runs in a process of its own: the subreaper and kill_all's sweep are process-wide, so
-// another test's kill_all would kill these daemons first.
 #[cfg(target_os = "linux")]
 #[test]
 fn kill_all_reaches_descendants_that_left_the_session() {

@@ -34,10 +34,6 @@ impl CallKind {
     }
 }
 
-/// One line of `trace.jsonl`. A call's request is `header.config.sampling_params` (with
-/// `max_tokens` replaced in place by `max_tokens_override`), then `model`, `messages` (the
-/// `prompt` range), `header.tools`, `tool_choice` ("none" for compaction, else "auto") and
-/// `stream: false`, serialized in that order.
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event<'a> {
@@ -71,7 +67,6 @@ pub enum Event<'a> {
         failure: &'a Failure,
         retry_in_ms: Option<u64>,
     },
-    /// Follows its tool message.
     ToolCall {
         call_id: &'a str,
         name: &'a str,
@@ -106,9 +101,6 @@ struct Line<'a> {
     t_ms: u128,
 }
 
-/// One synchronous write per line, so a cancelled future never leaves half a line. A failed write
-/// or the size cap marks the trace truncated and the attempt goes on: the session server, not
-/// this file, is the token record.
 pub struct Trace {
     file: Option<File>,
     written: u64,
@@ -165,7 +157,6 @@ impl Trace {
     }
 }
 
-/// Append-only; compaction opens a new segment instead of rewriting this one.
 pub struct Segment {
     index: u32,
     messages: Vec<Value>,

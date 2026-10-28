@@ -39,8 +39,6 @@ const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
     ("GPG_TTY", ""),
 ];
 
-// Children spawned here and not yet reaped by tokio. The Linux orphan reaper and sweep must
-// leave them alone, including those of other sessions in the same process.
 static SPAWNED: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -494,9 +492,6 @@ fn read_log(path: &Path, limit: usize) -> io::Result<(String, u64)> {
     Ok((strip_ansi(&String::from_utf8_lossy(&bytes)), total))
 }
 
-// The command appends to the log itself, so the cap cannot hold its output back. Past the cap
-// the log keeps its first half, a marker, and its latest quarter, copied down in place until the
-// length stops changing; only an append between that last check and the truncation is lost.
 fn cap_log(log: &File, path: &Path, kept: &mut Option<u64>) -> io::Result<bool> {
     use std::os::unix::fs::FileExt;
     let mut end = log.metadata()?.len();
@@ -572,9 +567,6 @@ fn processes() -> Vec<libc::pid_t> {
     }
 }
 
-// The runner adopts descendants that leave their command's session (setsid, double fork), so
-// kill_all can still find them, and reaps what it adopts. Processes in the runner's own session
-// are never touched: no command descendant can be in it, and other code's children are.
 #[cfg(target_os = "linux")]
 fn adopt_orphans() -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {

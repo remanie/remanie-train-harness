@@ -34,7 +34,6 @@ pub fn bearer_header(key: &str) -> Result<HeaderValue, &'static str> {
     Ok(header)
 }
 
-/// Forwarded verbatim; the contract schema already refused the keys the runner sets.
 #[derive(Debug, Deserialize)]
 #[serde(try_from = "Map<String, Value>")]
 pub struct SamplingParams {
@@ -75,10 +74,12 @@ struct Body<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "failure", rename_all = "snake_case")]
 pub enum Failure {
-    /// Nothing was sent.
-    Connect { detail: String },
-    /// Sent, then no complete response.
-    Lost { detail: String },
+    Connect {
+        detail: String,
+    },
+    Lost {
+        detail: String,
+    },
     Status {
         status: u16,
         body_excerpt: String,
@@ -91,8 +92,6 @@ pub enum Failure {
 }
 
 impl Failure {
-    /// `Some(retry_after)` exactly when the endpoint did not process the request, so resending
-    /// the same bytes cannot record a second generation.
     fn retryable(&self) -> Option<Option<Duration>> {
         match self {
             Failure::Connect { .. } => Some(None),
@@ -172,7 +171,6 @@ pub enum Finish {
 }
 
 pub struct Sampled {
-    /// `choices[0].message` exactly as received; it is replayed, never rebuilt.
     pub message: Value,
     pub finish: Finish,
     pub usage: Option<Usage>,
@@ -188,8 +186,6 @@ pub struct Request<'a> {
 }
 
 pub fn http_client() -> Result<reqwest::Client, Cause> {
-    // No total timeout: the attempt deadline is the only bound, so a deadline that passes while
-    // a request is outstanding always ends the attempt as `deadline`.
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))

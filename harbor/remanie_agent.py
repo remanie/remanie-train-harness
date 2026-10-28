@@ -30,8 +30,7 @@ CONNECTION_FIELDS = ("model", "base_url", "api_key_env")
 
 
 class RemanieInfrastructureError(RuntimeError):
-    """The runner reported a failure the policy did not cause (its infrastructure exit code).
-    Not a NonZeroAgentExitCodeError, so Harbor skips the verifier."""
+    """Not a NonZeroAgentExitCodeError, so Harbor skips the verifier."""
 
 
 @dataclass(frozen=True)

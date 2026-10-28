@@ -95,7 +95,6 @@ impl Fixture {
         (serde_json::to_value(&result).unwrap(), exit)
     }
 
-    /// Also checks that result.json, the trace's last line and the returned result agree.
     async fn run_with_key(&self, key: Option<&str>) -> Value {
         let (result, exit) = self.launch(key).await;
         assert_eq!(exit, if result["gradable"] == true { 0 } else { 70 });

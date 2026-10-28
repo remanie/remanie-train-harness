@@ -17,7 +17,6 @@ use crate::trace::{CallKind, Event, MAX_TRACE_BYTES, Segment, Trace};
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
 
-/// Valid against `assets/contract.json#/input`, which `parse_input` checks first.
 #[derive(Debug, Deserialize)]
 struct Input {
     base_url: String,
@@ -42,8 +41,6 @@ struct Compaction {
     max_tokens: u64,
 }
 
-/// Writes `result.json` on every path into the `session_dir` this call created. `take_key` runs
-/// before the first await.
 pub async fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> RunResult {
     let started = std::time::Instant::now();
     let mut tally = Tally::default();
@@ -150,8 +147,6 @@ fn internal(detail: impl Into<String>) -> Cause {
     }
 }
 
-/// Claims `session_dir` as soon as the input names an absolute one, so a rejected input still
-/// leaves a `result.json` there; a directory that already exists is never written into.
 fn parse_input(stdin: &[u8], session_dir: &mut Option<PathBuf>) -> Result<(Value, Input), Cause> {
     if stdin.len() > MAX_INPUT_BYTES {
         return Err(config("input exceeds 1 MiB"));
@@ -223,8 +218,6 @@ async fn interrupted() {
     }
 }
 
-/// A conservative estimate of the next prompt: what the endpoint last counted plus every byte
-/// appended since, each byte counted as a token.
 #[derive(Default)]
 struct ContextBudget {
     counted: u64,
@@ -268,7 +261,6 @@ async fn execute(cx: &mut Attempt<'_>) -> Outcome {
     }
 }
 
-/// `Err` carries the outcome that ends the attempt, `Completed` included.
 async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let input = cx.input;
     if cx.tally.turns == input.max_turns {
@@ -468,8 +460,6 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// Unknown tool names and unparseable arguments are not checked here: the tool session answers
-/// them as tool results the model can correct.
 fn read_reply(message: &Value) -> Result<Reply, Misbehaviour> {
     let content = match &message["content"] {
         Value::Null => None,
