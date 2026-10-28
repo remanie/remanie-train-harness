@@ -371,8 +371,7 @@ async fn the_trained_schema_keeps_its_tool_and_parameter_names() {
         ("todo_write", &["todos", "merge"]),
     ]
     .map(|(name, parameters)| {
-        let mut parameters = parameters.iter().map(|p| p.to_string()).collect::<Vec<_>>();
-        parameters.sort();
+        let parameters = parameters.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         (name.to_owned(), parameters)
     });
     assert_eq!(names, expected);

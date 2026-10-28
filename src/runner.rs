@@ -14,8 +14,6 @@ use crate::outcome::{CONTRACT, Cause, Misbehaviour, Outcome, Overflow, RunResult
 use crate::tools::ToolSession;
 use crate::trace::{CallKind, Event, MAX_TRACE_BYTES, Segment, Trace};
 
-pub use tool_shim::ToolErrorKind;
-
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
 
@@ -93,7 +91,7 @@ async fn attempt(
         Trace::create(&input.session_dir, MAX_TRACE_BYTES)
             .map_err(|error| internal(format!("create trace.jsonl: {error}")))?,
     );
-    let tools = ToolSession::new(input.workspace.clone(), input.session_dir.clone())
+    let tools = ToolSession::new(input.workspace.clone(), input.session_dir.join("terminal"))
         .await
         .map_err(|error| Cause::ToolRuntime {
             tool: "session".into(),
@@ -133,9 +131,9 @@ async fn attempt(
         request_in_flight: cx.model.in_flight(),
     });
     if outcome.keeps_background_tasks() {
-        tally.background_tasks_left_running = tool_shim::detach(tools).await;
+        tally.background_tasks_left_running = tools.detach();
     } else {
-        tool_shim::kill_all(tools).await;
+        tools.kill_all().await;
     }
     Ok(outcome)
 }
@@ -353,12 +351,16 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     }
     for call in &reply.calls {
         let started = Instant::now();
-        let output = tool_shim::call(cx.tools, call).await.map_err(|error| {
-            Outcome::Infrastructure(Cause::ToolRuntime {
-                tool: call.name.clone(),
-                detail: error.0,
-            })
-        })?;
+        let output = cx
+            .tools
+            .call(&call.name, &call.arguments)
+            .await
+            .map_err(|error| {
+                Outcome::Infrastructure(Cause::ToolRuntime {
+                    tool: call.name.clone(),
+                    detail: error.0,
+                })
+            })?;
         cx.tally.tool_calls.count(output.error);
         let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
         cx.budget.append(&message);
@@ -367,7 +369,7 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
             call_id: &call.id,
             name: &call.name,
             class: output.error,
-            task_id: output.task_id.as_deref(),
+            task_id: output.task_id,
             latency_ms: started.elapsed().as_millis() as u64,
         });
     }
@@ -408,12 +410,7 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let summary = summary(&sampled);
     cx.segment.push(sampled.message, cx.trace);
     let summary = summary.ok_or(Outcome::InvalidResponse(Misbehaviour::InvalidSummary))?;
-    let state = tool_shim::state(cx.tools).await.map_err(|error| {
-        Outcome::Infrastructure(Cause::ToolRuntime {
-            tool: "todo_write".into(),
-            detail: error.0,
-        })
-    })?;
+    let state = cx.tools.state().await;
     let continuation = render(
         "continuation",
         include_str!("../assets/continuation.jinja2"),
@@ -513,87 +510,6 @@ fn read_reply(message: &Value) -> Result<Reply, Misbehaviour> {
         refusal: message["refusal"].as_str().map(str::to_owned),
         calls,
     })
-}
-
-/// Stand-in for the `tools.rs` boundary from v2/rust-tools: every model-visible result is `Ok`,
-/// `Err` means the tool runtime broke. Delete when that branch lands.
-mod tool_shim {
-    use serde::Serialize;
-    use serde_json::Value;
-
-    use super::ToolCall;
-    use crate::outcome::TaskRef;
-    use crate::tools::ToolSession;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum ToolErrorKind {
-        UnknownTool,
-        InvalidArguments,
-        Failed,
-    }
-
-    pub struct ToolOutput {
-        pub content: String,
-        pub error: Option<ToolErrorKind>,
-        pub task_id: Option<String>,
-    }
-
-    pub struct InternalError(pub String);
-
-    pub async fn call(tools: &ToolSession, call: &ToolCall) -> Result<ToolOutput, InternalError> {
-        let failed = |error, text: String| {
-            Ok(ToolOutput {
-                content: format!("Tool error: {text}"),
-                error: Some(error),
-                task_id: None,
-            })
-        };
-        let arguments = match serde_json::from_str(&call.arguments) {
-            Ok(arguments) => arguments,
-            Err(error) => {
-                return failed(
-                    ToolErrorKind::InvalidArguments,
-                    format!("invalid tool argument JSON: {error}"),
-                );
-            }
-        };
-        match tools.call(&call.name, arguments, &call.id).await {
-            Ok(content) => Ok(ToolOutput {
-                content,
-                error: None,
-                task_id: None,
-            }),
-            Err(error) => {
-                let text = format!("{error:#}");
-                if text.contains("install ripgrep") {
-                    Err(InternalError(text))
-                } else if text == "tool is not permitted" {
-                    failed(ToolErrorKind::UnknownTool, text)
-                } else if text.starts_with(&format!("invalid {} arguments", call.name)) {
-                    failed(ToolErrorKind::InvalidArguments, text)
-                } else {
-                    failed(ToolErrorKind::Failed, text)
-                }
-            }
-        }
-    }
-
-    pub async fn state(tools: &ToolSession) -> Result<Value, InternalError> {
-        tools
-            .snapshot()
-            .await
-            .map_err(|error| InternalError(format!("{error:#}")))
-    }
-
-    pub async fn detach(tools: ToolSession) -> Vec<TaskRef> {
-        tools.shutdown().await;
-        Vec::new()
-    }
-
-    pub async fn kill_all(tools: ToolSession) {
-        tools.shutdown().await;
-    }
 }
 
 #[cfg(test)]

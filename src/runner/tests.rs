@@ -883,7 +883,6 @@ async fn infrastructure_outcomes_kill_background_processes() {
 }
 
 #[tokio::test]
-#[ignore = "needs ToolSession::detach from v2/rust-tools"]
 async fn gradable_outcomes_leave_background_processes_running() {
     let mut f = fixture(vec![
         tool_reply(vec![call("server", "run_terminal_cmd", json!({

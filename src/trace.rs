@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::model::Failure;
 use crate::outcome::RunResult;
-use crate::runner::ToolErrorKind;
+use crate::tools::{TaskId, ToolErrorKind};
 
 pub const MAX_TRACE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -77,7 +77,7 @@ pub enum Event<'a> {
         name: &'a str,
         #[serde(serialize_with = "tool_class")]
         class: Option<ToolErrorKind>,
-        task_id: Option<&'a str>,
+        task_id: Option<TaskId>,
         latency_ms: u64,
     },
     Compaction {

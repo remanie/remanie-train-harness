@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::runner::ToolErrorKind;
+use crate::tools::ToolErrorKind;
 
 pub const CONTRACT: &str = include_str!("../assets/contract.json");
 pub const CONTRACT_VERSION: u32 = 1;
@@ -156,13 +156,6 @@ impl ToolCallCounts {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TaskRef {
-    pub task_id: String,
-    pub pid: u32,
-    pub command: String,
-}
-
 #[derive(Debug, Default, Serialize)]
 pub struct Tally {
     pub final_answer: String,
@@ -171,7 +164,7 @@ pub struct Tally {
     pub model_calls: u32,
     pub usage: Usage,
     pub tool_calls: ToolCallCounts,
-    pub background_tasks_left_running: Vec<TaskRef>,
+    pub background_tasks_left_running: Vec<crate::tools::LeftRunning>,
 }
 
 impl Tally {
