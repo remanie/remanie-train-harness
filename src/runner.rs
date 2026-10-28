@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -126,6 +126,7 @@ async fn attempt(
         segment: Segment::new(0, initial.clone(), trace),
         trace,
         budget: ContextBudget::default(),
+        turn_prompts: HashMap::new(),
         initial,
         tally,
         compact_next: false,
@@ -273,6 +274,7 @@ struct Attempt<'a> {
     segment: Segment,
     initial: Vec<Value>,
     budget: ContextBudget,
+    turn_prompts: HashMap<usize, u64>,
     tally: &'a mut Tally,
     compact_next: bool,
 }
@@ -340,6 +342,10 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
     cx.tally.turns += 1;
     cx.tally.count_response(usage);
     let reply = read_reply(&message);
+    if let Some(usage) = usage {
+        cx.turn_prompts
+            .insert(cx.segment.messages().len(), usage.prompt_tokens);
+    }
     cx.segment.push(message, cx.trace);
     match context_tokens {
         Some(tokens) => cx.budget.counted(tokens),
@@ -418,7 +424,8 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         return Ok(());
     };
     let messages = cx.segment.messages();
-    let kept = messages[kept_turns_start(messages)..].to_vec();
+    let kept_start = kept_turns_start(messages);
+    let kept = messages[kept_start..].to_vec();
     let prompt = render(
         "compaction",
         include_str!("../assets/compaction.jinja2"),
@@ -459,13 +466,20 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         kept_messages: kept.len(),
     });
     let continuation = json!({"role": "user", "content": continuation});
-    let counted = sampled
-        .context_tokens
-        .map(|tokens| tokens + bytes(&continuation));
+    let summary_prompt = sampled.usage.map(|usage| usage.prompt_tokens);
+    let counted = match (summary_prompt, cx.turn_prompts.get(&kept_start)) {
+        (Some(summary), Some(&dropped)) => {
+            Some(summary.saturating_sub(dropped) + cx.initial.iter().map(bytes).sum::<u64>())
+        }
+        _ => sampled.context_tokens,
+    }
+    .map(|tokens| tokens + bytes(&continuation));
     let mut messages = cx.initial.clone();
     messages.push(continuation);
     messages.extend(kept);
     cx.segment = Segment::new(from + 1, messages, cx.trace);
+    // A kept turn's count covers the old segment's prefix, so it cannot be subtracted from a later summary.
+    cx.turn_prompts.clear();
     cx.budget = ContextBudget::default();
     for message in cx.segment.messages() {
         cx.budget.append(message);

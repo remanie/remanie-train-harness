@@ -699,6 +699,36 @@ async fn after_compaction_the_budget_never_exceeds_the_new_segment_bytes() {
 }
 
 #[tokio::test]
+async fn after_compaction_the_budget_leaves_out_the_dropped_turns() {
+    let read = |id, file| call(id, "read_file", json!({"target_file": file}));
+    let mut f = fixture(vec![
+        tool_reply(vec![read("r1", "a.txt")], 900),
+        tool_reply(vec![read("r2", "a.txt")], 8_900),
+        tool_reply(vec![read("r3", "a.txt")], 16_900),
+        tool_reply(vec![read("r4", "b1.txt"), read("r5", "b2.txt")], 24_900),
+        reply(
+            json!({"role": "assistant", "content": "<summary>Read a.txt three times and b1/b2 once.</summary>"}),
+            "stop",
+            60_300,
+        ),
+        final_reply(),
+    ])
+    .await;
+    for (name, lines) in [("a.txt", 300), ("b1.txt", 900), ("b2.txt", 400)] {
+        let text: String = (0..lines)
+            .map(|i| format!("{name} {i:04} {}\n", "x".repeat(78)))
+            .collect();
+        std::fs::write(f.workspace().join(name), text).unwrap();
+    }
+    f.config["context_window_tokens"] = json!(65_536);
+    f.config["sampling_params"]["max_tokens"] = json!(8192);
+    f.config["compaction"] = json!({"threshold_tokens": 56_000, "max_tokens": 2048});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+}
+
+#[tokio::test]
 async fn an_unusable_summary_ends_the_attempt_and_keeps_the_transcript() {
     for (summary, finish) in [
         (
