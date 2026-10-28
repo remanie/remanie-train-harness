@@ -36,11 +36,7 @@ SCRIPT = [
         "content": None,
         "reasoning_content": "Write the file, then read it back.",
         "tool_calls": [
-            tool_call("call-write", "run_terminal_cmd", {
-                "command": "printf 'hello\\n' > hello.txt",
-                "description": "Write hello.txt",
-                "block_until_ms": 10000,
-            }),
+            tool_call("call-write", "search_replace", {"file_path": "hello.txt", "old_string": "", "new_string": "hello\n"}),
             tool_call("call-read", "read_file", {"target_file": "hello.txt"}),
         ],
     }, "tool_calls", 9000, 40, 0)),
@@ -91,7 +87,8 @@ def main():
             "sampling_params": {"max_tokens": 512, "temperature": 1.0},
             "max_turns": 4,
             "deadline_secs": 60,
-            "compaction": {"threshold_tokens": 9500, "max_tokens": 256},
+            "context_window_tokens": 10000,
+            "compaction": {"max_tokens": 256},
         }
         run = subprocess.run([str(args.runner.resolve())], input=json.dumps(job).encode(), capture_output=True, timeout=120)
         server.shutdown()

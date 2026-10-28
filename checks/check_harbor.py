@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -108,13 +109,13 @@ class ScriptedModel:
                 shell("printf '%s' $$ > background.pid; printf background-ready; exec sleep 300", "background"),
             ], tokens=30_000)
         if self.turn == 2:
-            assert self.compactions == 1 and messages[2]["content"].startswith("Previous work on this task:")
-            state = json.loads(messages[2]["content"].split("Current tool state:\n", 1)[1])
-            todo = state["todos"]["todos"]["verify"]
-            assert todo["content"] == "Verify result.txt" and todo["status"] == "in_progress"
-            tasks = state["background_tasks"]
-            assert len(tasks) == 1 and not tasks[0]["completed"]
-            task_id = tasks[0]["task_id"]
+            continuation = messages[2]["content"]
+            assert self.compactions == 1 and len(messages) == 3
+            assert continuation.startswith("This session is being continued from a previous conversation")
+            assert "\n- [in_progress] verify: Verify result.txt\n" in continuation
+            running = re.findall(r'^- "(task-\d+)": `', continuation, re.M)
+            assert len(running) == 1, continuation
+            task_id = running[0]
             return reply(calls=[
                 call("get_terminal_command_output", {"task_ids": [task_id], "timeout_ms": 0}, "poll"),
                 call("read_file", {"target_file": "result.txt"}, "read"),

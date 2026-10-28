@@ -32,7 +32,7 @@ class TraceTests(unittest.TestCase):
         trace = self.write(LINES)
         self.assertEqual(
             [(result.call_id, result.name, result.status) for result in trace.tool_results],
-            [("call-write", "run_terminal_cmd", "ok"), ("call-read", "read_file", "ok")],
+            [("call-write", "search_replace", "ok"), ("call-read", "read_file", "ok")],
         )
         self.assertIn("hello", trace.tool_results[1].content)
         self.assertEqual([error["status"] for error in trace.endpoint_errors], [503])
