@@ -760,28 +760,19 @@ fn strip_ansi(text: &str) -> String {
 }
 
 fn ends_with_wait_builtin(command: &str) -> bool {
-    let trimmed = command
-        .trim_end()
-        .trim_end_matches(';')
-        .trim_end_matches('\n')
-        .trim_end();
-    let Some(prefix) = trimmed.strip_suffix("wait") else {
-        return false;
+    let trimmed = command.trim_end().trim_end_matches(';');
+    let (prefix, last) =
+        trimmed.split_at(trimmed.rfind([';', '\n', '&', '|']).map_or(0, |i| i + 1));
+    let mut words = last.split_whitespace();
+    let first = match words.next() {
+        Some("builtin" | "command") => words.next(),
+        first => first,
     };
-    let separated = prefix.ends_with([' ', '\t']);
     let prefix = prefix.trim_end_matches([' ', '\t']);
-    let prefix = if separated {
-        prefix
-            .strip_suffix("builtin")
-            .or_else(|| prefix.strip_suffix("command"))
-            .unwrap_or(prefix)
-            .trim_end_matches([' ', '\t'])
-    } else {
-        prefix
-    };
-    prefix.is_empty()
-        || prefix.ends_with([';', '\n'])
-        || (prefix.ends_with('&') && !prefix.ends_with("&&"))
+    first == Some("wait")
+        && (prefix.is_empty()
+            || prefix.ends_with([';', '\n'])
+            || (prefix.ends_with('&') && !prefix.ends_with("&&")))
 }
 
 fn parse_heredoc_start(chars: &[char], start: usize) -> Option<(String, bool, usize)> {
@@ -925,6 +916,20 @@ fn unwaited_background(command: &str) -> bool {
                 }
                 continue;
             }
+            if ch == '$' && chars.get(i + 1) == Some(&'{') {
+                word_start = false;
+                i += 2;
+                let mut depth = 1;
+                while i < len && depth > 0 {
+                    match chars[i] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
             if ch == '(' && chars.get(i + 1) == Some(&'(') {
                 word_start = i == 0 || chars[i - 1] != '$';
                 i += 2;
@@ -983,7 +988,7 @@ fn unwaited_background(command: &str) -> bool {
 
             if i.checked_sub(1)
                 .and_then(|j| chars.get(j).copied())
-                .is_some_and(|prev| prev == '>' || prev == '<')
+                .is_some_and(|prev| matches!(prev, '>' | '<' | '|'))
             {
                 i += 1;
                 continue;

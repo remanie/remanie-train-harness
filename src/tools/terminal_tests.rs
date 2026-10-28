@@ -445,6 +445,9 @@ fn background_guard_handles_shell_syntax() {
         "sleep 1 & cat <<wait\nbody\nwait",
         "sleep 1 & builtinwait",
         "sleep 1 & commandwait",
+        "sleep 1 & echo ${x}",
+        "sleep 1 |& tee log &",
+        "sleep 1 & wait_for_it",
     ] {
         assert!(unwaited_background(command), "accepted {command}");
     }
@@ -471,6 +474,13 @@ fn background_guard_handles_shell_syntax() {
         "sleep 0.01 & builtin\t wait # completed",
         "sleep 0.01 & command   wait",
         "sleep 0.01 & cat <<wait\nbody & text\nwait\nwait",
+        "make |& tee build.log",
+        "sleep 0.2 & wait $!",
+        "sleep 0.2 & pid=$!; wait $pid",
+        "sleep 0.2 & sleep 0.1 & wait %1 %2",
+        "sleep 0.2 &\nwait -n",
+        "x='a&b'; echo ${x//&/+}",
+        "echo ${x:-a&b} ${#y}",
     ] {
         assert!(!unwaited_background(command), "rejected {command}");
     }
