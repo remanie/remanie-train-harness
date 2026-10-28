@@ -184,7 +184,7 @@ pub struct Request<'a> {
     pub turn: u32,
     pub prompt: MessageRange,
     pub messages: &'a [Value],
-    pub max_tokens: u64,
+    pub max_tokens_override: Option<u64>,
 }
 
 pub fn http_client() -> Result<reqwest::Client, Cause> {
@@ -252,15 +252,16 @@ impl<'a> ModelClient<'a> {
     ) -> Result<Sampled, Outcome> {
         self.calls += 1;
         let call = self.calls;
-        let tool_choice = request.kind.tool_choice();
         let mut sampling = self.sampling.params.clone();
-        sampling.insert("max_tokens".into(), request.max_tokens.into());
+        if let Some(max_tokens) = request.max_tokens_override {
+            sampling.insert("max_tokens".into(), max_tokens.into());
+        }
         let body = serde_json::to_vec(&Body {
             sampling: &sampling,
             model: self.model,
             messages: request.messages,
             tools: self.tools,
-            tool_choice,
+            tool_choice: request.kind.tool_choice(),
             stream: false,
         })
         .map_err(|error| {
@@ -284,8 +285,7 @@ impl<'a> ModelClient<'a> {
                         turn: request.turn,
                         kind: request.kind,
                         prompt: request.prompt,
-                        tool_choice,
-                        max_tokens: request.max_tokens,
+                        max_tokens_override: request.max_tokens_override,
                         attempts: attempt,
                         latency_ms: started.elapsed().as_millis() as u64,
                         response: &response,

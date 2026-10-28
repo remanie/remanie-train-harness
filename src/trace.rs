@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::model::Failure;
@@ -34,40 +34,31 @@ impl CallKind {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct ToolMeta<'a> {
-    pub name: &'a str,
-    pub error: Option<ToolErrorKind>,
-    pub task_id: Option<&'a str>,
-    pub latency_ms: u64,
-}
-
-/// One line of `trace.jsonl`. Request `k` is `header.input.sampling_params` with `max_tokens`
-/// replaced, then `model`, `messages` (the call's `prompt` range), `header.tools`,
-/// `tool_choice` and `stream: false`, serialized in that order.
+/// One line of `trace.jsonl`. A call's request is `header.config.sampling_params` (with
+/// `max_tokens` replaced in place by `max_tokens_override`), then `model`, `messages` (the
+/// `prompt` range), `header.tools`, `tool_choice` ("none" for compaction, else "auto") and
+/// `stream: false`, serialized in that order.
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event<'a> {
     Header {
         contract: u32,
         started_at_unix_ms: u128,
-        input: &'a Value,
+        config: &'a Value,
         tools: &'a [Value],
     },
     Message {
         segment: u32,
         index: usize,
         message: &'a Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tool: Option<ToolMeta<'a>>,
     },
     ModelCall {
         call: u32,
         turn: u32,
         kind: CallKind,
         prompt: MessageRange,
-        tool_choice: &'a str,
-        max_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_tokens_override: Option<u64>,
         attempts: u32,
         latency_ms: u64,
         response: &'a Value,
@@ -80,6 +71,15 @@ pub enum Event<'a> {
         failure: &'a Failure,
         retry_in_ms: Option<u64>,
     },
+    /// Follows its tool message.
+    ToolCall {
+        call_id: &'a str,
+        name: &'a str,
+        #[serde(serialize_with = "tool_class")]
+        class: Option<ToolErrorKind>,
+        task_id: Option<&'a str>,
+        latency_ms: u64,
+    },
     Compaction {
         from_segment: u32,
         to_segment: u32,
@@ -87,6 +87,16 @@ pub enum Event<'a> {
         kept_messages: usize,
     },
     Result(&'a RunResult),
+}
+
+fn tool_class<S: Serializer>(
+    error: &Option<ToolErrorKind>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match error {
+        None => serializer.serialize_str("ok"),
+        Some(kind) => kind.serialize(serializer),
+    }
 }
 
 #[derive(Serialize)]
@@ -120,7 +130,7 @@ impl Trace {
         })
     }
 
-    pub fn header(&mut self, input: &Value, tools: &[Value]) {
+    pub fn header(&mut self, config: &Value, tools: &[Value]) {
         let started_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -128,7 +138,7 @@ impl Trace {
         self.record(&Event::Header {
             contract: crate::outcome::CONTRACT_VERSION,
             started_at_unix_ms,
-            input,
+            config,
             tools,
         });
     }
@@ -168,17 +178,16 @@ impl Segment {
             messages: Vec::with_capacity(messages.len()),
         };
         for message in messages {
-            segment.push(message, None, trace);
+            segment.push(message, trace);
         }
         segment
     }
 
-    pub fn push(&mut self, message: Value, tool: Option<ToolMeta<'_>>, trace: &mut Trace) {
+    pub fn push(&mut self, message: Value, trace: &mut Trace) {
         trace.record(&Event::Message {
             segment: self.index,
             index: self.messages.len(),
             message: &message,
-            tool,
         });
         self.messages.push(message);
     }
@@ -217,7 +226,6 @@ mod tests {
         for _ in 0..10 {
             segment.push(
                 json!({"role": "user", "content": "x".repeat(40)}),
-                None,
                 &mut trace,
             );
         }

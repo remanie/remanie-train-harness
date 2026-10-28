@@ -12,7 +12,7 @@ use crate::compaction::format_compact_summary;
 use crate::model::{Finish, ModelClient, Request, Sampled, SamplingParams, bearer_header};
 use crate::outcome::{CONTRACT, Cause, Misbehaviour, Outcome, Overflow, RunResult, Tally};
 use crate::tools::ToolSession;
-use crate::trace::{CallKind, Event, MAX_TRACE_BYTES, Segment, ToolMeta, Trace};
+use crate::trace::{CallKind, Event, MAX_TRACE_BYTES, Segment, Trace};
 
 pub use tool_shim::ToolErrorKind;
 
@@ -304,7 +304,7 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
                 turn: cx.tally.turns + 1,
                 prompt: cx.segment.range(),
                 messages: cx.segment.messages(),
-                max_tokens,
+                max_tokens_override: None,
             },
             cx.trace,
         )
@@ -312,7 +312,7 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     cx.tally.turns += 1;
     cx.tally.count_response(usage);
     let reply = read_reply(&message);
-    cx.segment.push(message, None, cx.trace);
+    cx.segment.push(message, cx.trace);
     match context_tokens {
         Some(tokens) => cx.budget.counted(tokens),
         None if input.context_window_tokens.is_some() || input.compaction.is_some() => {
@@ -362,13 +362,14 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         cx.tally.tool_calls.count(output.error);
         let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
         cx.budget.append(&message);
-        let meta = ToolMeta {
+        cx.segment.push(message, cx.trace);
+        cx.trace.record(&Event::ToolCall {
+            call_id: &call.id,
             name: &call.name,
-            error: output.error,
+            class: output.error,
             task_id: output.task_id.as_deref(),
             latency_ms: started.elapsed().as_millis() as u64,
-        };
-        cx.segment.push(message, Some(meta), cx.trace);
+        });
     }
     cx.compact_next = input.compaction.as_ref().is_some_and(|compaction| {
         cx.budget.estimate() + max_tokens.max(compaction.max_tokens) >= compaction.threshold_tokens
@@ -389,7 +390,7 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     )
     .map_err(Outcome::Infrastructure)?;
     cx.segment
-        .push(json!({"role": "user", "content": prompt}), None, cx.trace);
+        .push(json!({"role": "user", "content": prompt}), cx.trace);
     let sampled = cx
         .model
         .sample(
@@ -398,14 +399,14 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
                 turn: cx.tally.turns,
                 prompt: cx.segment.range(),
                 messages: cx.segment.messages(),
-                max_tokens: compaction.max_tokens,
+                max_tokens_override: Some(compaction.max_tokens),
             },
             cx.trace,
         )
         .await?;
     cx.tally.count_response(sampled.usage);
     let summary = summary(&sampled);
-    cx.segment.push(sampled.message, None, cx.trace);
+    cx.segment.push(sampled.message, cx.trace);
     let summary = summary.ok_or(Outcome::InvalidResponse(Misbehaviour::InvalidSummary))?;
     let state = tool_shim::state(cx.tools).await.map_err(|error| {
         Outcome::Infrastructure(Cause::ToolRuntime {

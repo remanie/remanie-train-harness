@@ -507,9 +507,9 @@ async fn tool_contract_errors_return_to_the_model_without_side_effects() {
             .starts_with("Tool error:")
     }));
     let kinds: Vec<_> = f
-        .events("message")
+        .events("tool_call")
         .iter()
-        .filter_map(|event| event.get("tool").map(|tool| tool["error"].clone()))
+        .map(|event| event["class"].clone())
         .collect();
     assert_eq!(
         kinds,
@@ -946,15 +946,22 @@ async fn every_request_is_rebuilt_byte_for_byte_from_the_trace() {
                 let prompt = &event["prompt"];
                 let messages = &segments[&prompt["segment"].as_u64().unwrap()]
                     [..prompt["end"].as_u64().unwrap() as usize];
-                let mut body = header["input"]["sampling_params"]
+                let mut body = header["config"]["sampling_params"]
                     .as_object()
                     .unwrap()
                     .clone();
-                body.insert("max_tokens".into(), event["max_tokens"].clone());
-                body.insert("model".into(), header["input"]["model"].clone());
+                if let Some(max_tokens) = event.get("max_tokens_override") {
+                    body.insert("max_tokens".into(), max_tokens.clone());
+                }
+                body.insert("model".into(), header["config"]["model"].clone());
                 body.insert("messages".into(), Value::Array(messages.to_vec()));
+                let tool_choice = if event["kind"] == "compaction" {
+                    "none"
+                } else {
+                    "auto"
+                };
                 body.insert("tools".into(), header["tools"].clone());
-                body.insert("tool_choice".into(), event["tool_choice"].clone());
+                body.insert("tool_choice".into(), json!(tool_choice));
                 body.insert("stream".into(), json!(false));
                 let bytes = serde_json::to_vec(&body).unwrap();
                 for _ in 0..event["attempts"].as_u64().unwrap() {
