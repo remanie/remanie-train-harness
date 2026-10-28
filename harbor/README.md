@@ -19,7 +19,7 @@ The output directory must be new. It holds the runner, `rg`, their Linux loader 
 |---|---|
 | `model_name` | Required. The adapter refuses a job without one. |
 | `base_url` | Optional. Defaults to Harbor's model connection. It must be reachable from the sandbox. |
-| `model_api_key_name` | Optional. Names the host variable that holds the key. Unset, the runner sends no key. |
+| `model_api_key_name` | Optional. Names the host variable that holds the key. When it is unset, the runner sends no key. |
 | `kwargs.runtime_dir` | The bundle directory. |
 | other `kwargs` | Runner options from [the input table](../README.md#input): `max_turns`, `deadline_secs`, `sampling_params`, `compaction`, `retry`, `keep_background_tasks`. |
 
@@ -36,15 +36,15 @@ Before any sandbox starts, the adapter refuses the job when the runner options f
 - Exit 0. The adapter returns and Harbor runs the verifier.
 - Exit 70. The adapter raises `RemanieInfrastructureError` and Harbor skips the verifier.
 - Any other exit. The adapter sends TERM to the runner's process group, then KILL after 5 s, and raises `RemanieInfrastructureError`.
-- Harbor's agent timeout. The adapter stops the process group the same way and re-raises the cancellation. Harbor grades it as `AgentTimeoutError`.
+- Harbor's agent timeout. The adapter stops the process group the same way and re-raises the cancellation. Harbor records `AgentTimeoutError` and still runs the verifier.
 
-On every path the adapter copies `result.json` into `context.metadata["remanie"]`. When `usage.complete` is true it also sets `n_input_tokens`, `n_output_tokens` and `n_cache_tokens`.
+On every path the adapter copies `result.json` into `context.metadata["remanie"]`. When `usage.complete` is true it also sets `n_input_tokens`, `n_output_tokens`, and `n_cache_tokens`.
 
-Each trial directory holds `agent/result.json`, `agent/remanie/trace.jsonl` and `agent/runtime-stderr.txt`. The stderr file is for diagnostics and has no fixed format.
+Each trial directory holds `agent/result.json`, `agent/remanie/trace.jsonl`, and `agent/runtime-stderr.txt`. The stderr file is for diagnostics and has no fixed format.
 
 ## Train with Miles
 
-Miles' Harbor connector runs the agent inside the trial and creates one session per attempt. Set `base_url` to that session, `http://<session-server>/sessions/<id>/v1`. The session server does not check a key, so leave `model_api_key_name` unset; any dummy value also works. Pass the launcher's sampling parameters as `sampling_params`. The server rejects a `temperature` that differs from the training temperature.
+Miles' Harbor connector runs the agent inside the trial and creates one session per attempt. Set `base_url` to that session, `http://<session-server>/sessions/<id>/v1`. The session server does not check a key, so leave `model_api_key_name` unset. A variable holding any dummy value also works. Pass the launcher's sampling parameters as `sampling_params`. The server rejects a `temperature` that differs from the training temperature.
 
 Leave `compaction` unset under the v1 linear session server. A compaction opens a new history, which v1 rejects with 400 `rollback failed`. Turn it on only with `--use-session-server v2`.
 
