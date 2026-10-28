@@ -40,8 +40,6 @@ fn neutralize_compaction_control_tokens(text: &str) -> String {
         .replace("<summary>", "<\u{200b}summary>")
         .replace("</analysis>", "<\u{200b}/analysis>")
         .replace("<analysis>", "<\u{200b}analysis>")
-        .replace("</summary_request>", "<\u{200b}/summary_request>")
-        .replace("<summary_request>", "<\u{200b}summary_request>")
 }
 
 #[cfg(test)]

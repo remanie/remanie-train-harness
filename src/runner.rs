@@ -1,492 +1,603 @@
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::compaction::format_compact_summary;
-use anyhow::{Context, Result, bail, ensure};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
-use serde::{Deserialize, Serialize};
+use reqwest::header::HeaderValue;
+use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
+use crate::compaction::format_compact_summary;
+use crate::model::{Finish, ModelClient, Request, Sampled, SamplingParams, bearer_header};
+use crate::outcome::{CONTRACT, Cause, Misbehaviour, Outcome, Overflow, RunResult, Tally};
 use crate::tools::ToolSession;
+use crate::trace::{CallKind, Event, MAX_TRACE_BYTES, Segment, ToolMeta, Trace};
 
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TRACE_BYTES: u64 = 256 * 1024 * 1024;
-const SAMPLING_FIELDS: &[&str] = &[
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "presence_penalty",
-    "frequency_penalty",
-    "repetition_penalty",
-    "seed",
-    "stop",
-    "chat_template_kwargs",
-    "stop_token_ids",
-    "skip_special_tokens",
-    "no_stop_trim",
-    "reasoning",
-    "reasoning_effort",
-];
+pub use tool_shim::ToolErrorKind;
+
+pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_TOOL_CALLS: usize = 128;
+
+/// Valid against `assets/contract.json#/input`, which `parse_input` checks first.
+#[derive(Debug, Deserialize)]
+struct Input {
+    base_url: String,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    model: String,
+    user_query: String,
+    workspace: PathBuf,
+    session_dir: PathBuf,
+    sampling_params: SamplingParams,
+    max_turns: u32,
+    deadline_secs: u64,
+    #[serde(default)]
+    context_window_tokens: Option<u64>,
+    #[serde(default)]
+    compaction: Option<Compaction>,
+}
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    pub base_url: String,
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    pub model: String,
-    pub user_query: String,
-    pub workspace: PathBuf,
-    pub session_dir: PathBuf,
-    #[serde(default = "empty_object")]
-    pub sampling_params: Value,
-    #[serde(default = "default_turns")]
-    pub max_turns: usize,
-    #[serde(default = "default_response_tokens")]
-    pub max_response_tokens: u32,
-    #[serde(default = "default_deadline")]
-    pub deadline_secs: u64,
-    #[serde(default)]
-    pub compaction_threshold_tokens: u64,
-    #[serde(default = "default_compaction_tokens")]
-    pub compaction_max_tokens: u32,
+struct Compaction {
+    threshold_tokens: u64,
+    max_tokens: u64,
 }
 
-fn empty_object() -> Value {
-    json!({})
-}
-fn default_turns() -> usize {
-    100
-}
-fn default_response_tokens() -> u32 {
-    4096
-}
-fn default_deadline() -> u64 {
-    600
-}
-fn default_compaction_tokens() -> u32 {
-    2048
+/// Runs one attempt from the stdin bytes. `result.json` is written into `session_dir` whenever
+/// this call created it, on every path. `take_key` is called before the first await.
+pub async fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> RunResult {
+    let started = std::time::Instant::now();
+    let mut tally = Tally::default();
+    let mut session_dir = None;
+    let mut trace = None;
+    let outcome = attempt(stdin, take_key, &mut session_dir, &mut trace, &mut tally)
+        .await
+        .unwrap_or_else(Outcome::Infrastructure);
+    let truncated = trace.as_ref().is_some_and(Trace::truncated);
+    let mut result = RunResult::new(outcome, tally, truncated, started.elapsed());
+    if let Some(dir) = &session_dir
+        && let Err(error) = result.write_atomically(dir)
+    {
+        result.outcome = Outcome::Infrastructure(Cause::Internal {
+            detail: format!("write result.json: {error}"),
+        });
+        result.gradable = false;
+    }
+    if let Some(trace) = &mut trace {
+        trace.record(&Event::Result(&result));
+    }
+    result
 }
 
-impl Config {
-    pub fn validate(&self) -> Result<()> {
-        let url = reqwest::Url::parse(&self.base_url).context("invalid base_url")?;
-        ensure!(
-            matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
-            "base_url must be HTTP(S)"
-        );
-        ensure!(
-            url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none(),
-            "base_url cannot contain credentials, query, or fragment"
-        );
-        ensure!(
-            url.path().trim_end_matches('/').ends_with("/v1"),
-            "base_url must end with /v1"
-        );
-        if let Some(name) = &self.api_key_env {
-            ensure!(
-                !name.is_empty()
-                    && name.bytes().enumerate().all(|(i, byte)| {
-                        byte == b'_'
-                            || byte.is_ascii_alphabetic()
-                            || (i > 0 && byte.is_ascii_digit())
-                    }),
-                "api_key_env must be an environment variable name"
-            );
-        }
-        ensure!(
-            !self.model.trim().is_empty() && !self.user_query.trim().is_empty(),
-            "model and user_query are required"
-        );
-        ensure!(
-            self.workspace.is_absolute() && self.workspace.is_dir(),
-            "workspace must be an existing absolute directory"
-        );
-        ensure!(
-            self.session_dir.is_absolute(),
-            "session_dir must be absolute"
-        );
-        ensure!(
-            self.max_turns > 0 && self.max_turns <= 512,
-            "max_turns must be 1..512"
-        );
-        ensure!(
-            (1..=86400).contains(&self.deadline_secs),
-            "deadline_secs must be 1..86400"
-        );
-        ensure!(
-            self.max_response_tokens > 0 && self.compaction_max_tokens > 0,
-            "token limits must be positive"
-        );
-        let params = self
-            .sampling_params
-            .as_object()
-            .context("sampling_params must be an object")?;
-        for key in params.keys() {
-            ensure!(
-                SAMPLING_FIELDS.contains(&key.as_str()),
-                "unsupported sampling field: {key}"
-            );
-        }
-        Ok(())
+async fn attempt(
+    stdin: &[u8],
+    take_key: impl FnOnce(&str) -> Option<OsString>,
+    session_dir: &mut Option<PathBuf>,
+    trace: &mut Option<Trace>,
+    tally: &mut Tally,
+) -> Result<Outcome, Cause> {
+    let (raw, input) = parse_input(stdin, session_dir)?;
+    let authorization = match &input.api_key_env {
+        Some(name) => Some(authorization(take_key(name), name)?),
+        None => None,
+    };
+    let url = reqwest::Url::parse(&format!(
+        "{}/chat/completions",
+        input.base_url.trim_end_matches('/')
+    ))
+    .map_err(|error| config(format!("invalid base_url: {error}")))?;
+    let http = crate::model::http_client()?;
+    let initial = initial_messages(&input.user_query)?;
+    let trace = trace.insert(
+        Trace::create(&input.session_dir, MAX_TRACE_BYTES)
+            .map_err(|error| internal(format!("create trace.jsonl: {error}")))?,
+    );
+    let tools = ToolSession::new(input.workspace.clone(), input.session_dir.clone())
+        .await
+        .map_err(|error| Cause::ToolRuntime {
+            tool: "session".into(),
+            detail: format!("{error:#}"),
+        })?;
+    let definitions = tools.definitions();
+    trace.header(&raw, &definitions);
+    let deadline = Instant::now() + Duration::from_secs(input.deadline_secs);
+    let mut cx = Attempt {
+        input: &input,
+        model: ModelClient::new(
+            http,
+            url,
+            authorization,
+            &input.model,
+            &input.sampling_params,
+            &definitions,
+            deadline,
+        ),
+        tools: &tools,
+        segment: Segment::new(0, initial.clone(), trace),
+        trace,
+        budget: ContextBudget::default(),
+        initial,
+        tally,
+        compact_next: false,
+    };
+    for message in cx.segment.messages() {
+        cx.budget.append(message);
+    }
+    let stopped = tokio::select! {
+        outcome = execute(&mut cx) => Some(outcome),
+        () = tokio::time::sleep_until(deadline) => None,
+        () = interrupted() => Some(Outcome::Cancelled),
+    };
+    let outcome = stopped.unwrap_or_else(|| Outcome::Deadline {
+        request_in_flight: cx.model.in_flight(),
+    });
+    if outcome.keeps_background_tasks() {
+        tally.background_tasks_left_running = tool_shim::detach(tools).await;
+    } else {
+        tool_shim::kill_all(tools).await;
+    }
+    Ok(outcome)
+}
+
+fn config(detail: impl Into<String>) -> Cause {
+    Cause::Config {
+        detail: detail.into(),
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct RunResult {
-    pub status: String,
-    pub final_answer: String,
-    pub turns: usize,
-    pub compactions: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl RunResult {
-    fn stopped(status: &str) -> Self {
-        Self {
-            status: status.into(),
-            final_answer: String::new(),
-            turns: 0,
-            compactions: 0,
-            error: None,
-        }
-    }
-
-    pub fn error(error: anyhow::Error) -> Self {
-        Self {
-            error: Some(format!("{error:#}")),
-            ..Self::stopped("error")
-        }
+fn internal(detail: impl Into<String>) -> Cause {
+    Cause::Internal {
+        detail: detail.into(),
     }
 }
 
-struct Trace(Mutex<File>);
-
-impl Trace {
-    fn record(&self, event: &str, body: &Value) -> Result<()> {
-        let mut file = self
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("trace lock poisoned"))?;
-        let line = serde_json::to_vec(&json!({"event": event, "body": body}))?;
-        ensure!(
-            file.metadata()?.len().saturating_add(line.len() as u64 + 1) <= MAX_TRACE_BYTES,
-            "trace exceeds 256 MiB"
-        );
-        file.write_all(&line)?;
-        writeln!(file)?;
-        file.flush()?;
-        Ok(())
+/// Claims `session_dir` as soon as the input names an absolute one, so a rejected input still
+/// leaves a `result.json` there; a directory that already exists is never written into.
+fn parse_input(stdin: &[u8], session_dir: &mut Option<PathBuf>) -> Result<(Value, Input), Cause> {
+    if stdin.len() > MAX_INPUT_BYTES {
+        return Err(config("input exceeds 1 MiB"));
     }
+    let raw: Value = serde_json::from_slice(stdin)
+        .map_err(|error| config(format!("input is not JSON: {error}")))?;
+    if let Some(dir) = raw["session_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+    {
+        std::fs::create_dir(&dir).map_err(|error| {
+            config(format!(
+                "session_dir must be new and its parent must exist: {error}"
+            ))
+        })?;
+        *session_dir = Some(dir);
+    }
+    let contract: Value = serde_json::from_str(CONTRACT)
+        .map_err(|error| internal(format!("contract.json: {error}")))?;
+    let schema = jsonschema::validator_for(&contract["input"])
+        .map_err(|error| internal(format!("contract.json input schema: {error}")))?;
+    if let Some(error) = schema.iter_errors(&raw).next() {
+        return Err(config(format!("{error} at {}", error.instance_path)));
+    }
+    let input: Input =
+        serde_json::from_value(raw.clone()).map_err(|error| config(error.to_string()))?;
+    if !input.workspace.is_dir() {
+        return Err(config("workspace must be an existing directory"));
+    }
+    Ok((raw, input))
 }
 
-struct ModelClient<'a> {
-    config: &'a Config,
-    authorization: Option<&'a HeaderValue>,
-    http: reqwest::Client,
-    definitions: Vec<Value>,
-    trace: &'a Trace,
+fn authorization(key: Option<OsString>, name: &str) -> Result<HeaderValue, Cause> {
+    let key = key
+        .ok_or_else(|| config(format!("environment variable {name} is not set")))?
+        .into_string()
+        .map_err(|_| config("API key must be UTF-8"))?;
+    bearer_header(&key).map_err(config)
 }
 
-impl ModelClient<'_> {
-    async fn sample(&self, messages: &[Value], max_tokens: u32, compacting: bool) -> Result<Value> {
-        let mut request = self.config.sampling_params.clone();
-        let fields = request.as_object_mut().context("invalid sampling_params")?;
-        fields.extend(
-            json!({
-                "model": self.config.model,
-                "messages": messages,
-                "tools": self.definitions,
-                "tool_choice": if compacting { "none" } else { "auto" },
-                "max_tokens": max_tokens,
-                "stream": false
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
-        let payload = serde_json::to_vec(&request)?;
-        ensure!(
-            payload.len() <= MAX_RESPONSE_BYTES,
-            "model request exceeds 16 MiB"
-        );
-        self.trace.record(
-            if compacting {
-                "compaction_request"
-            } else {
-                "model_request"
-            },
-            &request,
-        )?;
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
-        let mut request = self
-            .http
-            .post(url)
-            .header("Content-Type", "application/json")
-            .body(payload);
-        if let Some(authorization) = self.authorization {
-            request = request.header(AUTHORIZATION, authorization);
-        }
-        let mut response = request.send().await.context("model request failed")?;
-        ensure!(
-            response.status().is_success(),
-            "model endpoint returned HTTP {}",
-            response.status()
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                bytes.len().saturating_add(chunk.len()) <= MAX_RESPONSE_BYTES,
-                "model response exceeds 16 MiB"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        let body: Value =
-            serde_json::from_slice(&bytes).context("model endpoint returned invalid JSON")?;
-        self.trace.record(
-            if compacting {
-                "compaction_response"
-            } else {
-                "model_response"
-            },
-            &body,
-        )?;
-        ensure!(
-            body["choices"].as_array().is_some_and(|v| v.len() == 1),
-            "expected exactly one model choice"
-        );
-        Ok(body)
-    }
-    async fn compact(&self, turns: &[Value]) -> Result<Option<String>> {
-        let mut messages = turns.to_vec();
-        messages.push(json!({"role": "user", "content": render(
-            "compaction", include_str!("../assets/compaction.jinja2"), json!({})
-        )?}));
-        let response = self
-            .sample(&messages, self.config.compaction_max_tokens, true)
-            .await?;
-        let choice = &response["choices"][0];
-        let message = &choice["message"];
-        if choice["finish_reason"] != "stop" || has_tools(message) || !valid_message_shape(message)
-        {
-            return Ok(None);
-        }
-        let summary = format_compact_summary(message["content"].as_str().unwrap_or_default());
-        Ok((!summary.trim().is_empty() && summary.trim() != "Summary:").then_some(summary))
-    }
-}
-
-fn render(name: &str, source: &str, context: Value) -> Result<String> {
+fn render(name: &str, source: &str, context: Value) -> Result<String, Cause> {
     let mut env = minijinja::Environment::new();
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
-    env.add_template(name, source)?;
-    Ok(env
-        .get_template(name)?
-        .render(context)?
-        .trim_end_matches('\n')
-        .to_owned())
+    let rendered = env
+        .add_template(name, source)
+        .and_then(|()| env.get_template(name)?.render(context))
+        .map_err(|error| internal(format!("render {name}: {error}")))?;
+    Ok(rendered.trim_end_matches('\n').to_owned())
 }
 
-fn initial_messages(query: &str) -> Result<Vec<Value>> {
+fn initial_messages(query: &str) -> Result<Vec<Value>, Cause> {
     Ok(vec![
         json!({"role": "system", "content": render("system", include_str!("../assets/system_prompt.jinja2"), json!({}))?}),
         json!({"role": "user", "content": render("user", include_str!("../assets/user_query.jinja2"), json!({"user_query": query}))?}),
     ])
 }
 
-fn has_tools(message: &Value) -> bool {
-    message["tool_calls"]
-        .as_array()
-        .is_some_and(|v| !v.is_empty())
+async fn interrupted() {
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let Ok(mut terminate) = terminate else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        Ok(()) = tokio::signal::ctrl_c() => {}
+        Some(()) = terminate.recv() => {}
+        else => std::future::pending().await,
+    }
 }
 
-fn valid_message_shape(message: &Value) -> bool {
-    message["role"] == "assistant"
-        && message.get("tool_calls").is_none_or(|calls| {
-            calls.is_null() || calls.as_array().is_some_and(|calls| calls.len() <= 128)
+/// A conservative estimate of the next prompt: what the endpoint last counted plus every byte
+/// appended since, each byte counted as a token.
+#[derive(Default)]
+struct ContextBudget {
+    counted: u64,
+    appended_bytes: u64,
+}
+
+impl ContextBudget {
+    fn counted(&mut self, tokens: u64) {
+        *self = Self {
+            counted: tokens,
+            appended_bytes: 0,
+        };
+    }
+
+    fn append(&mut self, message: &Value) {
+        self.appended_bytes += serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64);
+    }
+
+    fn estimate(&self) -> u64 {
+        self.counted + self.appended_bytes
+    }
+}
+
+struct Attempt<'a> {
+    input: &'a Input,
+    model: ModelClient<'a>,
+    tools: &'a ToolSession,
+    trace: &'a mut Trace,
+    segment: Segment,
+    initial: Vec<Value>,
+    budget: ContextBudget,
+    tally: &'a mut Tally,
+    compact_next: bool,
+}
+
+async fn execute(cx: &mut Attempt<'_>) -> Outcome {
+    loop {
+        if let Err(outcome) = turn(cx).await {
+            return outcome;
+        }
+    }
+}
+
+/// One model turn and its tool calls, run one at a time in the model's order. `Err` ends the
+/// attempt with that outcome.
+async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
+    let input = cx.input;
+    if cx.tally.turns == input.max_turns {
+        return Err(Outcome::MaxTurns);
+    }
+    if cx.compact_next {
+        compact(cx).await?;
+        cx.compact_next = false;
+    }
+    let max_tokens = input.sampling_params.max_tokens();
+    if let Some(window) = input.context_window_tokens {
+        let estimated = cx.budget.estimate();
+        if estimated + max_tokens > window {
+            return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
+                estimated_prompt_tokens: estimated,
+                max_tokens,
+                context_window_tokens: window,
+            }));
+        }
+    }
+    let Sampled {
+        message,
+        finish,
+        usage,
+        context_tokens,
+    } = cx
+        .model
+        .sample(
+            Request {
+                kind: CallKind::Turn,
+                turn: cx.tally.turns + 1,
+                prompt: cx.segment.range(),
+                messages: cx.segment.messages(),
+                max_tokens,
+            },
+            cx.trace,
+        )
+        .await?;
+    cx.tally.turns += 1;
+    cx.tally.count_response(usage);
+    let reply = read_reply(&message);
+    cx.segment.push(message, None, cx.trace);
+    match context_tokens {
+        Some(tokens) => cx.budget.counted(tokens),
+        None if input.context_window_tokens.is_some() || input.compaction.is_some() => {
+            return Err(Outcome::Infrastructure(Cause::EndpointResponse {
+                detail: "usage.total_tokens is required with compaction or context_window_tokens"
+                    .into(),
+            }));
+        }
+        None => {}
+    }
+    let reply = match finish {
+        Finish::Length => {
+            cx.tally.final_answer = reply
+                .ok()
+                .and_then(|reply| reply.content)
+                .unwrap_or_default();
+            return Err(Outcome::MaxTokens);
+        }
+        Finish::Other(finish_reason) => {
+            return Err(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
+                finish_reason,
+            }));
+        }
+        Finish::Stop | Finish::ToolCalls => reply.map_err(Outcome::InvalidResponse)?,
+    };
+    if reply.calls.is_empty() {
+        if finish == Finish::ToolCalls {
+            return Err(Outcome::InvalidResponse(Misbehaviour::UnexpectedFinish {
+                finish_reason: "tool_calls".into(),
+            }));
+        }
+        cx.tally.final_answer = [reply.content, reply.refusal]
+            .into_iter()
+            .flatten()
+            .find(|text| !text.trim().is_empty())
+            .ok_or(Outcome::InvalidResponse(Misbehaviour::EmptyTurn))?;
+        return Err(Outcome::Completed);
+    }
+    for call in &reply.calls {
+        let started = Instant::now();
+        let output = tool_shim::call(cx.tools, call).await.map_err(|error| {
+            Outcome::Infrastructure(Cause::ToolRuntime {
+                tool: call.name.clone(),
+                detail: error.0,
+            })
+        })?;
+        cx.tally.tool_calls.count(output.error);
+        let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
+        cx.budget.append(&message);
+        let meta = ToolMeta {
+            name: &call.name,
+            error: output.error,
+            task_id: output.task_id.as_deref(),
+            latency_ms: started.elapsed().as_millis() as u64,
+        };
+        cx.segment.push(message, Some(meta), cx.trace);
+    }
+    cx.compact_next = input.compaction.as_ref().is_some_and(|compaction| {
+        cx.budget.estimate() + max_tokens.max(compaction.max_tokens) >= compaction.threshold_tokens
+    });
+    Ok(())
+}
+
+/// Ends the segment with the summary request and its reply, then opens the next segment with
+/// the original prompt, the continuation (summary, todos, background tasks) and the last two
+/// assistant turns with their tool results.
+async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
+    let Some(compaction) = &cx.input.compaction else {
+        return Ok(());
+    };
+    let messages = cx.segment.messages();
+    let kept = messages[kept_turns_start(messages)..].to_vec();
+    let prompt = render(
+        "compaction",
+        include_str!("../assets/compaction.jinja2"),
+        json!({}),
+    )
+    .map_err(Outcome::Infrastructure)?;
+    cx.segment
+        .push(json!({"role": "user", "content": prompt}), None, cx.trace);
+    let sampled = cx
+        .model
+        .sample(
+            Request {
+                kind: CallKind::Compaction,
+                turn: cx.tally.turns,
+                prompt: cx.segment.range(),
+                messages: cx.segment.messages(),
+                max_tokens: compaction.max_tokens,
+            },
+            cx.trace,
+        )
+        .await?;
+    cx.tally.count_response(sampled.usage);
+    let summary = summary(&sampled);
+    cx.segment.push(sampled.message, None, cx.trace);
+    let summary = summary.ok_or(Outcome::InvalidResponse(Misbehaviour::InvalidSummary))?;
+    let state = tool_shim::state(cx.tools).await.map_err(|error| {
+        Outcome::Infrastructure(Cause::ToolRuntime {
+            tool: "todo_write".into(),
+            detail: error.0,
         })
-        && message
-            .get("content")
-            .is_none_or(|content| content.is_null() || content.is_string())
-}
-
-pub async fn run(config: Config, authorization: Option<HeaderValue>) -> Result<RunResult> {
-    config.validate()?;
-    std::fs::create_dir(&config.session_dir)
-        .context("session_dir must be new and its parent must exist")?;
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(config.session_dir.join("trace.jsonl"))?;
-    let trace = Trace(Mutex::new(file));
-    let session = ToolSession::new(config.workspace.clone(), config.session_dir.clone()).await?;
-    let mut result = RunResult::stopped("max_turns");
-    let outcome = tokio::select! {
-        result = execute(&config, authorization.as_ref(), &session, &trace, &mut result) => result,
-        _ = tokio::time::sleep(Duration::from_secs(config.deadline_secs)) => { result.status = "deadline".into(); Ok(()) },
-        signal = interrupted() => { result.status = "cancelled".into(); signal },
-    };
-    session.shutdown().await;
-    if let Err(error) = outcome {
-        result.status = "error".into();
-        result.error = Some(format!("{error:#}"));
+    })?;
+    let continuation = render(
+        "continuation",
+        include_str!("../assets/continuation.jinja2"),
+        json!({"summary": summary, "tool_state": state.to_string()}),
+    )
+    .map_err(Outcome::Infrastructure)?;
+    let from = cx.segment.index();
+    cx.trace.record(&Event::Compaction {
+        from_segment: from,
+        to_segment: from + 1,
+        summary_call: cx.model.calls(),
+        kept_messages: kept.len(),
+    });
+    let mut messages = cx.initial.clone();
+    messages.push(json!({"role": "user", "content": continuation}));
+    messages.extend(kept);
+    cx.segment = Segment::new(from + 1, messages, cx.trace);
+    cx.budget = ContextBudget::default();
+    for message in cx.segment.messages() {
+        cx.budget.append(message);
     }
-    trace.record("result", &serde_json::to_value(&result)?)?;
-    Ok(result)
-}
-
-async fn interrupted() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! { signal = tokio::signal::ctrl_c() => { signal?; }, _ = terminate.recv() => {} }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
+    cx.tally.compactions += 1;
     Ok(())
 }
 
-async fn execute(
-    config: &Config,
-    authorization: Option<&HeaderValue>,
-    session: &ToolSession,
-    trace: &Trace,
-    result: &mut RunResult,
-) -> Result<()> {
-    let client = ModelClient {
-        config,
-        authorization,
-        http: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(config.deadline_secs))
-            .build()?,
-        definitions: session.definitions(),
-        trace,
-    };
-    let original = initial_messages(&config.user_query)?;
-    let mut messages = original.clone();
-    let mut compact_before_next_turn = false;
-    for _ in 0..config.max_turns {
-        if compact_before_next_turn {
-            let Some(summary) = client.compact(&messages).await? else {
-                result.status = "invalid_response".into();
-                return Ok(());
-            };
-            let content = render(
-                "continuation",
-                include_str!("../assets/continuation.jinja2"),
-                json!({
-                    "summary": summary,
-                    "tool_state": serde_json::to_string(&session.snapshot().await?)?
-                }),
-            )?;
-            messages = original.clone();
-            messages.push(json!({"role":"user", "content":content}));
-            result.compactions += 1;
-            trace.record("compacted_context", &json!(messages))?;
-        }
-        let response = client
-            .sample(&messages, config.max_response_tokens, false)
-            .await?;
-        result.turns += 1;
-        let choice = &response["choices"][0];
-        let message = &choice["message"];
-        let finish = choice["finish_reason"].as_str().unwrap_or_default();
-        if finish == "length" {
-            result.status = "max_tokens".into();
-            result.final_answer = message["content"].as_str().unwrap_or_default().into();
-            return Ok(());
-        }
-        if !valid_message_shape(message)
-            || !matches!(finish, "stop" | "tool_calls")
-            || (finish == "tool_calls" && !has_tools(message))
-        {
-            result.status = "invalid_response".into();
-            return Ok(());
-        }
-        messages.push(message.clone());
-        if !has_tools(message) {
-            result.final_answer = message["content"]
-                .as_str()
-                .or_else(|| message["refusal"].as_str())
-                .unwrap_or_default()
-                .into();
-            result.status = if result.final_answer.trim().is_empty() {
-                "invalid_response"
-            } else {
-                "completed"
-            }
-            .into();
-            return Ok(());
-        }
-        let calls = message["tool_calls"]
-            .as_array()
-            .context("invalid tool_calls")?;
-        let mut new_tool_bytes = 0_u64;
-        let mut seen_ids = HashSet::new();
-        for call in calls {
-            let valid = call["id"]
-                .as_str()
-                .filter(|id| !id.is_empty())
-                .is_some_and(|id| seen_ids.insert(id.to_owned()))
-                && call["type"] == "function"
-                && call["function"]["name"].as_str().is_some()
-                && call["function"]["arguments"].as_str().is_some();
-            if !valid {
-                result.status = "invalid_response".into();
-                return Ok(());
-            }
-        }
-        for call in calls {
-            let id = call["id"].as_str().context("missing call id")?;
-            let name = call["function"]["name"]
-                .as_str()
-                .context("missing tool name")?;
-            let arguments = call["function"]["arguments"]
-                .as_str()
-                .context("missing arguments")?;
-            let output = match serde_json::from_str(arguments) {
-                Ok(arguments) => session.call(name, arguments, id).await,
-                Err(error) => Err(anyhow::anyhow!("invalid tool argument JSON: {error}")),
-            };
-            let content = output.unwrap_or_else(|error| format!("Tool error: {error:#}"));
-            let tool_message = json!({"role":"tool", "tool_call_id":id, "content":content});
-            new_tool_bytes =
-                new_tool_bytes.saturating_add(serde_json::to_vec(&tool_message)?.len() as u64);
-            trace.record("tool_result", &tool_message)?;
-            messages.push(tool_message);
-        }
-        // shortcut: new tool bytes estimate tokens until the endpoint supports prompt counting.
-        let used = response["usage"]["total_tokens"].as_u64();
-        if config.compaction_threshold_tokens > 0 && used.is_none() {
-            bail!("compaction requires usage.total_tokens from the model endpoint");
-        }
-        compact_before_next_turn = config.compaction_threshold_tokens > 0
-            && used.is_some_and(|tokens| {
-                tokens
-                    .saturating_add(new_tool_bytes)
-                    .saturating_add(u64::from(
-                        config.max_response_tokens.max(config.compaction_max_tokens),
-                    ))
-                    >= config.compaction_threshold_tokens
-            });
+fn kept_turns_start(messages: &[Value]) -> usize {
+    let mut assistants = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| message["role"] == "assistant")
+        .map(|(index, _)| index);
+    let last = assistants.next();
+    assistants.next().or(last).unwrap_or(messages.len())
+}
+
+fn summary(sampled: &Sampled) -> Option<String> {
+    let reply = read_reply(&sampled.message).ok()?;
+    if sampled.finish != Finish::Stop || !reply.calls.is_empty() {
+        return None;
     }
-    Ok(())
+    let summary = format_compact_summary(&reply.content?);
+    (!summary.is_empty() && summary != "Summary:").then_some(summary)
+}
+
+struct Reply {
+    content: Option<String>,
+    refusal: Option<String>,
+    calls: Vec<ToolCall>,
+}
+
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Structural checks only. Unknown tool names and unparseable arguments are left to the tool
+/// session, which answers them as tool results the model can correct; ids need only be unique
+/// within this reply.
+fn read_reply(message: &Value) -> Result<Reply, Misbehaviour> {
+    let content = match &message["content"] {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        _ => return Err(Misbehaviour::MalformedMessage),
+    };
+    let calls = match &message["tool_calls"] {
+        Value::Null => &[][..],
+        Value::Array(calls) if calls.len() <= MAX_TOOL_CALLS => calls,
+        _ => return Err(Misbehaviour::MalformedMessage),
+    };
+    let mut ids = HashSet::new();
+    let calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let text = |value: &Value| value.as_str().map(str::to_owned);
+            let (Some(id), true, Some(name), Some(arguments)) = (
+                text(&call["id"]).filter(|id| !id.is_empty()),
+                call["type"] == "function",
+                text(&call["function"]["name"]),
+                text(&call["function"]["arguments"]),
+            ) else {
+                return Err(Misbehaviour::MalformedToolCall { index });
+            };
+            if !ids.insert(id.clone()) {
+                return Err(Misbehaviour::DuplicateCallId { id });
+            }
+            Ok(ToolCall {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Reply {
+        content,
+        refusal: message["refusal"].as_str().map(str::to_owned),
+        calls,
+    })
+}
+
+/// Stand-in for the `tools.rs` boundary from v2/rust-tools: every model-visible result is `Ok`,
+/// `Err` means the tool runtime broke. Delete when that branch lands.
+mod tool_shim {
+    use serde::Serialize;
+    use serde_json::Value;
+
+    use super::ToolCall;
+    use crate::outcome::TaskRef;
+    use crate::tools::ToolSession;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ToolErrorKind {
+        UnknownTool,
+        InvalidArguments,
+        Failed,
+    }
+
+    pub struct ToolOutput {
+        pub content: String,
+        pub error: Option<ToolErrorKind>,
+        pub task_id: Option<String>,
+    }
+
+    pub struct InternalError(pub String);
+
+    pub async fn call(tools: &ToolSession, call: &ToolCall) -> Result<ToolOutput, InternalError> {
+        let failed = |error, text: String| {
+            Ok(ToolOutput {
+                content: format!("Tool error: {text}"),
+                error: Some(error),
+                task_id: None,
+            })
+        };
+        let arguments = match serde_json::from_str(&call.arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return failed(
+                    ToolErrorKind::InvalidArguments,
+                    format!("invalid tool argument JSON: {error}"),
+                );
+            }
+        };
+        match tools.call(&call.name, arguments, &call.id).await {
+            Ok(content) => Ok(ToolOutput {
+                content,
+                error: None,
+                task_id: None,
+            }),
+            Err(error) => {
+                let text = format!("{error:#}");
+                if text.contains("install ripgrep") {
+                    Err(InternalError(text))
+                } else if text == "tool is not permitted" {
+                    failed(ToolErrorKind::UnknownTool, text)
+                } else if text.starts_with(&format!("invalid {} arguments", call.name)) {
+                    failed(ToolErrorKind::InvalidArguments, text)
+                } else {
+                    failed(ToolErrorKind::Failed, text)
+                }
+            }
+        }
+    }
+
+    pub async fn state(tools: &ToolSession) -> Result<Value, InternalError> {
+        tools
+            .snapshot()
+            .await
+            .map_err(|error| InternalError(format!("{error:#}")))
+    }
+
+    pub async fn detach(tools: ToolSession) -> Vec<TaskRef> {
+        tools.shutdown().await;
+        Vec::new()
+    }
+
+    pub async fn kill_all(tools: ToolSession) {
+        tools.shutdown().await;
+    }
 }
 
 #[cfg(test)]
