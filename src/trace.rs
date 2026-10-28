@@ -12,7 +12,6 @@ use crate::runner::ToolErrorKind;
 
 pub const MAX_TRACE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// A request's `messages` are the first `end` messages of segment `segment`.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct MessageRange {
     pub segment: u32,
@@ -97,9 +96,9 @@ struct Line<'a> {
     t_ms: u128,
 }
 
-/// Append-only, one synchronous write per line, so a cancelled future never leaves half a line.
-/// A failed write or the size cap stops tracing and marks it truncated; the attempt goes on,
-/// because the session server, not this file, is the token record.
+/// One synchronous write per line, so a cancelled future never leaves half a line. A failed write
+/// or the size cap marks the trace truncated and the attempt goes on: the session server, not
+/// this file, is the token record.
 pub struct Trace {
     file: Option<File>,
     written: u64,
@@ -156,8 +155,7 @@ impl Trace {
     }
 }
 
-/// One linear history as the session server sees it. Messages are only appended, each is traced
-/// once when it enters, and compaction starts a new segment instead of rewriting this one.
+/// Append-only; compaction opens a new segment instead of rewriting this one.
 pub struct Segment {
     index: u32,
     messages: Vec<Value>,

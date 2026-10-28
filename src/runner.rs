@@ -44,8 +44,8 @@ struct Compaction {
     max_tokens: u64,
 }
 
-/// Runs one attempt from the stdin bytes. `result.json` is written into `session_dir` whenever
-/// this call created it, on every path. `take_key` is called before the first await.
+/// Writes `result.json` on every path into the `session_dir` this call created. `take_key` runs
+/// before the first await.
 pub async fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> RunResult {
     let started = std::time::Instant::now();
     let mut tally = Tally::default();
@@ -270,8 +270,7 @@ async fn execute(cx: &mut Attempt<'_>) -> Outcome {
     }
 }
 
-/// One model turn and its tool calls, run one at a time in the model's order. `Err` ends the
-/// attempt with that outcome.
+/// `Err` carries the outcome that ends the attempt, `Completed` included.
 async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let input = cx.input;
     if cx.tally.turns == input.max_turns {
@@ -377,9 +376,6 @@ async fn turn(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     Ok(())
 }
 
-/// Ends the segment with the summary request and its reply, then opens the next segment with
-/// the original prompt, the continuation (summary, todos, background tasks) and the last two
-/// assistant turns with their tool results.
 async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let Some(compaction) = &cx.input.compaction else {
         return Ok(());
@@ -474,9 +470,8 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// Structural checks only. Unknown tool names and unparseable arguments are left to the tool
-/// session, which answers them as tool results the model can correct; ids need only be unique
-/// within this reply.
+/// Unknown tool names and unparseable arguments are not checked here: the tool session answers
+/// them as tool results the model can correct.
 fn read_reply(message: &Value) -> Result<Reply, Misbehaviour> {
     let content = match &message["content"] {
         Value::Null => None,

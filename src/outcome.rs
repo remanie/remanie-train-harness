@@ -21,10 +21,7 @@ pub enum Outcome {
     MaxTokens,
     ContextOverflow(Overflow),
     InvalidResponse(Misbehaviour),
-    Deadline {
-        /// The session server may have recorded the abandoned generation.
-        request_in_flight: bool,
-    },
+    Deadline { request_in_flight: bool },
     Cancelled,
     Infrastructure(Cause),
 }
@@ -63,8 +60,6 @@ pub enum Cause {
     Config {
         detail: String,
     },
-    /// Every attempt failed before the endpoint processed the request, until the retry budget or
-    /// the deadline ran out.
     EndpointUnavailable {
         attempts: u32,
         status: Option<u16>,
@@ -74,7 +69,7 @@ pub enum Cause {
         status: u16,
         body_excerpt: String,
     },
-    /// The request was sent and no complete response came back; the endpoint may have recorded it.
+    /// Sent without a complete reply; the endpoint may have recorded the generation.
     ConnectionLost {
         detail: String,
     },
@@ -108,7 +103,6 @@ impl Outcome {
     }
 }
 
-/// Summed over every accepted response; `complete` is false once any response lacked `usage`.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
@@ -169,7 +163,6 @@ pub struct TaskRef {
     pub command: String,
 }
 
-/// Everything `result.json` reports besides the outcome, accumulated while the attempt runs.
 #[derive(Debug, Default, Serialize)]
 pub struct Tally {
     pub final_answer: String,

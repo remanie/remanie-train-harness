@@ -34,8 +34,7 @@ pub fn bearer_header(key: &str) -> Result<HeaderValue, &'static str> {
     Ok(header)
 }
 
-/// The job's sampling object, forwarded verbatim. The contract schema refuses the keys the
-/// runner sets itself; `max_tokens` is required because compaction overrides it.
+/// Forwarded verbatim; the contract schema already refused the keys the runner sets.
 #[derive(Debug, Deserialize)]
 #[serde(try_from = "Map<String, Value>")]
 pub struct SamplingParams {
@@ -73,20 +72,18 @@ struct Body<'a> {
     stream: bool,
 }
 
-/// One failed exchange, as the trace records it.
 #[derive(Debug, Serialize)]
 #[serde(tag = "failure", rename_all = "snake_case")]
 pub enum Failure {
-    /// Failed before any byte of the request was sent.
+    /// Nothing was sent.
     Connect { detail: String },
-    /// Sent, then the connection failed before a complete response.
+    /// Sent, then no complete response.
     Lost { detail: String },
     Status {
         status: u16,
         body_excerpt: String,
         retry_after_ms: Option<u64>,
     },
-    /// A 2xx the runner cannot use.
     Response {
         detail: String,
         body_excerpt: String,
@@ -155,7 +152,6 @@ fn names_context_length(body: &str) -> bool {
         .any(|pattern| body.contains(pattern))
 }
 
-/// Full jitter, `uniform(0, min(cap, base * 2^(attempt-1)))`, raised to `Retry-After`, capped.
 fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
     let ceiling = RETRY_BASE
         .saturating_mul(1 << (attempt - 1).min(16))
@@ -180,7 +176,6 @@ pub struct Sampled {
     pub message: Value,
     pub finish: Finish,
     pub usage: Option<Usage>,
-    /// What the endpoint counted for this prompt and reply.
     pub context_tokens: Option<u64>,
 }
 
@@ -250,8 +245,6 @@ impl<'a> ModelClient<'a> {
         self.in_flight
     }
 
-    /// One model call. The body is serialized once and resent byte for byte while the endpoint
-    /// reports it did not process the request, with backoff that never sleeps past the deadline.
     pub async fn sample(
         &mut self,
         request: Request<'_>,
