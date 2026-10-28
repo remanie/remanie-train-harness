@@ -318,7 +318,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         async def execute(**kwargs):
             command = kwargs["command"].replace('"/proc/$pid/stat"', shlex.quote(str(stat_file)))
             process = await asyncio.create_subprocess_exec(
-                "/bin/sh", "-c", command,
+                "bash", "-c", command,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await process.communicate()

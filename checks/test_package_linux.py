@@ -91,7 +91,7 @@ class LauncherTest(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("REMANIE_BUNDLE"), "set REMANIE_BUNDLE to a package_linux.py output")
 class PackagedBundleTest(unittest.TestCase):
     def test_bundle_carries_the_contract_the_adapter_reads(self):
-        root = Path(os.environ["REMANIE_BUNDLE"])
+        root = Path(os.environ["REMANIE_BUNDLE"]).resolve()
         manifest = json.loads((root / "manifest.json").read_text())
         self.assertIn("contract.json", manifest["files"])
         self.assertEqual(Bundle.load(root).architecture, manifest["architecture"])
