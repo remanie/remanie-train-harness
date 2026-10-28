@@ -486,7 +486,6 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     messages.push(continuation);
     messages.extend(kept);
     cx.segment = Segment::new(from + 1, messages, cx.trace);
-    // A kept turn's count covers the old segment's prefix, so it cannot be subtracted from a later summary.
     cx.turn_prompts.clear();
     cx.budget = ContextBudget::default();
     for message in cx.segment.messages() {
