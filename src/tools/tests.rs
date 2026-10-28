@@ -211,66 +211,6 @@ async fn todos_merge_and_reset_per_attempt() {
 #[tokio::test]
 async fn background_wait_kill_and_shutdown() {
     let (dir, tools) = fixture().await;
-    let output = tools.call("run_terminal_cmd", json!({"command":"printf '%s\\n' \"$HOME\" \"$TMPDIR\" \"$PATH\"", "description":"check attempt environment"}), "env").await.unwrap();
-    assert!(output.contains(&dir.path().join("session/home").display().to_string()));
-    assert!(output.contains(&dir.path().join("session/tmp").display().to_string()));
-    assert!(output.contains("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
-    tools.call("run_terminal_cmd", json!({"command":"printf shared-home > ~/shared.txt", "description":"write in the attempt home"}), "write-home").await.unwrap();
-    let home_file = tools
-        .call(
-            "read_file",
-            json!({"target_file":"~/shared.txt"}),
-            "read-home",
-        )
-        .await
-        .unwrap();
-    assert!(home_file.contains("shared-home"));
-    tools.call("run_terminal_cmd", json!({"command":"env | cut -d= -f1 > child-env.txt", "description":"check environment inheritance"}), "env-names").await.unwrap();
-    let mut allowed: BTreeSet<String> = [
-        "PATH",
-        "HOME",
-        "TMPDIR",
-        "LANG",
-        "TERM",
-        "NO_COLOR",
-        "FORCE_COLOR",
-        "GROK_AGENT",
-        "PWD",
-        "OLDPWD",
-        "SHLVL",
-        "_",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    allowed.extend(
-        [
-            "PAGER",
-            "GIT_PAGER",
-            "SYSTEMD_PAGER",
-            "MANPAGER",
-            "AWS_PAGER",
-            "GIT_EDITOR",
-            "GIT_SEQUENCE_EDITOR",
-            "GIT_TERMINAL_PROMPT",
-            "GPG_TTY",
-            "LESS",
-            "GH_PAGER",
-            "PYTHONUNBUFFERED",
-        ]
-        .into_iter()
-        .map(str::to_owned),
-    );
-    let names = tokio::fs::read_to_string(dir.path().join("child-env.txt"))
-        .await
-        .unwrap();
-    for name in names.lines() {
-        assert!(
-            allowed.contains(name),
-            "inherited unexpected environment variable {name}"
-        );
-    }
-
     tools.call("run_terminal_cmd", json!({"command":"sleep 0.1; printf finished", "description":"test background waiting", "block_until_ms":1}), "waited").await.unwrap();
     let tasks = tools.snapshot().await.unwrap();
     let id = tasks["background_tasks"][0]["task_id"]

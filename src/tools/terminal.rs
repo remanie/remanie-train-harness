@@ -18,8 +18,10 @@ const POLL_BYTES: usize = 40_000;
 const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
-const PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-const PAGER_ENV: [(&str, &str); 10] = [
+const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
+    ("TERM", "dumb"),
+    ("NO_COLOR", "1"),
+    ("FORCE_COLOR", "0"),
     ("PAGER", "cat"),
     ("GIT_PAGER", "cat"),
     ("GH_PAGER", "cat"),
@@ -52,11 +54,9 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     pub async fn new(cwd: PathBuf, session_dir: PathBuf) -> Result<Self> {
-        for name in ["home", "tmp", "terminal"] {
-            tokio::fs::create_dir(session_dir.join(name))
-                .await
-                .with_context(|| format!("create attempt {name}"))?;
-        }
+        tokio::fs::create_dir(session_dir.join("terminal"))
+            .await
+            .context("create attempt terminal")?;
         Ok(Self {
             cwd,
             session_dir,
@@ -125,15 +125,7 @@ impl TerminalSession {
         let id = call_id.to_owned();
         let mut cmd = clean_command(Path::new("/bin/bash"), &self.cwd);
         cmd.args(["--noprofile", "--norc", "-c", command])
-            .env("HOME", self.session_dir.join("home"))
-            .env("TMPDIR", self.session_dir.join("tmp"))
-            .env("TERM", "dumb")
-            .env("NO_COLOR", "1")
-            .env("FORCE_COLOR", "0")
-            .envs(PAGER_ENV);
-        if block == 0 {
-            cmd.env("PYTHONUNBUFFERED", "1");
-        }
+            .envs(NON_INTERACTIVE_ENV);
         let task = {
             let mut state = lock(&self.state);
             ensure!(!state.closed, "tool session has ended");
@@ -503,9 +495,6 @@ fn clean_command(program: &Path, cwd: &Path) -> Command {
     let mut command = Command::new(program);
     command
         .current_dir(cwd)
-        .env_clear()
-        .env("PATH", PATH)
-        .env("LANG", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

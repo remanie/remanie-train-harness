@@ -50,7 +50,7 @@ impl ToolSession {
             .collect::<Result<_>>()?;
         Ok(Self {
             terminal: TerminalSession::new(cwd.clone(), session_dir.clone()).await?,
-            files: FileTools::new(cwd, session_dir.join("home")),
+            files: FileTools::new(cwd, std::env::var_os("HOME").map(PathBuf::from)),
             closed: AtomicBool::new(false),
             catalog,
             validators,

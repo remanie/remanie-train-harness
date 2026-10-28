@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn edits_preserve_literal_whitespace_and_quote_paths() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     for name in [" a.txt", "a.txt ", "'a.txt'", "a.txt"] {
         tokio::fs::write(dir.path().join(name), "before")
             .await
@@ -38,14 +38,14 @@ async fn edits_preserve_literal_whitespace_and_quote_paths() {
 }
 
 #[tokio::test]
-async fn tilde_paths_use_the_terminal_private_home() {
+async fn tilde_paths_use_home() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("private-home");
     tokio::fs::create_dir(&home).await.unwrap();
     tokio::fs::write(home.join("file.txt"), "before")
         .await
         .unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), home.clone());
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(home.clone()));
     assert_eq!(
         tools
             .call("read_file", &json!({"target_file":"~/file.txt"}))
@@ -73,12 +73,18 @@ async fn tilde_paths_use_the_terminal_private_home() {
             .unwrap()
             .contains("file.txt")
     );
+    let homeless = FileTools::new(dir.path().to_path_buf(), None);
+    let error = homeless
+        .call("read_file", &json!({"target_file":"~/file.txt"}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("HOME is not set"), "{error}");
 }
 
 #[tokio::test]
 async fn read_windows_keep_unicode_crlf_anchors_and_trailing_lines() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("AGENTS.md");
     tokio::fs::write(&path, "α\r\nβ\r\nγ\r\n").await.unwrap();
     assert_eq!(
@@ -142,7 +148,7 @@ async fn read_windows_keep_unicode_crlf_anchors_and_trailing_lines() {
 #[tokio::test]
 async fn reads_bound_the_returned_window_and_reject_non_text() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     tokio::fs::write(
         dir.path().join("large.txt"),
         format!("{}\nsmall\n", "x".repeat(READ_MAX_BYTES + 1)),
@@ -222,7 +228,7 @@ async fn reads_bound_the_returned_window_and_reject_non_text() {
 #[tokio::test]
 async fn edits_enforce_creation_unique_matches_and_preserve_exact_unicode_and_crlf() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("nested/file.txt");
     tools.call("search_replace", &json!({"file_path":"nested/file.txt","old_string":"","new_string":"café\r\n猫\r\ncafé\r\n"})).await.unwrap();
     assert!(
@@ -305,7 +311,7 @@ async fn edits_enforce_creation_unique_matches_and_preserve_exact_unicode_and_cr
 #[tokio::test]
 async fn edits_accept_crlf_or_read_text_and_preserve_untouched_line_endings() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("mixed.txt");
     tokio::fs::write(&path, "α\r\none\ntwo\r\n猫\r\nend\n")
         .await
@@ -342,7 +348,7 @@ async fn edits_accept_crlf_or_read_text_and_preserve_untouched_line_endings() {
 #[tokio::test]
 async fn edits_prefer_exact_newlines_before_normalizing_read_text() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("mixed.txt");
     tokio::fs::write(&path, "one\r\ntwo\r\none\ntwo\n")
         .await
@@ -385,7 +391,7 @@ async fn edits_prefer_exact_newlines_before_normalizing_read_text() {
 #[tokio::test]
 async fn literal_edits_preserve_replacement_bytes_at_crlf_boundaries() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("file.txt");
     for (needle, expected) in [("\n", "a\r\nX\nb"), ("\r\n", "a\nX\nb")] {
         tokio::fs::write(&path, "a\r\nb").await.unwrap();
@@ -403,7 +409,7 @@ async fn literal_edits_preserve_replacement_bytes_at_crlf_boundaries() {
 #[tokio::test]
 async fn oversized_replacements_fail_before_expanding_or_changing_the_file() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("expanded.txt");
     let original = "x".repeat(1_000);
     tokio::fs::write(&path, &original).await.unwrap();
@@ -446,7 +452,7 @@ fn in_place_writes_refuse_concurrent_changes_and_never_clobber() {
 async fn edits_keep_inode_owner_and_mode_and_new_files_follow_the_umask() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("linked.txt");
     std::fs::write(&path, "v1").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -497,7 +503,7 @@ async fn cancelling_edits_leaves_an_original_or_complete_file() {
     let replacement = "after\n".repeat(100_000);
     let tools = std::sync::Arc::new(FileTools::new(
         dir.path().to_path_buf(),
-        dir.path().join("home"),
+        Some(dir.path().join("home")),
     ));
     for delay in [0, 1, 5] {
         tokio::fs::write(&path, &original).await.unwrap();
@@ -518,7 +524,7 @@ async fn cancelling_edits_leaves_an_original_or_complete_file() {
 async fn unicode_filename_fallback_is_unique_and_symlink_edits_keep_the_link() {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let actual = dir.path().join("screen\u{202f}shot.txt");
     tokio::fs::write(&actual, "before").await.unwrap();
     assert!(
@@ -570,7 +576,7 @@ async fn special_files_fail_promptly_instead_of_waiting_for_a_writer() {
     let path = dir.path().join("pipe");
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     for (name, args) in [
         ("read_file", json!({"target_file":"pipe"})),
         (
@@ -590,7 +596,7 @@ async fn special_files_fail_promptly_instead_of_waiting_for_a_writer() {
 #[tokio::test]
 async fn todos_preserve_insertion_order_partial_updates_and_duplicate_atomicity() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     tools.call("todo_write", &json!({"todos":[{"id":"b","content":"second"},{"id":"a","content":"first"}],"merge":false})).await.unwrap();
     let output = tools
         .call(
@@ -628,7 +634,7 @@ async fn todos_preserve_insertion_order_partial_updates_and_duplicate_atomicity(
 #[tokio::test]
 async fn grep_honors_paths_filters_regex_flags_and_output_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     tokio::fs::create_dir(dir.path().join(".git"))
         .await
         .unwrap();
@@ -725,7 +731,7 @@ async fn grep_honors_paths_filters_regex_flags_and_output_limit() {
 #[tokio::test]
 async fn pdf_image_mode_errors_and_page_ranges_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     tokio::fs::write(dir.path().join("document.pdf"), b"%PDF-1.4\n")
         .await
         .unwrap();
@@ -769,7 +775,7 @@ async fn pdf_text_and_selected_pages_when_poppler_is_installed() {
             return;
         }
     }
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     tokio::fs::write(
         dir.path().join("pages.pdf"),
         test_pdf(&["First page text", "Second page text"]),
@@ -856,7 +862,7 @@ fn test_pdf(texts: &[&str]) -> Vec<u8> {
 #[tokio::test]
 async fn overlapping_matches_are_ambiguous_unless_replace_all() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let path = dir.path().join("closing.rb");
     tokio::fs::write(&path, "end\nend\nend\n").await.unwrap();
     let edit = json!({"file_path":"closing.rb","old_string":"end\nend","new_string":"done"});
@@ -881,7 +887,7 @@ async fn overlapping_matches_are_ambiguous_unless_replace_all() {
 #[tokio::test]
 async fn a_full_window_says_where_the_file_continues() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let tools = FileTools::new(dir.path().to_path_buf(), Some(dir.path().join("home")));
     let text = (1..=1500)
         .map(|n| format!("line {n}\n"))
         .collect::<String>();

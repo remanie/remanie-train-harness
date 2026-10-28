@@ -220,29 +220,35 @@ async fn foreground_comments_and_arithmetic_run_without_background_errors() {
 }
 
 #[tokio::test]
-async fn bounded_logs_safe_names_and_clean_environment() {
-    let (dir, terminal) = fixture().await;
+async fn commands_inherit_the_runner_environment() {
+    let (_dir, terminal) = fixture().await;
     let output = terminal
         .call(
             "run_terminal_cmd",
             &args(
-                "env | cut -d= -f1; printf '%s\\n' \"$HOME\" \"$TMPDIR\" \"$PATH\"",
+                "printf '%s|%s|%s|%s|%s' \"$HOME\" \"$PATH\" \"$CARGO_PKG_NAME\" \"$TERM\" \"$GIT_PAGER\"",
                 1000,
             ),
-            "../../escape",
+            "env",
         )
         .await
         .unwrap();
-    for name in [
-        "OPENROUTER_API_KEY",
-        "AWS_ACCESS_KEY_ID",
-        "BASH_ENV",
-        "SHELL",
-    ] {
-        assert!(!output.contains(name));
-    }
-    assert!(output.contains(&dir.path().join("session/home").display().to_string()));
-    assert!(output.contains(PATH));
+    let expected = format!(
+        "{}|{}|remanie-train-harness|dumb|cat",
+        std::env::var("HOME").unwrap(),
+        std::env::var("PATH").unwrap()
+    );
+    assert!(output.contains(&expected), "{output}");
+    terminal.shutdown().await;
+}
+
+#[tokio::test]
+async fn bounded_logs_and_safe_names() {
+    let (dir, terminal) = fixture().await;
+    terminal
+        .call("run_terminal_cmd", &args("true", 1000), "../../escape")
+        .await
+        .unwrap();
     assert!(!dir.path().join("escape.log").exists());
     let output = terminal
         .call(

@@ -19,12 +19,12 @@ const MAX_LINES: usize = 1_000;
 
 pub(super) struct FileTools {
     cwd: PathBuf,
-    home: PathBuf,
+    home: Option<PathBuf>,
     todos: Mutex<IndexMap<String, Value>>,
 }
 
 impl FileTools {
-    pub(super) fn new(cwd: PathBuf, home: PathBuf) -> Self {
+    pub(super) fn new(cwd: PathBuf, home: Option<PathBuf>) -> Self {
         Self {
             cwd,
             home,
@@ -42,7 +42,7 @@ impl FileTools {
                         args["target_directory"]
                             .as_str()
                             .context("missing target_directory")?,
-                    ),
+                    )?,
                 )
                 .await
             }
@@ -56,18 +56,22 @@ impl FileTools {
         json!({"todos": *self.todos.lock().await})
     }
 
-    fn path(&self, input: &str) -> PathBuf {
-        if input == "~" {
-            return self.home.clone();
+    fn path(&self, input: &str) -> Result<PathBuf> {
+        if input != "~" && !input.starts_with("~/") {
+            return Ok(self.cwd.join(input));
         }
-        if let Some(relative) = input.strip_prefix("~/") {
-            return self.home.join(relative.trim_start_matches('/'));
-        }
-        self.cwd.join(input)
+        let home = self
+            .home
+            .clone()
+            .context("HOME is not set, so ~ cannot be expanded")?;
+        Ok(match input.strip_prefix("~/") {
+            Some(relative) => home.join(relative.trim_start_matches('/')),
+            None => home,
+        })
     }
 
     async fn read(&self, input: ReadInput) -> Result<String> {
-        let path = resolve_file(self.path(&input.target_file)).await;
+        let path = resolve_file(self.path(&input.target_file)?).await;
         let file = tokio::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -199,7 +203,7 @@ impl FileTools {
                 );
             }
         }
-        let path = resolve_file(self.path(&input.file_path)).await;
+        let path = resolve_file(self.path(&input.file_path)?).await;
         let mut existing = None;
         let old = match tokio::fs::OpenOptions::new()
             .read(true)
@@ -332,7 +336,7 @@ impl FileTools {
     }
 
     async fn grep(&self, input: GrepInput) -> Result<String> {
-        let root = self.path(input.path.as_deref().unwrap_or(""));
+        let root = self.path(input.path.as_deref().unwrap_or(""))?;
         let mut args: Vec<String> = [
             "--heading",
             "--with-filename",
