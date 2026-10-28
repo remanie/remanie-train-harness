@@ -1,6 +1,6 @@
 {
   "run_terminal_cmd": {
-    "description": "Run a bash command and return its output.\n\nOutput over 20000 bytes is shortened to its start and end, a command ending in an unwaited & needs block_until_ms=0, and background commands keep running after your final answer.",
+    "description": "Run a bash command and return its output.\n\nOutput over 20000 bytes is shortened to its start and end. To run a command in the background, pass block_until_ms=0 instead of using &. Background commands keep running after your final answer.",
     "parameters": {
       "type": "object",
       "properties": {

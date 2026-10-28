@@ -141,6 +141,35 @@ async fn foreground_comments_and_arithmetic_run_without_background_errors() {
 }
 
 #[tokio::test]
+async fn background_commands_use_block_until_ms_zero_and_never_an_ampersand() {
+    let (dir, terminal) = fixture().await;
+    for block in [0, 1000] {
+        let error = terminal.run(&args("sleep 30 &", block)).await.unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "To run a command in the background, pass block_until_ms=0 instead of using &."
+            ),
+            "{error}"
+        );
+    }
+    let (started, id) = run(&terminal, "printf '%s' $$ > server.pid; exec sleep 30", 0).await;
+    assert!(started.contains("<status>running</status>"));
+    let pid = read_pid(&dir.path().join("server.pid")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the background command died"
+    );
+    assert!(
+        output(&terminal, &[id], 0)
+            .await
+            .contains("Status: running")
+    );
+    terminal.kill_all().await;
+}
+
+#[tokio::test]
 async fn commands_inherit_the_runner_environment() {
     let (_dir, terminal) = fixture().await;
     let (output, _) = run(
@@ -375,7 +404,7 @@ fn kill_all_reaches_descendants_that_left_the_session() {
         .await;
         run(
             &terminal,
-            "(setsid sh -c 'printf %s $$ > forked.pid; exec sleep 913' &); sleep 0.2",
+            "sh -c \"(setsid sh -c 'printf %s \\$\\$ > forked.pid; exec sleep 913' &)\"; sleep 0.2",
             0,
         )
         .await;

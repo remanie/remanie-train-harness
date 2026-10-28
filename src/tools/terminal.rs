@@ -133,8 +133,8 @@ impl TerminalSession {
         let block = args["block_until_ms"].as_u64().unwrap_or(30_000);
         ensure!(block <= 300_000, "block_until_ms exceeds 300000");
         ensure!(
-            block == 0 || !unwaited_background(command),
-            "Do not use an unwaited background '&'; use block_until_ms=0 instead."
+            !unwaited_background(command),
+            "To run a command in the background, pass block_until_ms=0 instead of using &."
         );
         let id = {
             let mut state = lock(&self.state);
