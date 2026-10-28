@@ -319,3 +319,79 @@ async fn background_wait_kill_detach_and_kill_all() {
     assert_eq!(unsafe { libc::kill(left[0].pid, 0) }, 0);
     unsafe { libc::kill(left[0].pid, libc::SIGKILL) };
 }
+
+#[tokio::test]
+async fn the_trained_schema_keeps_its_tool_and_parameter_names() {
+    let (dir, tools) = fixture().await;
+    let names = tools
+        .definitions()
+        .iter()
+        .map(|definition| {
+            let function = &definition["function"];
+            let parameters = function["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            (function["name"].as_str().unwrap().to_owned(), parameters)
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        (
+            "run_terminal_cmd",
+            &["command", "description", "block_until_ms"][..],
+        ),
+        ("get_terminal_command_output", &["task_ids", "timeout_ms"]),
+        ("kill_terminal_command", &["task_id"]),
+        (
+            "read_file",
+            &["target_file", "offset", "limit", "pages", "format"],
+        ),
+        (
+            "search_replace",
+            &["file_path", "old_string", "new_string", "replace_all"],
+        ),
+        ("list_dir", &["target_directory"]),
+        (
+            "grep",
+            &[
+                "pattern",
+                "path",
+                "glob",
+                "-B",
+                "-A",
+                "-C",
+                "-i",
+                "type",
+                "head_limit",
+                "multiline",
+            ],
+        ),
+        ("todo_write", &["todos", "merge"]),
+    ]
+    .map(|(name, parameters)| {
+        let mut parameters = parameters.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        parameters.sort();
+        (name.to_owned(), parameters)
+    });
+    assert_eq!(names, expected);
+    tokio::fs::write(dir.path().join("notes.txt"), "text\n")
+        .await
+        .unwrap();
+    let image = call(
+        &tools,
+        "read_file",
+        json!({"target_file":"notes.txt", "format":"image"}),
+    )
+    .await;
+    assert_eq!(image.error, Some(ToolErrorKind::InvalidArguments));
+    let text = call(
+        &tools,
+        "read_file",
+        json!({"target_file":"notes.txt", "format":"text"}),
+    )
+    .await;
+    assert_eq!(text.content, "1→text\n");
+    tools.kill_all().await;
+}
