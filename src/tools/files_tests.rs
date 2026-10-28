@@ -167,7 +167,7 @@ async fn reads_bound_the_returned_window_and_reject_non_text() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("25000 tokens")
+            .contains("100000 bytes")
     );
     assert_eq!(
         tools
