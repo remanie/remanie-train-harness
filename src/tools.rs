@@ -2,13 +2,15 @@ mod files;
 mod list_dir;
 mod terminal;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 use files::FileTools;
 use terminal::TerminalSession;
@@ -23,6 +25,13 @@ const TOOL_NAMES: [&str; 8] = [
     "list_dir",
     "grep",
     "todo_write",
+];
+
+const READ_ONLY: [&str; 4] = [
+    "get_terminal_command_output",
+    "read_file",
+    "list_dir",
+    "grep",
 ];
 
 pub struct ToolSession {
@@ -183,6 +192,39 @@ impl ToolSession {
                 )),
             },
         }
+    }
+
+    /// Grok Build's per-path locks for one reply's calls: a path a writing call targets gets a
+    /// lock, and every call on that path takes it.
+    pub fn path_locks<'c>(
+        &self,
+        calls: impl IntoIterator<Item = (&'c str, &'c str)>,
+    ) -> Vec<Option<Arc<Mutex<()>>>> {
+        let keyed: Vec<_> = calls
+            .into_iter()
+            .map(|(name, arguments)| {
+                let path = serde_json::from_str::<Value>(arguments)
+                    .ok()
+                    .and_then(|args| {
+                        ["file_path", "path", "target_file"]
+                            .into_iter()
+                            .find_map(|key| args[key].as_str().map(str::to_owned))
+                    })
+                    .and_then(|path| self.files.path(&path).ok())
+                    .map(|path| files::lock_key(&path));
+                (READ_ONLY.contains(&name), path)
+            })
+            .collect();
+        let mut locks = HashMap::new();
+        for (_, path) in keyed.iter().filter(|(read_only, _)| !read_only) {
+            if let Some(path) = path {
+                locks.entry(path.clone()).or_insert_with(Arc::default);
+            }
+        }
+        keyed
+            .into_iter()
+            .map(|(_, path)| locks.get(&path?).cloned())
+            .collect()
     }
 
     pub async fn state(&self) -> Value {

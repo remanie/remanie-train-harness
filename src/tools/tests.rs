@@ -416,3 +416,32 @@ async fn the_trained_schema_keeps_its_tool_and_parameter_names() {
     }
     tools.kill_all().await;
 }
+
+#[tokio::test]
+async fn writes_to_one_file_share_a_lock_under_any_alias() {
+    let (dir, tools) = fixture().await;
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let edit =
+        |path: &str| json!({"file_path": path, "old_string": "", "new_string": "x"}).to_string();
+    let read = |path: &str| json!({"target_file": path}).to_string();
+    let (a, b, c, d) = (
+        edit("new.txt"),
+        edit("./sub/../new.txt"),
+        read("new.txt"),
+        read("other.txt"),
+    );
+    let e = edit(&dir.path().join("sub/inner.txt").display().to_string());
+    let locks = tools.path_locks([
+        ("search_replace", a.as_str()),
+        ("search_replace", b.as_str()),
+        ("read_file", c.as_str()),
+        ("read_file", d.as_str()),
+        ("search_replace", e.as_str()),
+        ("list_dir", r#"{"target_directory": "."}"#),
+    ]);
+    let lock = |index: usize| locks[index].as_ref().unwrap();
+    assert!(Arc::ptr_eq(lock(0), lock(1)) && Arc::ptr_eq(lock(0), lock(2)));
+    assert!(locks[3].is_none() && locks[5].is_none());
+    assert!(!Arc::ptr_eq(lock(0), lock(4)));
+    tools.kill_all().await;
+}

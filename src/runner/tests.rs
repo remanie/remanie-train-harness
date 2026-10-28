@@ -526,22 +526,27 @@ async fn tool_contract_errors_return_to_the_model_without_side_effects() {
 }
 
 #[tokio::test]
-async fn tool_calls_run_one_at_a_time_in_the_model_order() {
+async fn tool_results_arrive_in_completion_order_and_one_file_is_edited_in_turn() {
     let calls = vec![
         call(
-            "write",
+            "slow",
+            "run_terminal_cmd",
+            json!({"command": "sleep 0.5; printf slow", "description": "slow", "block_until_ms": 10000}),
+        ),
+        call(
+            "create",
             "search_replace",
             json!({"file_path": "order.txt", "old_string": "", "new_string": "first\n"}),
         ),
-        call("read-1", "read_file", json!({"target_file": "order.txt"})),
         call(
-            "append",
-            "run_terminal_cmd",
-            json!({"command": "sleep 0.3; echo second >> order.txt", "description": "append", "block_until_ms": 10000}),
+            "edit",
+            "search_replace",
+            json!({"file_path": "./sub/../order.txt", "old_string": "first", "new_string": "second"}),
         ),
-        call("read-2", "read_file", json!({"target_file": "order.txt"})),
+        call("read", "read_file", json!({"target_file": "order.txt"})),
     ];
     let f = fixture(vec![tool_reply(calls, 10), final_reply()]).await;
+    std::fs::create_dir(f.workspace().join("sub")).unwrap();
     assert_eq!(f.run().await["outcome"], "completed");
     let requests = f.requests().await;
     let tools: Vec<_> = requests[1]["messages"]
@@ -554,10 +559,20 @@ async fn tool_calls_run_one_at_a_time_in_the_model_order() {
         .iter()
         .map(|message| message["tool_call_id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["write", "read-1", "append", "read-2"]);
-    let content = |index: usize| tools[index]["content"].as_str().unwrap();
-    assert!(content(1).contains("first") && !content(1).contains("second"));
-    assert!(content(3).contains("second"));
+    assert_eq!(ids, ["create", "edit", "read", "slow"]);
+    assert!(tools.iter().all(|message| {
+        !message["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Tool error")
+    }));
+    assert_eq!(tools[2]["content"], "1→second\n");
+    let traced: Vec<_> = f
+        .events("tool_call")
+        .iter()
+        .map(|event| event["call_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(traced, ids);
 }
 
 #[tokio::test]

@@ -4,6 +4,8 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -384,19 +386,34 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
         cx.tally.final_answer = answer;
         return ControlFlow::Break(Outcome::Completed);
     }
-    for call in &reply.calls {
-        let started = Instant::now();
-        let output = proceed(
-            cx.tools
-                .call(&call.name, &call.arguments)
-                .await
-                .map_err(|error| {
-                    Outcome::Infrastructure(Cause::ToolRuntime {
-                        tool: call.name.clone(),
-                        detail: error.0,
-                    })
-                }),
-        )?;
+    let tools = cx.tools;
+    let locks = tools.path_locks(
+        reply
+            .calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.arguments.as_str())),
+    );
+    let mut running: FuturesUnordered<_> = reply
+        .calls
+        .iter()
+        .zip(locks)
+        .map(|(call, lock)| async move {
+            let started = Instant::now();
+            let _guard = match &lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let output = tools.call(&call.name, &call.arguments).await;
+            (call, output, started.elapsed())
+        })
+        .collect();
+    while let Some((call, output, latency)) = running.next().await {
+        let output = proceed(output.map_err(|error| {
+            Outcome::Infrastructure(Cause::ToolRuntime {
+                tool: call.name.clone(),
+                detail: error.0,
+            })
+        }))?;
         cx.tally.tool_calls.count(output.error);
         let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
         cx.budget.append(&message);
@@ -406,7 +423,7 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
             name: &call.name,
             class: output.error,
             task_id: output.task_id,
-            latency_ms: started.elapsed().as_millis() as u64,
+            latency_ms: latency.as_millis() as u64,
         });
     }
     let estimate = cx.budget.estimate();

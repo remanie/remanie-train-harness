@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 ignore = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 jsonschema = { version = "0.30", default-features = false }

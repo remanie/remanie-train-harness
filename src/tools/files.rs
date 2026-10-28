@@ -63,7 +63,7 @@ impl FileTools {
             .collect()
     }
 
-    fn path(&self, input: &str) -> Result<PathBuf> {
+    pub(super) fn path(&self, input: &str) -> Result<PathBuf> {
         if input != "~" && !input.starts_with("~/") {
             return Ok(self.cwd.join(input));
         }
@@ -625,6 +625,36 @@ struct TodoUpdate {
     id: String,
     content: Option<String>,
     status: Option<String>,
+}
+
+// Grok Build's lock key: `.` and `..` resolved lexically, then the longest existing ancestor
+// canonicalized, so aliases of one file, created or not, share a key.
+pub(super) fn lock_key(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component),
+        }
+    }
+    let mut ancestor = normalized.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            canonical.extend(suffix.iter().rev());
+            return canonical;
+        }
+        match (ancestor.file_name(), ancestor.parent()) {
+            (Some(name), Some(parent)) => {
+                suffix.push(name);
+                ancestor = parent;
+            }
+            _ => return normalized,
+        }
+    }
 }
 
 async fn resolve_file(path: PathBuf) -> PathBuf {
