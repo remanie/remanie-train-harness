@@ -1,26 +1,16 @@
 // Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
 pub fn format_compact_summary(summary: &str) -> String {
-    let mut result = summary.to_string();
+    let mut result = summary.trim().to_string();
 
-    // Strip only leading scratchpad blocks; quoted tags inside real sections are task evidence.
-    while let Some(start) = result.find("<analysis>") {
-        let is_leading = match result.find("<summary>") {
-            Some(sp) => start < sp || result[sp + "<summary>".len()..start].trim().is_empty(),
-            None => result[..start].trim().is_empty(),
-        };
-        if !is_leading {
-            break;
-        }
-        match result[start..].find("</analysis>") {
-            Some(rel) => {
-                let end = start + rel + "</analysis>".len();
-                result = format!("{}{}", &result[..start], &result[end..]);
+    while result.starts_with("<analysis>") {
+        match result.find("</analysis>") {
+            Some(end) => {
+                result = result[end + "</analysis>".len()..].trim_start().to_string();
             }
             None => {
-                let drop_to = result[start..]
+                result = result
                     .find("<summary>")
-                    .map_or(result.len(), |rel| start + rel);
-                result = format!("{}{}", &result[..start], &result[drop_to..]);
+                    .map_or_else(String::new, |start| result[start..].to_string());
                 break;
             }
         }
@@ -32,11 +22,10 @@ pub fn format_compact_summary(summary: &str) -> String {
     {
         let before = result[..start].to_string();
         let after = result[end + "</summary>".len()..].to_string();
-        let inner = strip_leading_scratchpad(result[start + "<summary>".len()..end].trim());
+        let inner = result[start + "<summary>".len()..end].trim();
         result = format!("{before}Summary:\n{inner}{after}");
     }
 
-    // Escaped control tags cannot become a new summary instruction on the next turn.
     result = neutralize_compaction_control_tokens(&result);
 
     while result.contains("\n\n\n") {
@@ -44,14 +33,6 @@ pub fn format_compact_summary(summary: &str) -> String {
     }
 
     result.trim().to_string()
-}
-
-fn strip_leading_scratchpad(inner: &str) -> String {
-    let mut s = inner.trim();
-    if let Some(rest) = s.strip_prefix("<summary>") {
-        s = rest.trim_start();
-    }
-    s.to_string()
 }
 
 fn neutralize_compaction_control_tokens(text: &str) -> String {
@@ -94,6 +75,21 @@ mod tests {
             assert!(result.contains(text), "lost {text}: {result}");
         }
         assert!(!result.contains("<analysis>"));
+    }
+
+    #[test]
+    fn leading_literal_tags_inside_summary_preserve_task_evidence() {
+        for body in [
+            "<analysis> is the parser delimiter to keep. Tests pass.",
+            "<analysis>literal parser input</analysis>\nRemember failing case A.",
+            "<summary> is the literal opening marker. Tests pass.",
+        ] {
+            let result = format_compact_summary(&format!("<summary>\n{body}\n</summary>"));
+            assert_eq!(
+                result,
+                format!("Summary:\n{}", neutralize_compaction_control_tokens(body))
+            );
+        }
     }
 
     #[test]

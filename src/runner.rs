@@ -375,7 +375,7 @@ async fn execute(
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(config.deadline_secs))
             .build()?,
-        definitions: session.definitions().await?,
+        definitions: session.definitions(),
         trace,
     };
     let original = initial_messages(&config.user_query)?;
@@ -384,7 +384,6 @@ async fn execute(
     let mut compact_before_next_turn = false;
     for _ in 0..config.max_turns {
         if compact_before_next_turn {
-            session.definitions().await?;
             let Some(summary) = client.compact(&messages).await? else {
                 result.status = "invalid_response".into();
                 return Ok(());
@@ -402,7 +401,6 @@ async fn execute(
             result.compactions += 1;
             trace.record("compacted_context", &json!(messages))?;
         }
-        session.definitions().await?;
         let response = client
             .sample(&messages, config.max_response_tokens, false)
             .await?;
@@ -422,7 +420,6 @@ async fn execute(
             result.status = "invalid_response".into();
             return Ok(());
         }
-        // Provider reasoning fields and argument spelling must survive conversation replay.
         messages.push(message.clone());
         if !has_tools(message) {
             result.final_answer = message["content"]

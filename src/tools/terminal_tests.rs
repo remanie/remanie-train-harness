@@ -177,6 +177,49 @@ async fn foreground_background_wait_all_and_kill() {
 }
 
 #[tokio::test]
+async fn task_ids_stay_unique_across_foreground_and_background_calls() {
+    let (_dir, terminal) = fixture().await;
+    let background = terminal
+        .call("run_terminal_cmd", &args("sleep 60", 0), "background")
+        .await
+        .unwrap();
+    assert!(background.contains("<task-id>background</task-id>"));
+    let foreground = terminal
+        .call(
+            "run_terminal_cmd",
+            &args("printf collision-ok", 1000),
+            "terminal-1",
+        )
+        .await
+        .unwrap();
+    assert!(foreground.contains("Exit code: 0") && foreground.contains("collision-ok"));
+    terminal.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreground_comments_and_arithmetic_run_without_background_errors() {
+    let (_dir, terminal) = fixture().await;
+    for (id, command) in [
+        ("comment", "printf comment-ok # R&D"),
+        (
+            "arithmetic",
+            "((mask = 3 & (5 & 1))); printf 'arithmetic-%s' \"$mask\"",
+        ),
+        ("expansion", "printf 'expansion-%s' $((3 & (5 & 1)))"),
+        ("wait", "sleep 0.01 & wait # R&D"),
+        ("builtin-wait", "sleep 0.01 & builtin wait"),
+        ("command-wait", "sleep 0.01 & command wait"),
+    ] {
+        let output = terminal
+            .call("run_terminal_cmd", &args(command, 1000), id)
+            .await
+            .unwrap();
+        assert!(output.contains("Exit code: 0"), "{command}: {output}");
+    }
+    terminal.shutdown().await;
+}
+
+#[tokio::test]
 async fn bounded_logs_safe_names_and_clean_environment() {
     let (dir, terminal) = fixture().await;
     let output = terminal
@@ -389,6 +432,19 @@ fn background_guard_handles_shell_syntax() {
         "sleep 1 &",
         "sleep 1 & echo started",
         "cat <<EOF &\nhello\nEOF",
+        "sleep 1 & # started",
+        "sleep 1 &\n# wait",
+        "printf x#literal &",
+        "printf \\ #literal &",
+        "printf ''#literal &",
+        "((mask = 3 & 1)); sleep 1 &",
+        "printf '%s' $((3 & 1)) &",
+        "printf x$((3 & 1))#literal &",
+        "sleep 1 & echo wait",
+        "sleep 1 & false && wait",
+        "sleep 1 & cat <<wait\nbody\nwait",
+        "sleep 1 & builtinwait",
+        "sleep 1 & commandwait",
     ] {
         assert!(unwaited_background(command), "accepted {command}");
     }
@@ -403,6 +459,18 @@ fn background_guard_handles_shell_syntax() {
         "cat <<'EOF'\nfoo & bar\nEOF",
         "cat <<- EOF\n\tfoo & bar\n\tEOF",
         "cat <<< 'foo & bar'",
+        "printf comment-ok # R&D",
+        "# &\nprintf comment-ok",
+        "((mask = 3 & (5 & 1))); printf '%s' \"$mask\"",
+        "printf '%s' $((3 & (5 & 1)))",
+        "sleep 0.01 & wait # R&D",
+        "sleep 0.01 & # started\nwait # done &",
+        "sleep 0.01 & true; wait",
+        "sleep 0.01 & builtin wait",
+        "sleep 0.01 & command wait",
+        "sleep 0.01 & builtin\t wait # completed",
+        "sleep 0.01 & command   wait",
+        "sleep 0.01 & cat <<wait\nbody & text\nwait\nwait",
     ] {
         assert!(!unwaited_background(command), "rejected {command}");
     }

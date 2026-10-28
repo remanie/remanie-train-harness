@@ -1,5 +1,3 @@
-"""Per-attempt local Docker relay; upstream credentials stay on the host."""
-
 import asyncio
 import json
 import secrets

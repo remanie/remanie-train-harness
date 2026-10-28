@@ -1,0 +1,151 @@
+What this change does: It fixes the issues found after extracting the standalone
+runner. It also removes unused runtime wrappers and comments that repeat code.
+
+What this repo does: It lets a model use eight coding tools, summarizes long
+conversations, and records execution traces. Harbor runs and grades each task.
+The expected load is one sequential model loop per disposable task environment,
+with managed background commands. A separate training backend must join these traces to trusted
+rewards and update the model.
+
+Scope and method
+
+Three GPT 6.1 Sol agents at extra-high effort reviewed the retained runtime,
+file tools, compaction, Harbor adapter and proxy. The parent reviewed callers,
+packaging, dependencies, comments and documentation. The agents reproduced
+findings before changing code, then cross-reviewed one another's fixes.
+The second pass caught another newline boundary case and two shell-guard cases;
+those fixes are included. The starting revision was aebea065.
+
+The review covered the standalone source, tests, build configuration, runtime
+packaging and integration fixture. It did not re-audit deleted production code
+or independently audit every third-party dependency.
+
+Must fix, now fixed
+
+1. A crashed runner could leave commands active during grading.
+   Location: harbor/remanie_agent.py, RemanieAgent.run and _stop_runtime.
+   What this is: Harbor stops the runner before it invokes the verifier.
+   Problem: A missing runner PID counted as successful cleanup. A tool could
+   kill the runner and keep running in its separate process group. Harbor's
+   handling of NonZeroAgentExitCodeError then allowed grading to continue.
+   Fix: Preserve the host execution task through cancellation and require its
+   confirmed zero exit. A crash or unconfirmed exit raises RuntimeError, which
+   skips verification and requires container teardown. A disappearing /proc
+   entry is handled as an absent process; the host must still confirm exit zero.
+   If skipped: A surviving command can change files during shared verification.
+
+2. A path could silently name the wrong file.
+   Location: src/tools/files.rs, FileTools::path.
+   What this is: File tools resolve the path supplied by the model.
+   Problem: Trimming spaces changed " a.txt" into "a.txt" and could edit a
+   same-content sibling while reporting success.
+   Fix: Preserve the literal path. Expand only the supported ~ prefix.
+   If skipped: An edit can change a different file from the one requested.
+
+3. Compaction could discard factual summary text.
+   Location: src/compaction.rs, format_compact_summary.
+   What this is: A summary replaces the previous conversation in model input.
+   Problem: A literal <analysis> marker at the beginning of the summary body
+   was mistaken for scratchpad text. An unclosed marker could erase the body.
+   Fix: Strip only analysis blocks before the outer summary. Preserve literal
+   tags within its body, including a leading <summary> marker.
+   If skipped: The model resumes without task evidence that the summary kept.
+
+4. An edit could change untouched line endings or add a carriage return.
+   Location: src/tools/files.rs, FileTools::edit.
+   What this is: search_replace locates and replaces text in a file.
+   Problem: Normalizing the whole file changed untouched LF lines to CRLF.
+   Converting replacement text after an exact LF match could also add an extra
+   carriage return next to a preserved one.
+   Fix: Prefer literal matches and preserve their replacement bytes. Use LF
+   normalization only as a fallback, map matches back to original byte ranges,
+   and preserve every byte outside those ranges. Keep output-size checks.
+   If skipped: A small edit can alter unrelated lines or corrupt a newline.
+
+5. File tools and terminal commands used different home directories.
+   Location: src/tools.rs and src/tools/files.rs.
+   What this is: Both tool families support paths beginning with ~/.
+   Problem: Bash used the private attempt home, but file tools used inherited
+   HOME. A terminal write and file read could reach different files.
+   Fix: Pass the same attempt home to FileTools. A test writes through Bash
+   and reads the result through read_file.
+   If skipped: The model cannot reliably find files it just created.
+
+6. Valid terminal calls could collide on task IDs.
+   Location: src/tools/terminal.rs, TerminalSession::run.
+   What this is: Background commands need IDs for polling and cancellation.
+   Problem: Explicit background calls used generated IDs such as terminal-1;
+   other calls used provider IDs. Those namespaces could collide.
+   Fix: Use the unique tool-call ID consistently. Keep the local counter only
+   for safe log filenames.
+   If skipped: A valid command can fail with a duplicate-task error.
+
+7. The background-command guard misread ordinary Bash syntax.
+   Location: src/tools/terminal.rs, unwaited_background.
+   What this is: Foreground calls reject an unwaited background ampersand.
+   Problem: Comments and arithmetic ampersands caused false rejections. Text
+   ending in echo wait or a heredoc delimiter named wait could pass the guard.
+   Fix: Skip comments and arithmetic, exclude heredoc bodies from the final
+   wait check, and require an executed final wait command. Keep support for
+   builtin wait and command wait.
+   If skipped: Ordinary commands fail, and some unwaited commands pass.
+
+8. Explicit todo replacement could retain old items.
+   Location: src/tools/files.rs, FileTools::todo.
+   What this is: merge=false replaces the todo list according to the schema.
+   Problem: Status-only updates silently enabled merging instead.
+   Fix: Honor merge=false. Partial updates that should preserve other items
+   explicitly use merge=true.
+   If skipped: The actual todo list disagrees with the advertised argument.
+
+9. Interrupted requests could produce misleading complete cost totals.
+   Location: harbor/remanie_agent.py, populate_context_post_run.
+   What this is: Harbor collects endpoint-reported token usage and cost.
+   Problem: A successful response followed by a failed request still reported
+   the earlier response's usage and cost as complete totals.
+   Fix: Count model and compaction requests as well as responses. An unmatched
+   request leaves the totals unknown.
+   If skipped: An interrupted attempt can report a partial bill as its total.
+
+10. Packaged library notices referenced license texts missing from the bundle.
+    Location: package_linux.py, distro_notices and package.
+    What this is: Packaging collects notices for redistributed binaries.
+    Problem: Debian copyright files referenced /usr/share/common-licenses texts
+    that the packager did not copy.
+    Fix: Require and include those referenced texts. Test both inclusion and
+    failure when a referenced license is absent.
+    If skipped: The bundle's notices refer to files it does not contain.
+
+Should fix, now fixed
+
+11. Unused runtime code and redundant comments added maintenance work.
+    Location: src/main.rs, src/runner.rs, src/tools.rs, tests and Cargo.toml.
+    What this is: The extraction retained wrappers from the larger runtime.
+    Problem: LocalSet wrappers had no spawn_local callers. The loop rebuilt
+    and discarded the immutable catalog. Its accessor was async and fallible
+    despite doing neither. Reqwest's JSON helper feature had no callers.
+    Fix: Remove those wrappers, discarded reads and unused feature. Remove
+    comments that narrate code and the stale zsh environment allowance.
+    If skipped: Readers must check code and explanations with no current job.
+
+Comment policy
+
+The remaining comments carry source attribution, external OS requirements,
+Debian/Cargo packaging facts, or the known token-estimation limit. CLI docstrings
+remain where argparse displays them. Legal notices and the five agreed prompt
+and tool-catalog assets are unchanged.
+
+Validation and verdict
+
+All 53 Rust tests pass on macOS and Linux. All 18 Python checks and all four
+Harbor/Docker fixtures pass. See validation.txt for the package checks and logs.
+
+Verdict: Ship these fixes. No confirmed blocking findings remain in the reviewed
+scope. The PR remains a draft.
+This report records fixed findings; it does not claim that every possible Bash
+program or concurrent filesystem operation has been proven correct.
+
+Not checked: paid model inference on this revision, the full Terminal-Bench
+suite, native AMD64 execution, optimizer updates or production sandbox controls.
+Local Docker has no per-task disk quota. Atomic edits do not serialize external
+writers. Container destruction remains necessary after crashes or forced exits.

@@ -169,21 +169,25 @@ class RemanieAgent(BaseInstalledAgent):
 
             try:
                 with environment.scoped_output_callback(capture_process):
-                    await self.exec_as_agent(
+                    execution = asyncio.create_task(self.exec_as_agent(
                         environment,
                         f"exec setsid --wait bash -c {shlex.quote(script)}",
                         env={"OPENROUTER_API_KEY": token},
-                    )
+                    ))
+                    await asyncio.shield(execution)
             finally:
-                cleanup = asyncio.create_task(self._stop_runtime(environment, process))
+                cleanup = asyncio.create_task(self._stop_runtime(environment, process, execution))
                 try:
                     await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
                     await cleanup
                     raise
-        # Harbor downloads logs before calling populate_context_post_run if context stays empty.
+                finally:
+                    if not execution.done():
+                        execution.cancel()
+                    await asyncio.gather(execution, return_exceptions=True)
 
-    async def _stop_runtime(self, environment, process):
+    async def _stop_runtime(self, environment, process, execution):
         if process is None:
             raise RuntimeError("Runtime identity was not captured; container teardown required")
         pid, started = process
@@ -191,7 +195,7 @@ class RemanieAgent(BaseInstalledAgent):
 pid={pid}
 alive() {{
     [ -e "/proc/$pid/stat" ] || return 1
-    IFS= read -r status < "/proc/$pid/stat" || exit 1
+    IFS= read -r status < "/proc/$pid/stat" || return 1
     set -- ${{status##*) }}
     [ "${{20}}" = {started} ] || exit 1
     [ "$1" != Z ] && [ "$1" != X ] || return 1
@@ -201,11 +205,11 @@ if ! alive; then exit 0; fi
 kill -TERM -- "-$pid" 2>/dev/null || true
 for i in {{1..50}}; do alive || exit 0; sleep 0.1; done
 kill -KILL -- "-$pid" 2>/dev/null || true
-# Forced termination cannot confirm cleanup of the runner's separate tool process groups.
 exit 1
 """
         try:
             await self.exec_as_agent(environment, script, timeout_sec=10)
+            await asyncio.wait_for(asyncio.shield(execution), timeout=10)
         except Exception as exc:
             raise RuntimeError("Runtime shutdown was not confirmed; container teardown required") from exc
 
@@ -230,6 +234,7 @@ exit 1
             metadata["result_invalid"] = True
 
         totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+        requests = 0
         responses = 0
         complete = True
         cost_count = 0
@@ -247,7 +252,12 @@ exit 1
                         metadata["trace_incomplete"] = True
                         complete = False
                         continue
-                    if not isinstance(event, dict) or event.get("event") not in ("model_response", "compaction_response"):
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("event") in ("model_request", "compaction_request"):
+                        requests += 1
+                        continue
+                    if event.get("event") not in ("model_response", "compaction_response"):
                         continue
                     responses += 1
                     body = event.get("body")
@@ -275,11 +285,12 @@ exit 1
         except (OSError, ValueError):
             metadata["trace_incomplete"] = True
             complete = False
+        complete = complete and requests == responses
         if responses and complete:
             context.n_input_tokens = totals["prompt_tokens"]
             context.n_output_tokens = totals["completion_tokens"]
             context.n_cache_tokens = totals["cached_tokens"]
-        if responses and cost_count == responses and not metadata.get("trace_incomplete"):
+        if responses and requests == responses and cost_count == responses and not metadata.get("trace_incomplete"):
             context.cost_usd = total_cost
-        metadata.update(response_count=responses, usage_complete=bool(responses and complete))
+        metadata.update(request_count=requests, response_count=responses, usage_complete=bool(responses and complete))
         context.metadata = {**(context.metadata or {}), "remanie": metadata}

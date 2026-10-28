@@ -13,23 +13,23 @@ from pathlib import Path
 CRATE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CRATE / "harbor"))
 
-from harbor.models.trial.config import (  # noqa: E402
+from harbor.models.trial.config import (
     AgentConfig,
     EnvironmentConfig,
     TaskConfig,
     TrialConfig,
     VerifierConfig,
 )
-from harbor.trial.trial import Trial  # noqa: E402
-from remanie_agent import RemanieAgent  # noqa: E402
+from harbor.trial.trial import Trial
+from remanie_agent import RemanieAgent
 
 FAKE_KEY = "remanie-local-fixture-key"
 CATALOG = json.loads((CRATE / "assets/tools.json").read_text())
 
 
 class UnconfirmedShutdownAgent(RemanieAgent):
-    async def _stop_runtime(self, environment, process):
-        await super()._stop_runtime(environment, None)
+    async def _stop_runtime(self, environment, process, execution):
+        await super()._stop_runtime(environment, None, execution)
 
 
 def call(name, arguments, id):
@@ -85,6 +85,9 @@ class ScriptedModel:
             return reply("<summary>Created result.txt containing before. The verification todo is in progress and a background task remains running.</summary>")
 
         self.turn += 1
+        if self.mode == "crash":
+            assert self.turn == 1
+            return reply(calls=[shell("printf '%s' $$ > crash.pid; kill -KILL \"$PPID\"; exec sleep 300", "crash-process", wait=30000)])
         if self.mode == "timeout":
             if self.turn == 1:
                 return reply(calls=[shell("printf '1\\n' > /logs/agent/runtime.pid; printf '%s' $$ > timeout.pid; exec sleep 300", "timeout-process")])
@@ -191,7 +194,7 @@ async def check(mode, runtime_dir, output_dir):
         thread.join(timeout=2)
         (output_dir / f"{mode}-model-requests.json").write_text(json.dumps(model.requests, indent=2) + "\n")
     assert not model.errors, model.errors
-    if mode == "cleanup_error":
+    if mode in ("cleanup_error", "crash"):
         assert result.exception_info and result.exception_info.exception_type == "RuntimeError"
         assert result.verifier_result is None and result.verifier is None
         assert not (output_dir / mode / "verifier/reward.txt").exists()
@@ -222,7 +225,7 @@ async def main():
     args = parser.parse_args()
     output = (args.output_dir or Path(tempfile.mkdtemp(prefix="remanie-harbor-check-"))).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    modes = ("completed", "timeout", "cleanup_error")
+    modes = ("completed", "timeout", "cleanup_error", "crash")
     assert not any((output / mode).exists() for mode in modes), "Use a fresh output directory"
     os.environ["OPENROUTER_API_KEY"] = FAKE_KEY
     print(f"Harbor integration logs: {output}", flush=True)

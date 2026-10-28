@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -127,12 +128,15 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         agent = self.agent()
         environment = self.environment()
         started = asyncio.Event()
+        stopped = asyncio.Event()
 
         async def execute(**kwargs):
             if "exec setsid" in kwargs["command"]:
                 await environment.output_callback("REMANIE_PROCESS=123:456\n", "stdout")
                 started.set()
-                await asyncio.Event().wait()
+                await stopped.wait()
+            elif 'kill -TERM -- "-$pid"' in kwargs["command"]:
+                stopped.set()
             return ExecResult(stdout="/task\n", return_code=0)
 
         environment.exec.side_effect = execute
@@ -146,16 +150,80 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('kill -KILL -- "-$pid"', cleanup["command"])
         self.assertEqual(cleanup["timeout_sec"], 10)
 
+    async def test_crashed_runtime_cannot_be_confirmed_by_a_missing_process(self):
+        agent = self.agent()
+        environment = self.environment()
+
+        async def execute(**kwargs):
+            if "exec setsid" in kwargs["command"]:
+                await environment.output_callback("REMANIE_PROCESS=123:456\n", "stdout")
+                return ExecResult(stderr="runtime was killed", return_code=137)
+            return ExecResult(stdout="/task\n", return_code=0)
+
+        environment.exec.side_effect = execute
+        with self.assertRaisesRegex(RuntimeError, "shutdown was not confirmed") as raised:
+            await agent.run("task", environment, AgentContext())
+        self.assertNotIsInstance(raised.exception, NonZeroAgentExitCodeError)
+
+    async def test_cancelled_attempt_still_checks_the_runtime_exit_status(self):
+        agent = self.agent()
+        environment = self.environment()
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def execute(**kwargs):
+            if "exec setsid" in kwargs["command"]:
+                await environment.output_callback("REMANIE_PROCESS=123:456\n", "stdout")
+                started.set()
+                await stopped.wait()
+                return ExecResult(stderr="runtime was already killed", return_code=137)
+            if 'kill -TERM -- "-$pid"' in kwargs["command"]:
+                stopped.set()
+            return ExecResult(stdout="/task\n", return_code=0)
+
+        environment.exec.side_effect = execute
+        task = asyncio.create_task(agent.run("task", environment, AgentContext()))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with self.assertRaisesRegex(RuntimeError, "shutdown was not confirmed"):
+            await task
+
     async def test_unconfirmed_shutdown_fails_closed(self):
         agent = self.agent()
         environment = self.environment()
+        execution = asyncio.get_running_loop().create_future()
+        execution.set_result(None)
         with self.assertRaisesRegex(RuntimeError, "identity was not captured"):
-            await agent._stop_runtime(environment, None)
+            await agent._stop_runtime(environment, None, execution)
         environment.exec.assert_not_awaited()
         environment.exec.side_effect = NonZeroAgentExitCodeError("cleanup failed")
         with self.assertRaisesRegex(RuntimeError, "shutdown was not confirmed") as raised:
-            await agent._stop_runtime(environment, ("123", "456"))
+            await agent._stop_runtime(environment, ("123", "456"), execution)
         self.assertNotIsInstance(raised.exception, NonZeroAgentExitCodeError)
+
+    async def test_proc_read_eof_allows_confirmed_exit_but_identity_mismatch_fails(self):
+        agent = self.agent()
+        environment = self.environment()
+        stat_file = self.root / "process.stat"
+        execution = asyncio.get_running_loop().create_future()
+        execution.set_result(ExecResult(return_code=0))
+
+        async def execute(**kwargs):
+            command = kwargs["command"].replace('"/proc/$pid/stat"', shlex.quote(str(stat_file)))
+            process = await asyncio.create_subprocess_exec(
+                "/bin/bash", "-c", command,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            return ExecResult(stdout=stdout.decode(), stderr=stderr.decode(), return_code=process.returncode)
+
+        environment.exec.side_effect = execute
+        stat_file.write_text("")
+        await agent._stop_runtime(environment, ("123", "456"), execution)
+        fields = ["S", "1", "123", "123", *(["0"] * 15), "789"]
+        stat_file.write_text("123 (runtime) " + " ".join(fields) + "\n")
+        with self.assertRaisesRegex(RuntimeError, "shutdown was not confirmed"):
+            await agent._stop_runtime(environment, ("123", "456"), execution)
 
     def test_oversized_or_symlink_logs_are_not_read(self):
         agent = self.agent()
@@ -206,6 +274,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
                 "prompt_tokens": 10, "completion_tokens": 3,
                 "prompt_tokens_details": {"cached_tokens": 4}, "cost": 0.01,
             }}},
+            {"event": "compaction_request", "body": {}},
             {"event": "compaction_response", "body": {"usage": {
                 "prompt_tokens": 20, "completion_tokens": 5, "cost": 0.02,
             }}},
@@ -223,6 +292,25 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(context.metadata["remanie"]["trace_incomplete"])
         self.assertIsNone(context.n_input_tokens)
         self.assertIsNone(context.cost_usd)
+
+    def test_missing_response_keeps_cost_and_usage_totals_unknown(self):
+        agent = self.agent()
+        trace = self.logs / "remanie"
+        trace.mkdir()
+        events = [
+            {"event": "model_request", "body": {}},
+            {"event": "model_response", "body": {"usage": {
+                "prompt_tokens": 10, "completion_tokens": 3, "cost": 0.01,
+            }}},
+            {"event": "model_request", "body": {}},
+        ]
+        (trace / "trace.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+        context = AgentContext()
+        agent.populate_context_post_run(context)
+        self.assertIsNone(context.n_input_tokens)
+        self.assertIsNone(context.cost_usd)
+        self.assertEqual(context.metadata["remanie"]["request_count"], 2)
+        self.assertFalse(context.metadata["remanie"]["usage_complete"])
 
     def test_partial_usage_is_not_reported_as_complete(self):
         agent = self.agent()

@@ -1,9 +1,84 @@
 use super::*;
 
 #[tokio::test]
+async fn edits_preserve_literal_whitespace_and_quote_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    for name in [" a.txt", "a.txt ", "'a.txt'", "a.txt"] {
+        tokio::fs::write(dir.path().join(name), "before")
+            .await
+            .unwrap();
+    }
+    for name in [" a.txt", "a.txt ", "'a.txt'"] {
+        let path = if name.ends_with(' ') {
+            dir.path().join(name)
+        } else {
+            PathBuf::from(name)
+        };
+        tools
+            .call(
+                "search_replace",
+                &json!({"file_path":path,"old_string":"before","new_string":"after"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join(name))
+                .await
+                .unwrap(),
+            "after"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("a.txt"))
+                .await
+                .unwrap(),
+            "before"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tilde_paths_use_the_terminal_private_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("private-home");
+    tokio::fs::create_dir(&home).await.unwrap();
+    tokio::fs::write(home.join("file.txt"), "before")
+        .await
+        .unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), home.clone());
+    assert_eq!(
+        tools
+            .call("read_file", &json!({"target_file":"~/file.txt"}))
+            .await
+            .unwrap(),
+        "1→before"
+    );
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"~//file.txt","old_string":"before","new_string":"after"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(home.join("file.txt"))
+            .await
+            .unwrap(),
+        "after"
+    );
+    assert!(
+        tools
+            .call("list_dir", &json!({"target_directory":"~"}))
+            .await
+            .unwrap()
+            .contains("file.txt")
+    );
+}
+
+#[tokio::test]
 async fn read_windows_keep_unicode_crlf_anchors_and_trailing_lines() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     let path = dir.path().join("AGENTS.md");
     tokio::fs::write(&path, "α\r\nβ\r\nγ\r\n").await.unwrap();
     assert_eq!(
@@ -67,7 +142,7 @@ async fn read_windows_keep_unicode_crlf_anchors_and_trailing_lines() {
 #[tokio::test]
 async fn reads_bound_the_returned_window_and_reject_non_text() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     tokio::fs::write(
         dir.path().join("large.txt"),
         format!("{}\nsmall\n", "x".repeat(READ_MAX_BYTES + 1)),
@@ -142,7 +217,7 @@ async fn reads_bound_the_returned_window_and_reject_non_text() {
 #[tokio::test]
 async fn edits_enforce_creation_unique_matches_and_preserve_exact_unicode_and_crlf() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     let path = dir.path().join("nested/file.txt");
     tools.call("search_replace", &json!({"file_path":"nested/file.txt","old_string":"","new_string":"café\r\n猫\r\ncafé\r\n"})).await.unwrap();
     assert!(
@@ -223,9 +298,107 @@ async fn edits_enforce_creation_unique_matches_and_preserve_exact_unicode_and_cr
 }
 
 #[tokio::test]
+async fn edits_accept_crlf_or_read_text_and_preserve_untouched_line_endings() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let path = dir.path().join("mixed.txt");
+    tokio::fs::write(&path, "α\r\none\ntwo\r\n猫\r\nend\n")
+        .await
+        .unwrap();
+    tools.call("search_replace", &json!({"file_path":"mixed.txt","old_string":"one\ntwo\n猫","new_string":"ONE\nTWO\n犬"})).await.unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "α\r\nONE\r\nTWO\r\n犬\r\nend\n"
+    );
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"mixed.txt","old_string":"α\r\nONE","new_string":"β\r\nUNO"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "β\r\nUNO\r\nTWO\r\n犬\r\nend\n"
+    );
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"mixed.txt","old_string":"\n","new_string":"|","replace_all":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "β\r|UNO\r|TWO\r|犬\r|end|"
+    );
+}
+
+#[tokio::test]
+async fn edits_prefer_exact_newlines_before_normalizing_read_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let path = dir.path().join("mixed.txt");
+    tokio::fs::write(&path, "one\r\ntwo\r\none\ntwo\n")
+        .await
+        .unwrap();
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"mixed.txt","old_string":"one\r\ntwo","new_string":"ONE\r\nTWO"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "ONE\r\nTWO\r\none\ntwo\n"
+    );
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"mixed.txt","old_string":"one\ntwo","new_string":"ONE TWO"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "ONE\r\nTWO\r\nONE TWO\n"
+    );
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"mixed.txt","old_string":"\r","new_string":"","replace_all":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "ONE\nTWO\nONE TWO\n"
+    );
+}
+
+#[tokio::test]
+async fn literal_edits_preserve_replacement_bytes_at_crlf_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let path = dir.path().join("file.txt");
+    for (needle, expected) in [("\n", "a\r\nX\nb"), ("\r\n", "a\nX\nb")] {
+        tokio::fs::write(&path, "a\r\nb").await.unwrap();
+        tools
+            .call(
+                "search_replace",
+                &json!({"file_path":"file.txt","old_string":needle,"new_string":"\nX\n"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
 async fn oversized_replacements_fail_before_expanding_or_changing_the_file() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     let path = dir.path().join("expanded.txt");
     let original = "x".repeat(1_000);
     tokio::fs::write(&path, &original).await.unwrap();
@@ -269,7 +442,10 @@ async fn cancelling_edits_leaves_an_original_or_complete_file() {
     let path = dir.path().join("file");
     let original = "before\n".repeat(100_000);
     let replacement = "after\n".repeat(100_000);
-    let tools = std::sync::Arc::new(FileTools::new(dir.path().to_path_buf()));
+    let tools = std::sync::Arc::new(FileTools::new(
+        dir.path().to_path_buf(),
+        dir.path().join("home"),
+    ));
     for delay in [0, 1, 5] {
         tokio::fs::write(&path, &original).await.unwrap();
         let tools = tools.clone();
@@ -289,7 +465,7 @@ async fn cancelling_edits_leaves_an_original_or_complete_file() {
 async fn unicode_filename_fallback_is_unique_and_symlink_edits_keep_the_link() {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     let actual = dir.path().join("screen\u{202f}shot.txt");
     tokio::fs::write(&actual, "before").await.unwrap();
     assert!(
@@ -341,7 +517,7 @@ async fn special_files_fail_promptly_instead_of_waiting_for_a_writer() {
     let path = dir.path().join("pipe");
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     for (name, args) in [
         ("read_file", json!({"target_file":"pipe"})),
         (
@@ -361,12 +537,12 @@ async fn special_files_fail_promptly_instead_of_waiting_for_a_writer() {
 #[tokio::test]
 async fn todos_preserve_insertion_order_partial_updates_and_duplicate_atomicity() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     tools.call("todo_write", &json!({"todos":[{"id":"b","content":"second"},{"id":"a","content":"first"}],"merge":false})).await.unwrap();
     let output = tools
         .call(
             "todo_write",
-            &json!({"todos":[{"id":"b","status":"completed"}],"merge":false}),
+            &json!({"todos":[{"id":"b","status":"completed"}],"merge":true}),
         )
         .await
         .unwrap();
@@ -379,6 +555,17 @@ async fn todos_preserve_insertion_order_partial_updates_and_duplicate_atomicity(
     assert!(tools.call("todo_write", &json!({"todos":[{"id":"a","content":"changed"},{"id":"a","status":"completed"}],"merge":false})).await.is_err());
     assert_eq!(tools.snapshot().await, before);
     tools
+        .call(
+            "todo_write",
+            &json!({"todos":[{"id":"b","status":"pending"}],"merge":false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tools.snapshot().await,
+        json!({"todos":{"b":{"content":"b","priority":"medium","status":"pending"}}})
+    );
+    tools
         .call("todo_write", &json!({"todos":[],"merge":false}))
         .await
         .unwrap();
@@ -388,7 +575,7 @@ async fn todos_preserve_insertion_order_partial_updates_and_duplicate_atomicity(
 #[tokio::test]
 async fn grep_honors_paths_filters_regex_flags_and_output_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     tokio::fs::create_dir(dir.path().join(".git"))
         .await
         .unwrap();
@@ -485,7 +672,7 @@ async fn grep_honors_paths_filters_regex_flags_and_output_limit() {
 #[tokio::test]
 async fn pdf_image_mode_errors_and_page_ranges_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     tokio::fs::write(dir.path().join("document.pdf"), b"%PDF-1.4\n")
         .await
         .unwrap();
@@ -529,7 +716,7 @@ async fn pdf_text_and_selected_pages_when_poppler_is_installed() {
             return;
         }
     }
-    let tools = FileTools::new(dir.path().to_path_buf());
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
     tokio::fs::write(
         dir.path().join("pages.pdf"),
         test_pdf(&["First page text", "Second page text"]),

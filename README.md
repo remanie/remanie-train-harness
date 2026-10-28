@@ -1,8 +1,8 @@
 # remanie-train-harness
 
-A small Rust coding rollout runner with eight tools, optional compaction, and a JSONL execution trace. Harbor runs it in disposable Docker task environments and grades the result.
+A small Rust program that lets a model work on a coding task using eight tools. It can summarize long conversations and saves an execution trace. Harbor runs each task in a disposable Docker environment and grades the result.
 
-The tools are `run_terminal_cmd`, `get_terminal_command_output`, `kill_terminal_command`, `read_file`, `search_replace`, `list_dir`, `grep`, and `todo_write`. Their names, argument schemas and prompt assets match the original agreed Grok Build profile. The runtime contains only the handlers used by this profile.
+The tools are `run_terminal_cmd`, `get_terminal_command_output`, `kill_terminal_command`, `read_file`, `search_replace`, `list_dir`, `grep`, and `todo_write`. Their names and argument definitions match the agreed Grok Build tool set. Each tool description keeps its original first sentence.
 
 ## Build and check
 
@@ -49,7 +49,11 @@ The runner wraps the task once in `<user_query>` tags and sends the eight defini
 
 `run_terminal_cmd` starts a fresh Bash shell in the task workspace. Its environment is explicit, with a private HOME and TMPDIR. A command that outlasts `block_until_ms` becomes a background task; use the output and kill tools to manage it. Shutdown terminates managed process groups. The launcher must still destroy the sandbox after crashes or forced termination.
 
-The file tools accept absolute paths and do not provide a security boundary. `search_replace` refuses an ambiguous match and cannot overwrite a nonempty file with an empty `old_string`. Todo state and background task metadata survive compaction and reset for each attempt.
+The file tools accept absolute paths and do not restrict access to the workspace. Both file tools and terminal commands expand `~` to the attempt's private home directory.
+
+`search_replace` refuses an ambiguous match and cannot overwrite a nonempty file with an empty `old_string`. It preserves untouched bytes, including line endings. Atomic replacement prevents partial files but does not lock out other processes.
+
+Todo state and background task metadata survive compaction and reset for each attempt.
 
 ## Compaction and traces
 
@@ -57,7 +61,7 @@ A positive `compaction_threshold_tokens` enables compaction. Zero disables it. T
 
 Compaction makes one summary request through the same endpoint. A finished, nonempty summary replaces conversation history together with the original system prompt, task and current tool state. Earlier requests remain in `trace.jsonl`. Malformed summaries stop as `invalid_response`; endpoint failures stop as `error`. There are no automatic model retries.
 
-The trace records request/response JSON, tool results, compacted contexts and the outcome. It is not a token-level training dataset: this runner does not produce tokenizer IDs, log probabilities, loss masks or optimizer updates. A training backend must supply those records and join them to a trusted reward.
+The trace records request and response JSON, tool results, summaries and the outcome. A training backend must supply token IDs, log probabilities and loss masks, associate them with a trusted reward, and update the model. This runner does not perform those steps.
 
 The result includes `status`, `final_answer`, `turns` and `compactions`, plus `error` on infrastructure failure. Harbor independently runs the verifier. The model's final answer does not set the reward.
 
@@ -67,6 +71,6 @@ Run one attempt per disposable sandbox. Keep provider credentials and private gr
 
 Each model request/response is capped at 16 MiB, each command log at 16 MiB, and the trace at 256 MiB. The launcher owns CPU, memory, disk and network limits. The current Harbor adapter supports local Docker; it does not enforce per-task disk quotas.
 
-This project derives from Grok Build. The source and retained code are documented in [NOTICE](NOTICE). The production application, UI, registry, remote integrations, cloud clients, media renderers and Miles adapter are absent from the build and source tree.
+This project derives from Grok Build. [NOTICE](NOTICE) identifies the original source and retained code. The source tree contains one Rust package, the Harbor adapter, runtime packaging and their checks.
 
 See [validation](reviews/validation.txt) for the extraction checks. The [earlier smoke report](reviews/terminal-bench-2.1-smoke-2026-10-27.txt) tested the larger predecessor, not this extracted implementation.

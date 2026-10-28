@@ -29,7 +29,6 @@ fn main() -> ExitCode {
         config.validate()?;
         let authorization = if let Some(name) = &config.api_key_env {
             let key = std::env::var_os(name);
-            // Remove credentials before the runtime or tools can spawn threads or processes.
             unsafe { std::env::remove_var(name) };
             let key = key
                 .context("configured API key environment variable is missing")?
@@ -42,7 +41,7 @@ fn main() -> ExitCode {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(tokio::task::LocalSet::new().run_until(runner::run(config, authorization)))
+        runtime.block_on(runner::run(config, authorization))
     })();
     let result = result.unwrap_or_else(runner::RunResult::error);
     let exit = if result.status == "error" {

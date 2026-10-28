@@ -15,7 +15,7 @@ python3 package_linux.py \
   runtime
 ```
 
-The output directory must be new. Packaging copies the executable, ripgrep, their Linux loader and shared libraries, and available Debian license notices. It records their hashes in `manifest.json`. Harbor installs this bundle under `/opt/remanie-train-harness`. The bundled loader avoids requiring a particular glibc version in each task image.
+The output directory must be new. Packaging copies the executable, ripgrep, their Linux loader and shared libraries. It requires the Debian copyright notices and any common license texts they reference. It records the bundled files' hashes in `manifest.json`. Harbor installs this bundle under `/opt/remanie-train-harness`. The bundled loader avoids requiring a particular glibc version in each task image.
 
 Use an AMD64 build and worker for comparable benchmark results. Local validation on this Mac uses a native ARM64 runner and emulated AMD64 task commands. This tests the integration but changes task execution speed.
 
@@ -45,7 +45,11 @@ For a preflight that makes no model calls:
   --dry-run --skip-credential-checks
 ```
 
-The adapter keeps the provider key in the host process. A temporary proxy gives each task a separate credential, restricts it to the configured model and token limits, and closes when the attempt ends. Timeout cleanup uses the process identity captured by the host before the model runs. If shutdown cannot be confirmed, Harbor skips grading and tears down the task. The task receives no OpenRouter key. This adapter currently targets local Docker; the container must be able to reach `host.docker.internal`.
+The adapter keeps the provider key in the host process. A temporary proxy gives each task a separate credential, restricts it to the configured model and token limits, and closes when the attempt ends.
+
+Timeout cleanup uses the process identity captured by the host before the model runs. The host must also confirm that the runner exited with code zero. A crash or unconfirmed shutdown makes Harbor skip grading and tear down the task.
+
+This adapter currently targets local Docker; the container must be able to reach `host.docker.internal`.
 
 ## What the smoke configuration measures
 
@@ -59,7 +63,7 @@ It runs one task at a time, with no automatic retries or task resource overrides
 
 These three attempts check whether the integration works. They are not a full Terminal-Bench score. For a full run, copy the configuration, remove `task_names`, and choose the attempt count deliberately. The benchmark repository recommends at least five attempts per task. Keep the task-specific time limits; some are much longer than 900 seconds.
 
-Results go to `eval-results/`. Each trial saves Harbor's verdict, `agent/result.json`, `agent/runtime-stderr.txt`, and `agent/remanie/trace.jsonl`. The adapter sums token usage and cost reported by the endpoint, including summary calls. If usage is missing, it leaves the corresponding total unknown. The model's final text does not set the reward.
+Results go to `eval-results/`. Each trial saves Harbor's verdict, `agent/result.json`, `agent/runtime-stderr.txt`, and `agent/remanie/trace.jsonl`. The adapter sums token usage and cost reported by the endpoint, including summary calls. A request without a recorded response leaves the totals unknown. Missing usage or cost also leaves the corresponding total unknown. The model's final text does not set the reward.
 
 OpenRouter charges for inference, including reasoning and repeated input tokens. A dry run checks configuration and dataset metadata, not access to the model or available credits. Use a capped evaluation key for a paid run.
 

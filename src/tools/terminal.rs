@@ -107,16 +107,14 @@ impl TerminalSession {
             block == 0 || !unwaited_background(command),
             "Do not use an unwaited background '&'; use block_until_ms=0 instead."
         );
-        let (local_id, log_path) = {
+        let log_path = {
             let mut state = lock(&self.state);
             ensure!(!state.closed, "tool session has ended");
             state.next_id += 1;
             let local = format!("terminal-{}", state.next_id);
-            let path = self
-                .session_dir
+            self.session_dir
                 .join("terminal")
-                .join(format!("{local}.log"));
-            (local, path)
+                .join(format!("{local}.log"))
         };
         let log = tokio::fs::OpenOptions::new()
             .write(true)
@@ -124,11 +122,7 @@ impl TerminalSession {
             .open(&log_path)
             .await
             .context("create command output log")?;
-        let id = if block == 0 {
-            local_id
-        } else {
-            call_id.to_owned()
-        };
+        let id = call_id.to_owned();
         let mut cmd = clean_command(Path::new("/bin/bash"), &self.cwd);
         cmd.args(["--noprofile", "--norc", "-c", command])
             .env("HOME", self.session_dir.join("home"))
@@ -530,7 +524,6 @@ fn clean_command(program: &Path, cwd: &Path) -> Command {
 }
 
 fn signal_group(pid: libc::pid_t, signal: libc::c_int) {
-    // SAFETY: only positive, unreaped child PIDs are stored; each child leads its own session.
     unsafe {
         libc::kill(-pid, signal);
     }
@@ -682,7 +675,6 @@ async fn drive(
     if status.is_none() {
         task.stop("cancelled", false);
         let mut state = lock(&task.state);
-        // stop already sent SIGKILL; dropping the child delegates any exceptional failed reap to Tokio.
         if let Ok(Some(exit)) = child.try_wait() {
             status = Some(exit);
         }
@@ -767,25 +759,33 @@ fn strip_ansi(text: &str) -> String {
     output
 }
 
-fn unwaited_background(command: &str) -> bool {
-    contains_background_operator(command) && !ends_with_wait_builtin(command)
-}
-
 fn ends_with_wait_builtin(command: &str) -> bool {
     let trimmed = command
         .trim_end()
         .trim_end_matches(';')
         .trim_end_matches('\n')
         .trim_end();
-    trimmed == "wait"
-        || trimmed.ends_with(" wait")
-        || trimmed.ends_with(";wait")
-        || trimmed.ends_with("\twait")
-        || trimmed.ends_with("\nwait")
+    let Some(prefix) = trimmed.strip_suffix("wait") else {
+        return false;
+    };
+    let separated = prefix.ends_with([' ', '\t']);
+    let prefix = prefix.trim_end_matches([' ', '\t']);
+    let prefix = if separated {
+        prefix
+            .strip_suffix("builtin")
+            .or_else(|| prefix.strip_suffix("command"))
+            .unwrap_or(prefix)
+            .trim_end_matches([' ', '\t'])
+    } else {
+        prefix
+    };
+    prefix.is_empty()
+        || prefix.ends_with([';', '\n'])
+        || (prefix.ends_with('&') && !prefix.ends_with("&&"))
 }
 
 fn parse_heredoc_start(chars: &[char], start: usize) -> Option<(String, bool, usize)> {
-    let mut i = start + 2; // skip `<<`
+    let mut i = start + 2;
 
     let strip_tabs = chars.get(i).copied() == Some('-');
     if strip_tabs {
@@ -797,7 +797,7 @@ fn parse_heredoc_start(chars: &[char], start: usize) -> Option<(String, bool, us
     }
 
     match chars.get(i).copied() {
-        None | Some('\n') => None, // no delimiter
+        None | Some('\n') => None,
         Some('\'') => {
             i += 1;
             let d_start = i;
@@ -806,7 +806,7 @@ fn parse_heredoc_start(chars: &[char], start: usize) -> Option<(String, bool, us
             }
             chars.get(i)?;
             let delimiter: String = chars.get(d_start..i)?.iter().collect();
-            i += 1; // skip closing quote
+            i += 1;
             if delimiter.is_empty() {
                 return None;
             }
@@ -868,25 +868,27 @@ fn skip_heredoc_body(chars: &[char], start: usize, delimiter: &str, strip_tabs: 
 
         if check == delimiter {
             if i < len {
-                i += 1; // skip the `\n` after the delimiter
+                i += 1;
             }
             return i;
         }
 
         if i < len {
-            i += 1; // skip `\n`
+            i += 1;
         }
     }
 
     len
 }
 
-fn contains_background_operator(command: &str) -> bool {
-    let chars: Vec<char> = command.chars().collect();
+fn unwaited_background(command: &str) -> bool {
+    let mut chars: Vec<char> = command.chars().collect();
     let len = chars.len();
     let mut i = 0;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
+    let mut word_start = true;
+    let mut background = false;
     let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
 
     while i < len {
@@ -895,25 +897,60 @@ fn contains_background_operator(command: &str) -> bool {
         };
 
         if ch == '\\' && !in_single_quote {
-            i += 2; // skip the escaped character
+            if chars.get(i + 1) != Some(&'\n') {
+                word_start = false;
+            }
+            i += 2;
             continue;
         }
 
         if ch == '\'' && !in_double_quote {
             in_single_quote = !in_single_quote;
+            word_start = false;
             i += 1;
             continue;
         }
         if ch == '"' && !in_single_quote {
             in_double_quote = !in_double_quote;
+            word_start = false;
             i += 1;
             continue;
         }
 
+        if !in_single_quote && !in_double_quote {
+            if ch == '#' && word_start {
+                while i < len && chars[i] != '\n' {
+                    chars[i] = ' ';
+                    i += 1;
+                }
+                continue;
+            }
+            if ch == '(' && chars.get(i + 1) == Some(&'(') {
+                word_start = i == 0 || chars[i - 1] != '$';
+                i += 2;
+                let mut depth = 2;
+                while i < len && depth > 0 {
+                    match chars[i] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            word_start = matches!(
+                ch,
+                ' ' | '\t' | '\n' | ';' | '|' | '&' | '(' | ')' | '<' | '>'
+            );
+        }
+
         if ch == '\n' && !in_single_quote && !in_double_quote && !pending_heredocs.is_empty() {
-            i += 1; // skip the newline
+            i += 1;
             for (delim, strip_tabs) in pending_heredocs.drain(..) {
+                let start = i;
                 i = skip_heredoc_body(&chars, i, &delim, strip_tabs);
+                chars[start..i].fill(' ');
             }
             continue;
         }
@@ -952,13 +989,13 @@ fn contains_background_operator(command: &str) -> bool {
                 continue;
             }
 
-            return true;
+            background = true;
         }
 
         i += 1;
     }
 
-    false
+    background && !ends_with_wait_builtin(&chars.into_iter().collect::<String>())
 }
 
 #[cfg(test)]

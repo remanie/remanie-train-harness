@@ -1,4 +1,5 @@
 // Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -18,13 +19,15 @@ const MAX_LINES: usize = 1_000;
 
 pub(super) struct FileTools {
     cwd: PathBuf,
+    home: PathBuf,
     todos: Mutex<IndexMap<String, Value>>,
 }
 
 impl FileTools {
-    pub(super) fn new(cwd: PathBuf) -> Self {
+    pub(super) fn new(cwd: PathBuf, home: PathBuf) -> Self {
         Self {
             cwd,
+            home,
             todos: Mutex::new(IndexMap::new()),
         }
     }
@@ -54,30 +57,11 @@ impl FileTools {
     }
 
     fn path(&self, input: &str) -> PathBuf {
-        let trimmed = input.trim();
-        let quoted = trimmed.len() >= 2
-            && trimmed.starts_with(['\'', '"'])
-            && trimmed.ends_with(['\'', '"']);
-        let mut input = trimmed.trim_matches(['\'', '"']).trim();
-        if quoted {
-            while let Some(stripped) = input
-                .strip_suffix("\\n")
-                .or_else(|| input.strip_suffix("\\r"))
-                .or_else(|| input.strip_suffix("\\t"))
-            {
-                input = stripped.trim_end();
-            }
+        if input == "~" {
+            return self.home.clone();
         }
-        if (input == "~" || input.starts_with("~/"))
-            && let Some(home) = std::env::var_os("HOME")
-        {
-            return PathBuf::from(home).join(input.strip_prefix("~/").unwrap_or(""));
-        }
-        if !input.is_empty() && !Path::new(input).is_absolute() {
-            let absolute = PathBuf::from(format!("/{input}"));
-            if absolute.starts_with(&self.cwd) {
-                return absolute;
-            }
+        if let Some(relative) = input.strip_prefix("~/") {
+            return self.home.join(relative.trim_start_matches('/'));
         }
         self.cwd.join(input)
     }
@@ -243,8 +227,18 @@ impl FileTools {
         } else {
             let old = old.context("file not found")?;
             let crlf = old.contains("\r\n");
-            let matching = if crlf { old.replace("\r\n", "\n") } else { old };
-            let count = matching.match_indices(&input.old_string).count();
+            let normalize = crlf && !old.contains(&input.old_string);
+            let matching = if normalize {
+                Cow::Owned(old.replace("\r\n", "\n"))
+            } else {
+                Cow::Borrowed(old.as_str())
+            };
+            let needle = if normalize {
+                Cow::Owned(input.old_string.replace("\r\n", "\n"))
+            } else {
+                Cow::Borrowed(input.old_string.as_str())
+            };
+            let count = matching.match_indices(needle.as_ref()).count();
             ensure!(
                 count > 0,
                 "The string to replace was not found in the file, use the read_file tool to see the correct string."
@@ -253,38 +247,64 @@ impl FileTools {
                 count == 1 || input.replace_all,
                 "The string to replace was found multiple times in the file. Use replace_all to replace all occurrences, or include more context to only edit one occurrence."
             );
-            let expanded = count
-                .checked_mul(input.new_string.len())
-                .and_then(|inserted| {
-                    matching
-                        .len()
-                        .checked_sub(count.checked_mul(input.old_string.len())?)?
-                        .checked_add(inserted)
-                });
+            let replacement = if normalize {
+                let size = input.new_string.len() + input.new_string.matches('\n').count()
+                    - input.new_string.matches("\r\n").count();
+                ensure!(
+                    size as u64 <= MAX_DOCUMENT_BYTES,
+                    "replacement exceeds the 50 MB edit limit"
+                );
+                input.new_string.replace("\r\n", "\n").replace('\n', "\r\n")
+            } else {
+                input.new_string
+            };
+            let expanded = count.checked_mul(replacement.len()).and_then(|inserted| {
+                matching
+                    .len()
+                    .checked_sub(count.checked_mul(needle.len())?)?
+                    .checked_add(inserted)
+            });
             ensure!(
                 expanded.is_some_and(|size| size as u64 <= MAX_DOCUMENT_BYTES),
                 "replacement exceeds the 50 MB edit limit"
             );
-            let text = matching.replace(&input.old_string, &input.new_string);
-            (
-                if crlf {
-                    let expanded = text
-                        .len()
-                        .checked_add(text.matches('\n').count())
-                        .and_then(|size| size.checked_sub(text.matches("\r\n").count()));
+            let mut crlf_offsets = old
+                .match_indices("\r\n")
+                .filter(|_| normalize)
+                .map(|(offset, _)| offset)
+                .peekable();
+            let mut skipped_carriage_returns = 0;
+            let mut original_index = |normalized_index| {
+                while crlf_offsets
+                    .peek()
+                    .is_some_and(|offset| *offset < normalized_index + skipped_carriage_returns)
+                {
+                    crlf_offsets.next();
+                    skipped_carriage_returns += 1;
+                }
+                normalized_index + skipped_carriage_returns
+            };
+            let mut text = String::with_capacity(expanded.unwrap());
+            let mut copied = 0;
+            for (normalized_start, _) in matching.match_indices(needle.as_ref()) {
+                let start = original_index(normalized_start);
+                let end = original_index(normalized_start + needle.len());
+                for piece in [&old[copied..start], &replacement] {
                     ensure!(
-                        expanded.is_some_and(|size| size as u64 <= MAX_DOCUMENT_BYTES),
+                        text.len().saturating_add(piece.len()) as u64 <= MAX_DOCUMENT_BYTES,
                         "replacement exceeds the 50 MB edit limit"
                     );
-                    text.replace("\r\n", "\n").replace('\n', "\r\n")
-                } else {
-                    text
-                },
-                false,
-                count,
-            )
+                    text.push_str(piece);
+                }
+                copied = end;
+            }
+            ensure!(
+                text.len().saturating_add(old.len() - copied) as u64 <= MAX_DOCUMENT_BYTES,
+                "replacement exceeds the 50 MB edit limit"
+            );
+            text.push_str(&old[copied..]);
+            (text, false, count)
         };
-        // No await between the temporary write and rename: cancellation must not truncate the target.
         atomic_write(&path, existing.as_ref(), &text)?;
         Ok(format!(
             "The file {} has been {}.{}",
@@ -449,14 +469,7 @@ impl FileTools {
             );
         }
         let mut todos = self.todos.lock().await;
-        let merge = input.merge
-            || (!todos.is_empty()
-                && !input.todos.is_empty()
-                && input.todos.iter().all(|update| {
-                    update.content.as_deref().is_none_or(str::is_empty)
-                        && todos.contains_key(&update.id)
-                }));
-        if !merge {
+        if !input.merge {
             todos.clear();
         }
         for update in input.todos {

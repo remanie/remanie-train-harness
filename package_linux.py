@@ -1,5 +1,3 @@
-"""Package the runtime on a Debian or Ubuntu build host of the target architecture."""
-
 import hashlib
 import json
 import platform
@@ -8,6 +6,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+DEBIAN_DOCS = Path("/usr/share/doc")
+DEBIAN_LICENSES = Path("/usr/share/common-licenses")
 
 
 def distro_notices(paths):
@@ -26,10 +27,16 @@ def distro_notices(paths):
         if not owners:
             raise RuntimeError(f"No Debian package owns redistributed file: {path}")
         for owner in owners:
-            source = Path("/usr/share/doc") / owner.split(":", 1)[0] / "copyright"
+            source = DEBIAN_DOCS / owner.split(":", 1)[0] / "copyright"
             if not source.is_file():
                 raise RuntimeError(f"Missing required copyright for {owner}: {source}")
             notices[owner.replace(":", "_") + ".txt"] = source
+            for name in re.findall(r"/usr/share/common-licenses/([A-Za-z0-9.+-]+)", source.read_text()):
+                name = name.rstrip(".")
+                license_file = DEBIAN_LICENSES / name
+                if not license_file.is_file():
+                    raise RuntimeError(f"Missing referenced Debian license: {license_file}")
+                notices[f"common-licenses/{name}"] = license_file
     return notices
 
 
@@ -81,7 +88,9 @@ def package(binary: Path, destination: Path) -> None:
     notices = destination / "licenses"
     notices.mkdir()
     for name, source in sorted(license_sources.items()):
-        shutil.copyfile(source, notices / name)
+        target = notices / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
     for path in sorted(destination.rglob("*")):
         if path.is_file():
             manifest["files"][str(path.relative_to(destination))] = hashlib.sha256(path.read_bytes()).hexdigest()

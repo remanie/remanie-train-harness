@@ -24,6 +24,8 @@ it also overwrites the old PID-file location. The verifier requires its
 background process to be gone before verification. The third trial forces a
 missing host process identity and checks that Harbor skips verification and
 tears down the environment.
+The fourth trial kills the Rust runner while its tool process keeps running.
+Harbor must skip verification and destroy the environment.
 The verifier shares the task's process namespace so it can test that cleanup.
 
 A passing reward belongs only to this integration fixture. It is not a

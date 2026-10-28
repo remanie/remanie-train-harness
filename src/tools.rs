@@ -49,16 +49,16 @@ impl ToolSession {
             })
             .collect::<Result<_>>()?;
         Ok(Self {
-            terminal: TerminalSession::new(cwd.clone(), session_dir).await?,
-            files: FileTools::new(cwd),
+            terminal: TerminalSession::new(cwd.clone(), session_dir.clone()).await?,
+            files: FileTools::new(cwd, session_dir.join("home")),
             closed: AtomicBool::new(false),
             catalog,
             validators,
         })
     }
 
-    pub async fn definitions(&self) -> Result<Vec<Value>> {
-        Ok(TOOL_NAMES
+    pub fn definitions(&self) -> Vec<Value> {
+        TOOL_NAMES
             .into_iter()
             .map(|name| {
                 let definition = &self.catalog[name];
@@ -68,7 +68,7 @@ impl ToolSession {
                     "parameters": definition["parameters"]
                 }})
             })
-            .collect())
+            .collect()
     }
 
     pub async fn call(&self, name: &str, args: Value, call_id: &str) -> Result<String> {
