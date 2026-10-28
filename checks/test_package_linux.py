@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import package_linux
+from licenses import license_files
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harbor"))
 from remanie_agent import Bundle
@@ -27,16 +28,27 @@ class PackageNoticesTest(unittest.TestCase):
             )
             for name in ("LGPL-2.1", "GPL"):
                 (licenses / name).write_text("test license text\n")
-            owner = SimpleNamespace(
-                returncode=0,
-                stdout="diversion by libc6 from: /lib/libc.so.6\n"
-                "diversion by libc6 to: /lib/libc.so.6.usr-is-merged\n"
-                "libc6:arm64: /lib/libc.so.6\n",
-            )
+            (root / "usr/lib").mkdir(parents=True)
+            (root / "usr/lib/libc.so.6").write_text("")
+            (root / "lib").symlink_to("usr/lib")
+            library = root / "lib/libc.so.6"
+            self.assertNotEqual(library.resolve(), library)
+
+            def dpkg_query(command, **options):
+                self.assertEqual(options["env"]["LC_ALL"], "C")
+                if command[2] == str(library):
+                    return SimpleNamespace(returncode=0, stdout=(
+                        f"diversion by libc6 from: {library}\n"
+                        f"diversion by libc6 to: {library}.usr-is-merged\n"
+                        f"local diversion from: {library}\n"
+                        f"local diversion to: {library}.distrib\n"
+                    ))
+                return SimpleNamespace(returncode=0, stdout=f"libc6:arm64: {command[2]}\n")
+
             with patch.object(package_linux, "DEBIAN_DOCS", docs), \
                     patch.object(package_linux, "DEBIAN_LICENSES", licenses), \
-                    patch.object(package_linux.subprocess, "run", return_value=owner):
-                paths = {Path("/lib/libc.so.6")}
+                    patch.object(package_linux.subprocess, "run", side_effect=dpkg_query):
+                paths = {library}
                 self.assertEqual(package_linux.distro_notices(paths), {
                     "libc6_arm64.txt": copyright_file,
                     "common-licenses/LGPL-2.1": licenses / "LGPL-2.1",
@@ -45,6 +57,17 @@ class PackageNoticesTest(unittest.TestCase):
                 (licenses / "LGPL-2.1").unlink()
                 with self.assertRaisesRegex(RuntimeError, "Missing referenced Debian license"):
                     package_linux.distro_notices(paths)
+
+
+class InventoryTest(unittest.TestCase):
+    def test_uncovered_package_fails_instead_of_omitting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = {
+                "manifest_path": str(Path(directory) / "Cargo.toml"),
+                "name": "uncovered", "version": "1.0.0", "license_file": None,
+            }
+            with self.assertRaisesRegex(ValueError, "Missing license text for uncovered 1.0.0"):
+                license_files(package)
 
 
 class LauncherTest(unittest.TestCase):

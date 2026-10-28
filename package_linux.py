@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import platform
 import re
 import shutil
@@ -18,10 +19,11 @@ def distro_notices(paths):
         for candidate in dict.fromkeys((path, path.resolve())):
             result = subprocess.run(
                 ["dpkg-query", "-S", str(candidate)], capture_output=True, text=True,
+                env={**os.environ, "LC_ALL": "C"},
             )
             if result.returncode == 0:
                 owners = [owner for line in result.stdout.splitlines()
-                          if not line.startswith("diversion by ")
+                          if "diversion" not in line.split(": ", 1)[0]
                           for owner in line.split(": ", 1)[0].split(", ")]
                 if owners:
                     break

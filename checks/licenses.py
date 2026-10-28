@@ -5,8 +5,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
-import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,17 +123,6 @@ def render(packages):
         "", "LICENSE AND NOTICE TEXTS", "",
         "\n".join(f"===== {identifier} =====\n\n{content}" for content, identifier in texts.items()),
     ])
-
-
-class InventoryTests(unittest.TestCase):
-    def test_uncovered_package_fails_instead_of_omitting_it(self):
-        with tempfile.TemporaryDirectory() as directory:
-            package = {
-                "manifest_path": str(Path(directory) / "Cargo.toml"),
-                "name": "uncovered", "version": "1.0.0", "license_file": None,
-            }
-            with self.assertRaisesRegex(ValueError, "Missing license text for uncovered 1.0.0"):
-                license_files(package)
 
 
 def main():

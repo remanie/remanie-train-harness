@@ -138,7 +138,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
             1: RuntimeError,
             137: RuntimeError,
         }
-        (self.logs / "result.json").write_text(json.dumps({"outcome": {"kind": "completed"}, "usage": {}}))
+        (self.logs / "result.json").write_text(json.dumps({"outcome": "completed", "usage": {}}))
         for code, raised in cases.items():
             with self.subTest(exit=code):
                 agent = self.agent()
@@ -159,7 +159,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
                 metadata = self.metadata(agent)
                 self.assertEqual(metadata["exit_code"], code)
                 self.assertEqual(metadata["bundle_sha256"], self.bundle_sha256)
-                self.assertEqual(metadata["result"]["outcome"], {"kind": "completed"})
+                self.assertEqual(metadata["result"]["outcome"], "completed")
 
     def test_job_errors_fail_on_the_host(self):
         for options in (
@@ -347,7 +347,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
             ({"prompt_tokens": -1, "completion_tokens": 8, "cached_tokens": 4, "complete": True}, (None, None, None)),
         ):
             with self.subTest(usage=usage):
-                result.write_text(json.dumps({"outcome": {"kind": "turn_cap"}, "usage": usage}))
+                result.write_text(json.dumps({"outcome": "max_turns", "usage": usage}))
                 context = AgentContext()
                 agent.populate_context_post_run(context)
                 self.assertEqual((context.n_input_tokens, context.n_output_tokens, context.n_cache_tokens), expected)
@@ -357,6 +357,10 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         agent = self.agent()
         self.assertIsNone(self.metadata(agent)["result"])
         result = self.logs / "result.json"
+        result.write_bytes(b"")
+        metadata = self.metadata(agent)
+        self.assertIsNone(metadata["result"])
+        self.assertNotIn("result_invalid", metadata)
         with result.open("wb") as file:
             file.truncate(16 * 1024 * 1024 + 1)
         self.assertTrue(self.metadata(agent)["result_invalid"])

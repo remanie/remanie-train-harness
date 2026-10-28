@@ -262,6 +262,8 @@ exit 1
                 info = os.fstat(file.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RESULT_BYTES:
                     raise ValueError("result.json must be a regular file of at most 16 MiB")
+                if info.st_size == 0:
+                    raise FileNotFoundError("result.json is empty")
                 result = json.loads(file.read(MAX_RESULT_BYTES + 1))
             if not isinstance(result, dict):
                 raise ValueError("result.json must hold an object")
