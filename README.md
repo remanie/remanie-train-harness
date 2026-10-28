@@ -1,12 +1,94 @@
 # remanie-train-harness
 
-A small Rust program that lets a model work on a coding task using eight tools. It can summarize long conversations and saves an execution trace. Harbor runs each task in a disposable environment and grades the result.
+`remanie-train-harness` is the agent runtime a model trains through on Harbor tasks. One process runs one attempt inside the task sandbox. It reads one JSON object on stdin, sends every model call to one OpenAI-compatible `/v1/chat/completions` endpoint, runs the tool calls, and exits with a code that tells Harbor whether to grade the sandbox. In training the endpoint is Miles' session server, which records token ids and log-probs. The runner never sees them and never computes a reward.
 
-The tools are `run_terminal_cmd`, `get_terminal_command_output`, `kill_terminal_command`, `read_file`, `search_replace`, `list_dir`, `grep`, and `todo_write`. Their names and argument definitions match the agreed Grok Build tool set. Each tool description keeps its original first sentence.
+Each request carries the two-sentence system prompt from `assets/system_prompt.jinja2`, the task wrapped once in `<user_query>` tags by `assets/user_query.jinja2`, and the eight tool definitions from `assets/tools.json` with `tool_choice: "auto"`. The endpoint owns the chat template and the tool-call parser. The history only grows. The runner appends each assistant message exactly as the endpoint returned it, runs its tool calls one at a time in the order listed, and appends one tool message per call. Compaction runs only when the input sets `compaction`. The runner writes a trace as it goes.
 
-## Build and check
+It is not a product harness. It has no interactive mode, no permission prompts and no workspace confinement. The sandbox is what isolates the task.
 
-Install Rust 1.94, Bash and ripgrep. Linux and macOS are supported.
+## Input
+
+`assets/contract.json` holds the input schema. The runner embeds it, and the Harbor adapter checks job settings against it on the host. Stdin is at most 1 MiB, and unknown fields are refused.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `base_url` | yes | `http` or `https` URL whose path ends in `/v1`, with no credentials, query or fragment. |
+| `model` | yes | Model name sent with every request. |
+| `api_key_env` | no | Environment variable that holds the key. The runner reads it and removes it before any tool starts. Without it, requests carry no `Authorization` header. |
+| `user_query` | yes | The task text. |
+| `workspace` | yes | Existing absolute directory. Commands start here. |
+| `session_dir` | yes | Absolute path that must not exist yet. Its parent must exist. It receives `trace.jsonl`, `result.json` and the command logs. |
+| `sampling_params` | yes | Forwarded verbatim. Must contain `max_tokens`. Must not set `model`, `messages`, `tools`, `tool_choice`, `stream`, `stream_options`, `n`, `logprobs` or `input_ids`. |
+| `max_turns` | yes | Model calls allowed, 1 to 512. |
+| `deadline_secs` | yes | Wall-clock limit, 1 to 86400. Set it below Harbor's agent timeout. |
+| `compaction` | no | `{threshold_tokens, max_tokens}`. Without it the runner never compacts. |
+| `retry` | no | `{attempts, base_backoff_ms, max_backoff_ms}`, default 6, 2000 and 30000. |
+| `keep_background_tasks` | no | Default `true`. |
+
+With compaction on, the runner asks for a summary once the last reported prompt size plus the bytes of new tool output plus the response reserve reaches `threshold_tokens`. The summary request sends `tool_choice: "none"` and `max_tokens` from `compaction`. The next request starts a new history of the system prompt, the task, and a continuation message with the summary, the todo list and the background tasks.
+
+## Exit codes and result
+
+| Exit | Meaning |
+|---|---|
+| 0 | Gradable. The sandbox state is the policy's product. |
+| 70 | Infrastructure failure. Do not grade. |
+| anything else | The process died, for example a panic (101) or a signal. Do not grade. |
+
+Exit 0 ends with one of these outcomes:
+
+| `outcome` | When |
+|---|---|
+| `completed` | The model replied without tool calls. |
+| `max_turns` | `max_turns` model calls were made. The last turn's tools ran. |
+| `max_tokens` | The reply ended with `finish_reason: "length"`. |
+| `context_overflow` | The endpoint returned 400 with a body that names the context length. |
+| `invalid_response` | An empty reply, a tool call that is not a function, two tool calls in one reply sharing an id, or an unusable summary. |
+| `deadline` | `deadline_secs` passed. |
+| `cancelled` | The runner received SIGTERM or SIGINT. |
+
+Exit 70 covers an endpoint that still fails after the retries, an endpoint status the runner does not retry, a response the runner cannot parse, a configuration error, a tool runtime failure and a missing runtime dependency. The runner resends a request with identical bytes only when the endpoint did not process it: a connection failure before the request was sent, 429 and 503. Backoff starts at 2 s, doubles with jitter up to 30 s, honors `Retry-After`, and stops at the deadline.
+
+The runner writes `<session_dir>/result.json` atomically on every exit it controls and prints the same object on stdout. Its fields are `schema`, `outcome`, `cause` (exit 70 only, with up to 64 KiB of the endpoint's error body), `gradable`, `final_answer`, `turns`, `compactions`, `model_calls`, `usage` (`prompt_tokens`, `completion_tokens`, `cached_tokens`, and `complete`, false when any response lacked usage), `tool_calls` (`total`, `ok`, `tool_error`, `invalid_arguments`, `unknown_tool`), `background_tasks_left_running` (`task_id`, `pid`, `command`), `trace` (`path`, `events`, `truncated`) and `wall_time`.
+
+On exit 0 background tasks keep running so the verifier can reach them. On exit 70 the runner kills them.
+
+## Trace
+
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line. Each message appears once, so its size grows linearly with the conversation. The body of every request can be rebuilt from the `header` and a message range. `harbor/remanie_trace.py` reads it.
+
+| `event` | Written | Fields |
+|---|---|---|
+| `header` | once, first | `config` without secrets, `tools`, `prompts_sha256`, `bundle_sha256` |
+| `message` | when a message is appended | `segment`, `index`, `message` |
+| `model_call` | per accepted response | `call`, `kind` (`turn` or `compaction`), `prompt` (`segment`, `end`), `max_tokens_override`, `request_sha256`, `response` verbatim, `attempts`, `latency_ms` |
+| `endpoint_error` | per failed attempt | `call`, `attempt`, `status`, `body_excerpt` (up to 64 KiB), `verdict`, `retry_after_ms` |
+| `tool_call` | per tool call | `call_id`, `name`, `class` (`ok`, `tool_error`, `invalid_arguments`, `unknown_tool`), `latency_ms`, `output_bytes` |
+| `compaction` | per compaction | `from`, `to`, `summary_call`, `estimated_tokens` |
+| `result` | once, last | the `result.json` object |
+
+When a write fails or the trace reaches 256 MiB, the runner stops tracing, finishes the attempt and sets `trace.truncated`.
+
+## Tools
+
+An unknown tool name, arguments that are not JSON or fail the schema, and a tool's own error go back to the model as the tool message. They do not end the attempt.
+
+| Tool | Enforced limits |
+|---|---|
+| `run_terminal_cmd` | Runs `/bin/bash --noprofile --norc -c` in `workspace` with the sandbox's environment. `block_until_ms` defaults to 30000, at most 300000. A command still running then becomes a background task whose id is the tool-call id. An unwaited `&` is refused unless `block_until_ms` is 0. The reply shows 20,000 bytes of output. The log stops growing at 16 MiB while the command keeps running. A command runs at most 36,000 s. |
+| `get_terminal_command_output` | 1 to 20 task ids. `timeout_ms` at most 300000, and 0 returns a snapshot. Up to 40,000 bytes per task. |
+| `kill_terminal_command` | Stops one task's process group and waits up to 5 s for it to exit. |
+| `read_file` | At most 1000 lines and about 100,000 bytes per call. A partial window ends with a note naming the next `offset`. Reading stops after 30 s. A PDF needs `format: "text"` and Poppler and may be at most 50 MiB. A PDF over 10 pages needs `pages`, at most 20 per call. |
+| `search_replace` | `old_string` must match exactly once, overlapping matches included, unless `replace_all`. Files up to 50 MiB. Untouched bytes and line endings are kept. |
+| `list_dir` | Hides ignored and dot files. Scans up to 100,000 entries and returns at most 10,000 bytes. |
+| `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. Lines are cut at 1000 columns, files over 5 MiB are skipped, and a search stops after 20 s. |
+| `todo_write` | `merge` defaults to `true` and updates by `id`. The list survives compaction. |
+
+Paths may be absolute and are not confined to `workspace`. `~` is the sandbox's `$HOME`.
+
+## Build and test
+
+`rust-toolchain.toml` pins Rust 1.94.0 with rustfmt and clippy. Install ripgrep. The tools find `rg` on `PATH`, or at the absolute path in `RG_BIN_PATH`.
 
 ```sh
 cargo build --release --locked
@@ -14,61 +96,21 @@ cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-`rg` must be on PATH, or `RG_BIN_PATH` must name its absolute location. PDF text extraction additionally needs `pdfinfo` and `pdftotext`, usually supplied by Poppler. Image output, rendered documents and PPTX extraction are not supported.
+The tests run on Linux and macOS. Packaging and the Harbor integration check need Linux. On macOS, run the Harbor check against Docker. [checks/README.txt](checks/README.txt) lists every check, and [harbor/README.md](harbor/README.md) covers the runtime bundle and Harbor jobs.
 
-See [Harbor setup](harbor/README.md) for a Linux runtime bundle and the pinned Terminal-Bench configuration. [The integration check](checks/README.txt) tests all eight tools, compaction and timeout cleanup without paid inference.
+## What the sandbox must provide
 
-## One attempt
+- Linux on the bundle's CPU architecture.
+- `/bin/bash` and `setsid`.
+- `rg`, which the Harbor bundle carries.
+- Network access to `base_url`.
+- `pdfinfo` and `pdftotext` from Poppler, only for reading PDFs.
 
-The executable reads one JSON object from stdin and writes one JSON result to stdout. Diagnostics go to stderr. The workspace must exist; the session directory must be new and its parent must exist.
+## Known limits
 
-```json
-{
-  "base_url": "https://openrouter.ai/api/v1",
-  "model": "x-ai/grok-4.7",
-  "api_key_env": "OPENROUTER_API_KEY",
-  "user_query": "Fix the failing tests in this repository.",
-  "workspace": "/workspace/task",
-  "session_dir": "/attempts/unique-attempt",
-  "sampling_params": {"reasoning": {"effort": "high"}},
-  "max_turns": 100,
-  "max_response_tokens": 4096,
-  "deadline_secs": 600,
-  "compaction_threshold_tokens": 0,
-  "compaction_max_tokens": 2048
-}
-```
+- Code in the sandbox can read the key from the runner's process through `/proc`. Use a key with a spending cap, or an endpoint that needs none.
+- The file tools and commands can reach any path the sandbox user can.
+- Harbor's local Docker environment does not enforce a task's disk quota.
+- A model request or response over 16 MiB ends the attempt with exit 70.
 
-The system prompt is exactly:
-
-```text
-You are an autonomous coding agent. Your main goal is to complete the user's request denoted with the <user_query> tag.
-```
-
-The runner wraps the task once in `<user_query>` tags and sends the eight definitions from `assets/tools.json` as native function tools. The endpoint owns the model's chat template and tool parser. The runner preserves assistant JSON when replaying conversation history.
-
-`run_terminal_cmd` starts a fresh Bash shell in the task workspace. Its environment is explicit, with a private HOME and TMPDIR. A command that outlasts `block_until_ms` becomes a background task; use the output and kill tools to manage it. Shutdown terminates managed process groups. The launcher must still destroy the sandbox after crashes or forced termination.
-
-The file tools accept absolute paths and do not restrict access to the workspace. Both file tools and terminal commands expand `~` to the attempt's private home directory.
-
-`search_replace` refuses an ambiguous match and cannot overwrite a nonempty file with an empty `old_string`. It preserves untouched bytes, including line endings. Atomic replacement prevents partial files but does not lock out other processes.
-
-Todo state and background task metadata survive compaction and reset for each attempt.
-
-## Compaction and traces
-
-A positive `compaction_threshold_tokens` enables compaction. Zero disables it. The estimate uses endpoint token usage, new tool-result bytes and a response reserve. Set it below the model's context limit. A context overflow ends the attempt; the runner does not silently discard messages.
-
-Compaction makes one summary request through the same endpoint. A finished, nonempty summary replaces conversation history together with the original system prompt, task and current tool state. Earlier requests remain in `trace.jsonl`. Malformed summaries stop as `invalid_response`; endpoint failures stop as `error`. There are no automatic model retries.
-
-The trace records request and response JSON, tool results, summaries and the outcome. A training backend must supply token IDs, log probabilities and loss masks, associate them with a trusted reward, and update the model. This runner does not perform those steps.
-
-The result includes `status`, `final_answer`, `turns` and `compactions`, plus `error` on infrastructure failure. Harbor independently runs the verifier. The model's final answer does not set the reward.
-
-## Isolation and limits
-
-Run one attempt per disposable sandbox. Keep private grading material outside the task. The Harbor adapter passes the selected model credential into the runner's environment. The runner removes it before starting tools, but code inside the sandbox may still recover it from process memory or operating-system interfaces. Use a restricted evaluation credential or a reachable gateway with a limited token. Credential and spending limits belong to the provider or gateway.
-
-Each model request/response is capped at 16 MiB, each command log at 16 MiB, and the trace at 256 MiB. The launcher owns CPU, memory, disk and network limits. Harbor's selected environment provider must enforce those limits. The local Docker backend does not enforce per-task disk quotas.
-
-This project derives from Grok Build. [NOTICE](NOTICE) identifies the original source and retained code. The source tree contains one Rust package, the Harbor adapter, runtime packaging and their checks.
+This project derives from Grok Build. [NOTICE](NOTICE) names the source and the retained code.
