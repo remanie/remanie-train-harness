@@ -221,7 +221,7 @@ impl FileTools {
                     bytes.len() as u64 <= MAX_DOCUMENT_BYTES,
                     "file exceeds the 50 MB edit limit"
                 );
-                existing = Some(metadata);
+                existing = Some((file.into_std().await, metadata));
                 Some(String::from_utf8(bytes).context("cannot edit a non-UTF-8 file")?)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -318,7 +318,7 @@ impl FileTools {
             text.push_str(&old[copied..]);
             (text, false, count)
         };
-        atomic_write(&path, existing.as_ref(), &text)?;
+        write_file(&path, existing.as_ref(), &text)?;
         Ok(format!(
             "The file {} has been {}.{}",
             input.file_path,
@@ -512,40 +512,43 @@ impl FileTools {
     }
 }
 
-fn atomic_write(path: &Path, expected: Option<&std::fs::Metadata>, text: &str) -> Result<()> {
+// In place rather than rename, so the inode, owner, mode and hardlinks survive; a crash
+// mid-write can leave the file partly written.
+fn write_file(
+    path: &Path,
+    existing: Option<&(std::fs::File, std::fs::Metadata)>,
+    text: &str,
+) -> Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
 
-    let parent = path.parent().context("file path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(text.as_bytes())?;
-    temporary.flush()?;
-    if let Some(expected) = expected {
-        let current =
-            std::fs::symlink_metadata(path).context("file changed during edit; read_file again")?;
-        let fingerprint = |metadata: &std::fs::Metadata| {
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.len(),
-                metadata.mtime(),
-                metadata.mtime_nsec(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-            )
-        };
-        ensure!(
-            current.is_file() && fingerprint(&current) == fingerprint(expected),
-            "file changed during edit; read_file again"
-        );
-        temporary
-            .as_file()
-            .set_permissions(expected.permissions())?;
-        temporary.persist(path)?;
-    } else {
-        temporary.persist_noclobber(path)?;
-    }
+    let Some((file, expected)) = existing else {
+        std::fs::create_dir_all(path.parent().context("file path has no parent")?)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        return Ok(file.write_all(text.as_bytes())?);
+    };
+    let current =
+        std::fs::symlink_metadata(path).context("file changed during edit; read_file again")?;
+    let fingerprint = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    ensure!(
+        current.is_file() && fingerprint(&current) == fingerprint(expected),
+        "file changed during edit; read_file again"
+    );
+    file.write_all_at(text.as_bytes(), 0)?;
+    file.set_len(text.len() as u64)?;
     Ok(())
 }
 

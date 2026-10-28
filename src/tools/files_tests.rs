@@ -413,32 +413,80 @@ async fn oversized_replacements_fail_before_expanding_or_changing_the_file() {
 }
 
 #[test]
-fn atomic_edit_preserves_mode_and_rejects_changes_without_leaving_temporary_files() {
-    use std::os::unix::fs::PermissionsExt;
+fn in_place_writes_refuse_concurrent_changes_and_never_clobber() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file");
     std::fs::write(&path, "original").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let original = std::fs::metadata(&path).unwrap();
+    let open = || {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let metadata = file.metadata().unwrap();
+        (file, metadata)
+    };
+    let stale = open();
     std::fs::write(&path, "concurrent change").unwrap();
     assert!(
-        atomic_write(&path, Some(&original), "discarded")
+        write_file(&path, Some(&stale), "discarded")
             .unwrap_err()
             .to_string()
             .contains("file changed")
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "concurrent change");
+    write_file(&path, Some(&open()), "short").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "short");
+    assert!(write_file(&path, None, "must not overwrite").is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "short");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    let current = std::fs::metadata(&path).unwrap();
-    atomic_write(&path, Some(&current), "replacement").unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+}
+
+#[tokio::test]
+async fn edits_keep_inode_owner_and_mode_and_new_files_follow_the_umask() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let path = dir.path().join("linked.txt");
+    std::fs::write(&path, "v1").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::hard_link(&path, dir.path().join("alias.txt")).unwrap();
+    if unsafe { libc::geteuid() } == 0 {
+        std::os::unix::fs::chown(&path, Some(65534), Some(65534)).unwrap();
+    }
+    let before = std::fs::metadata(&path).unwrap();
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"linked.txt","old_string":"v1","new_string":"v2"}),
+        )
+        .await
+        .unwrap();
+    let after = std::fs::metadata(&path).unwrap();
     assert_eq!(
-        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o755
+        std::fs::read_to_string(dir.path().join("alias.txt")).unwrap(),
+        "v2"
     );
-    assert!(atomic_write(&path, None, "must not overwrite").is_err());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(
+        (after.ino(), after.uid(), after.gid(), after.mode()),
+        (before.ino(), before.uid(), before.gid(), before.mode())
+    );
+    std::fs::write(dir.path().join("shell.html"), "x").unwrap();
+    tools
+        .call(
+            "search_replace",
+            &json!({"file_path":"tool.html","old_string":"","new_string":"x"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(dir.path().join("tool.html"))
+            .unwrap()
+            .mode(),
+        std::fs::metadata(dir.path().join("shell.html"))
+            .unwrap()
+            .mode()
+    );
 }
 
 #[tokio::test]
