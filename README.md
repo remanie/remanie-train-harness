@@ -47,7 +47,7 @@ The runner estimates a turn request's prompt as the endpoint's last `usage.total
 | `cancelled` | 0 | The runner received SIGTERM or SIGINT. |
 | `infrastructure` | 70 | `config`, `endpoint_unavailable`, `endpoint_status`, `connection_lost`, `endpoint_response`, `tool_runtime`, or `internal`. |
 
-Before the first reply, a request that does not fit ends as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` ends as `infrastructure` with cause `endpoint_response`, and the runner does not resend it.
+Before the first reply, a request that does not fit ends the attempt as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` ends the attempt as `infrastructure` with cause `endpoint_response`, and the runner does not resend the request.
 
 The runner resends a request with identical bytes only when the endpoint did not process it. It keeps resending while the next wait, at most 30 s, ends before `deadline_secs`.
 
@@ -57,7 +57,7 @@ On exit 0 background tasks keep running so the verifier can reach them. On exit 
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `harbor/remanie_trace.py` reads it and rebuilds the body of any request from the `header` and a message range.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `harbor/remanie_trace.py` reads the file and rebuilds the body of any request from the `header` and a message range.
 
 | `event` | Written | Fields |
 |---|---|---|
