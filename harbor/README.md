@@ -1,6 +1,6 @@
 # Harbor adapter
 
-`remanie_agent.py` defines `RemanieAgent`, a Harbor installed agent with import path `remanie_agent:RemanieAgent`. It installs the runtime bundle in the task sandbox, runs one attempt, and turns the runner's exit code into Harbor's grade-or-skip decision. `requirements.txt` pins Harbor 0.25.0.
+`remanie_agent.py` defines `RemanieAgent`, a Harbor installed agent with import path `remanie_agent:RemanieAgent`. It installs the runtime bundle in the task sandbox, runs one attempt, and uses the runner's exit code to tell Harbor whether to run the verifier. `requirements.txt` pins Harbor 0.25.0.
 
 ## Build the bundle
 
@@ -11,7 +11,7 @@ cargo build --release --locked
 python3 package_linux.py target/release/remanie-train-harness runtime
 ```
 
-The output directory must be new. It holds the runner, `rg`, their Linux loader and shared libraries, the license notices, and `manifest.json` with the architecture and each file's sha256.
+The output directory must be new. It holds the runner, `rg`, their Linux loader and shared libraries, the license notices, `contract.json`, and `manifest.json` with the architecture and each file's sha256.
 
 ## Job settings
 
@@ -23,7 +23,14 @@ The output directory must be new. It holds the runner, `rg`, their Linux loader 
 | `kwargs.runtime_dir` | The bundle directory. |
 | other `kwargs` | Runner settings from [the input table](../README.md#input), such as `max_turns`, `deadline_secs`, `sampling_params`, and `compaction`. |
 
-Harbor supplies `model`, `base_url`, `api_key_env`, `user_query`, `workspace`, and `session_dir`, so `kwargs` must not set them. Before any sandbox starts, the adapter refuses the job when the runner settings fail the input schema in the bundle's `contract.json`, when the selected key has no value on the host, when the job sets a prompt template, or when the bundle lacks `remanie-train-harness`, `rg`, `manifest.json`, or `contract.json`. `terminal-bench-2.1-smoke.json` is a complete job.
+Harbor supplies `model`, `base_url`, `api_key_env`, `user_query`, `workspace`, and `session_dir`, so `kwargs` must not set them. Before any sandbox starts, the adapter refuses the job in these cases:
+
+- The runner settings fail the input schema in the bundle's `contract.json`.
+- The selected key has no value on the host.
+- The job sets a prompt template.
+- The bundle lacks `remanie-train-harness`, `rg`, `manifest.json`, or `contract.json`.
+
+`terminal-bench-2.1-smoke.json` is a complete job. `harbor/test_remanie_agent.py` checks every job file in the repository against `assets/contract.json`.
 
 ## Install and launch
 
@@ -36,7 +43,7 @@ Harbor supplies `model`, `base_url`, `api_key_env`, `user_query`, `workspace`, a
 - Exit 0. The adapter returns and Harbor runs the verifier.
 - Exit 70. The adapter raises `RemanieInfrastructureError` and Harbor skips the verifier.
 - Any other exit. The runner died. The adapter raises an error with the exit code and Harbor skips the verifier.
-- Harbor's agent timeout. The adapter sends TERM to the runner's process group, waits up to 5 s, sends KILL, and re-raises the cancellation. Harbor records `AgentTimeoutError` and still runs the verifier. If the adapter cannot confirm the stop, it raises an error instead and Harbor skips the verifier.
+- Harbor's agent timeout. The adapter sends TERM to the runner's process group and waits up to 5 s. If the runner exits 0 in that time, the adapter re-raises the cancellation, and Harbor records `AgentTimeoutError` and still runs the verifier. Otherwise the adapter sends KILL and raises an error, and Harbor skips the verifier.
 
 On every path the adapter sets `context.metadata["remanie"]` to the runner's `exit_code`, the bundle's `bundle_sha256`, and `result`, the parsed `result.json` or null when there is none. When `usage.complete` is true it also sets `n_input_tokens`, `n_output_tokens`, and `n_cache_tokens`.
 
@@ -50,7 +57,7 @@ Leave `compaction` unset under the v1 linear session server. A compaction opens 
 
 ## Read the trace
 
-`remanie_trace.py` uses only the standard library, so a trainer can copy the one file.
+`remanie_trace.py` uses only the standard library and needs Python 3.10 or newer, so a trainer can copy the one file.
 
 ```python
 import remanie_trace
@@ -61,6 +68,8 @@ body = trace.request_body(trace.calls[0])  # the chat-completions body of the fi
 trace.usage()                            # token totals, with complete False when any are missing
 ```
 
+`request_body()` equals the sent body as JSON, not byte for byte. Python's `json.dumps` writes the float `0.00001` as `1e-05`, for example, so do not compare hashes of rebuilt bodies.
+
 ## Run the smoke job
 
 ```sh
@@ -70,4 +79,4 @@ export PYTHONPATH="$PWD/harbor"
 .venv/bin/harbor run --config harbor/terminal-bench-2.1-smoke.json
 ```
 
-Keep `OPENROUTER_API_KEY` in the host environment. Add `--dry-run --skip-credential-checks` to check the job without model calls. The job runs one attempt each of three Terminal-Bench 2.1 tasks, one at a time with no retries, from the dataset pinned by digest in the job file. It checks the integration and is not a benchmark score.
+Keep `OPENROUTER_API_KEY` in the host environment. Add `--dry-run --skip-credential-checks` to check the job without model calls. The job runs one attempt each of three Terminal-Bench 2.1 tasks, one at a time with no retries, from the dataset pinned by digest in the job file. Its reward checks the integration and is not a benchmark score.
