@@ -73,7 +73,7 @@ impl ToolOutput {
 }
 
 impl ToolSession {
-    pub async fn new(cwd: PathBuf, log_dir: PathBuf) -> Result<Self> {
+    pub async fn new(cwd: PathBuf, log_root: PathBuf) -> Result<Self> {
         let catalog: BTreeMap<String, Value> =
             serde_json::from_str(include_str!("../assets/tools.json"))?;
         ensure!(
@@ -90,7 +90,7 @@ impl ToolSession {
             })
             .collect::<Result<_>>()?;
         Ok(Self {
-            terminal: TerminalSession::new(cwd.clone(), log_dir).await?,
+            terminal: TerminalSession::new(cwd.clone(), log_root).await?,
             files: FileTools::new(
                 cwd,
                 std::env::var_os("HOME").map(PathBuf::from),

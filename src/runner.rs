@@ -88,12 +88,15 @@ async fn attempt(
         Trace::create(&input.session_dir, MAX_TRACE_BYTES)
             .map_err(|error| internal(format!("create trace.jsonl: {error}")))?,
     );
-    let tools = ToolSession::new(input.workspace.clone(), input.session_dir.join("terminal"))
-        .await
-        .map_err(|error| Cause::ToolRuntime {
-            tool: "session".into(),
-            detail: format!("{error:#}"),
-        })?;
+    let tools = ToolSession::new(
+        input.workspace.clone(),
+        std::env::temp_dir().join("remanie-terminal"),
+    )
+    .await
+    .map_err(|error| Cause::ToolRuntime {
+        tool: "session".into(),
+        detail: format!("{error:#}"),
+    })?;
     let definitions = tools.definitions();
     trace.header(&raw, &definitions);
     let deadline = Instant::now() + Duration::from_secs(input.deadline_secs);

@@ -962,6 +962,34 @@ async fn gradable_outcomes_leave_background_processes_running() {
 }
 
 #[tokio::test]
+async fn command_logs_stay_in_the_sandbox_temp_dir_outside_the_session_dir() {
+    let f = fixture(vec![
+        tool_reply(
+            vec![call(
+                "server",
+                "run_terminal_cmd",
+                json!({
+                    "command": "exec sleep 60", "description": "start a server", "block_until_ms": 0
+                }),
+            )],
+            10,
+        ),
+        final_reply(),
+    ])
+    .await;
+    let result = f.run().await;
+    let left = &result["background_tasks_left_running"][0];
+    unsafe { libc::kill(left["pid"].as_i64().unwrap() as i32, libc::SIGKILL) };
+    let log = PathBuf::from(left["output_file"].as_str().unwrap());
+    assert!(
+        log.starts_with(std::env::temp_dir().join("remanie-terminal")),
+        "{log:?}"
+    );
+    assert!(log.exists());
+    assert!(!f.session().join("terminal").exists());
+}
+
+#[tokio::test]
 async fn every_request_is_rebuilt_byte_for_byte_from_the_trace() {
     let todo = call(
         "todo",

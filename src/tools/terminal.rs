@@ -88,10 +88,8 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub async fn new(cwd: PathBuf, log_dir: PathBuf) -> Result<Self> {
-        tokio::fs::create_dir_all(&log_dir)
-            .await
-            .context("create command log directory")?;
+    pub async fn new(cwd: PathBuf, log_root: PathBuf) -> Result<Self> {
+        let log_dir = fresh_dir(&log_root).context("create command log directory")?;
         #[cfg(target_os = "linux")]
         adopt_orphans().context("become the subreaper of command descendants")?;
         Ok(Self {
@@ -463,6 +461,18 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         if let Some(task) = &self.0 {
             task.stop("cancelled", false);
+        }
+    }
+}
+
+fn fresh_dir(root: &Path) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let mut n = 0;
+    loop {
+        let dir = root.join(format!("{}-{n}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            created => return created.map(|()| dir),
         }
     }
 }
