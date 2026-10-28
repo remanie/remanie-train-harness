@@ -11,8 +11,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use files::FileTools;
-pub use terminal::TaskId;
 use terminal::TerminalSession;
+pub use terminal::{LeftRunning, TaskId};
 
 const TOOL_NAMES: [&str; 8] = [
     "run_terminal_cmd",
@@ -170,6 +170,10 @@ impl ToolSession {
             "todos": self.files.snapshot().await,
             "background_tasks": self.terminal.background_tasks()
         })
+    }
+
+    pub fn detach(self) -> Vec<LeftRunning> {
+        self.terminal.detach()
     }
 
     pub async fn kill_all(self) {

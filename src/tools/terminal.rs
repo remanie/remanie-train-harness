@@ -1,16 +1,17 @@
 // Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
-use std::collections::BTreeMap;
-use std::io;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
@@ -18,9 +19,10 @@ use super::internal;
 
 const PREVIEW_BYTES: usize = 20_000;
 const POLL_BYTES: usize = 40_000;
-const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const TRUNCATED: &str = "\n[... output truncated ...]\n";
 const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
     ("TERM", "dumb"),
     ("NO_COLOR", "1"),
@@ -36,6 +38,10 @@ const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GPG_TTY", ""),
 ];
+
+// Children spawned here and not yet reaped by tokio. The Linux orphan reaper and sweep must
+// leave them alone, including those of other sessions in the same process.
+static SPAWNED: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -64,6 +70,14 @@ impl TaskId {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct LeftRunning {
+    pub task_id: TaskId,
+    pub pid: i32,
+    pub command: String,
+    pub output_file: PathBuf,
+}
+
 struct State {
     next_id: u32,
     tasks: BTreeMap<TaskId, Arc<Task>>,
@@ -80,6 +94,8 @@ impl TerminalSession {
         tokio::fs::create_dir_all(&log_dir)
             .await
             .context("create command log directory")?;
+        #[cfg(target_os = "linux")]
+        adopt_orphans().context("become the subreaper of command descendants")?;
         Ok(Self {
             cwd,
             log_dir,
@@ -130,34 +146,41 @@ impl TerminalSession {
             TaskId(state.next_id)
         };
         let log_path = self.log_dir.join(format!("{id}.log"));
-        let log = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&log_path)
-            .await
+        let log = create_log(&self.log_dir, &log_path)
             .map_err(|error| internal(format!("create command output log: {error}")))?;
-        let mut cmd = clean_command(Path::new("/bin/bash"), &self.cwd);
-        cmd.args(["--noprofile", "--norc", "-c", command])
-            .envs(NON_INTERACTIVE_ENV);
-        let task = {
-            let mut state = lock(&self.state);
-            let task = spawn(
-                cmd,
-                TaskState::new(
-                    id,
-                    command,
-                    description,
-                    &self.cwd,
-                    Some(log_path),
-                    POLL_BYTES,
-                ),
-                Some(log),
-                MAX_LOG_BYTES,
-                MAX_RUNTIME,
-            )?;
-            state.tasks.insert(id, task.clone());
-            task
-        };
+        let mut shell = Command::new("/bin/bash");
+        shell
+            .args(["--noprofile", "--norc", "-c", command])
+            .current_dir(&self.cwd)
+            .envs(NON_INTERACTIVE_ENV)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(internal)?)
+            .stderr(log.try_clone().map_err(internal)?);
+        // SAFETY: setsid is async-signal-safe and only runs in the child before exec.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let (child, pid) = spawn_tracked(&mut shell).context("spawn command")?;
+        let task = Arc::new(Task {
+            id,
+            pid,
+            command: command.into(),
+            description: (!description.trim().is_empty()).then(|| description.into()),
+            cwd: self.cwd.clone(),
+            log: log_path,
+            started: SystemTime::now(),
+            clock: Instant::now(),
+            state: Mutex::default(),
+            finished: watch::channel(false).0,
+        });
+        lock(&self.state).tasks.insert(id, task.clone());
+        tokio::spawn(drive(child, task.clone(), log));
         let mut abort = AbortOnDrop(Some(task.clone()));
         let finished = block > 0
             && tokio::time::timeout_at(started + Duration::from_millis(block), task.wait())
@@ -166,16 +189,14 @@ impl TerminalSession {
         abort.0 = None;
         if finished {
             lock(&self.state).tasks.remove(&id);
-            let state = lock(&task.state);
-            state.check_error()?;
-            Ok((state.foreground(), id))
+            task.check_error()?;
+            Ok((task.foreground()?, id))
         } else {
-            let mut state = lock(&task.state);
-            state.background = true;
+            lock(&task.state).background = true;
             Ok((
                 format!(
                     "<task-id>{id}</task-id>\n<task-type>bash</task-type>\n<output-file>{}</output-file>\n<status>running</status>\n<summary>Background task {id} started</summary>\nUse get_terminal_command_output with task_ids=[\"{id}\"] when you need the output.",
-                    state.output_file.as_ref().unwrap().display()
+                    task.log.display()
                 ),
                 id,
             ))
@@ -219,10 +240,9 @@ impl TerminalSession {
                 completed += 1;
                 continue;
             };
-            let state = lock(&task.state);
-            state.check_error()?;
-            completed += usize::from(state.completed);
-            output.push_str(&state.poll(multiple));
+            task.check_error()?;
+            completed += usize::from(lock(&task.state).completed);
+            output.push_str(&task.poll(multiple)?);
             output.push('\n');
         }
         if multiple {
@@ -239,25 +259,37 @@ impl TerminalSession {
         Value::Array(state.tasks.values().filter_map(|task| {
             let state = lock(&task.state);
             state.background.then(|| json!({
-                "task_id": state.id, "command": state.command, "cwd": state.cwd,
-                "description": state.description, "start_time": state.started,
-                "end_time": state.ended, "output": "", "output_file": state.output_file,
-                "output_total_bytes": state.total, "truncated": state.total > state.output.len(),
-                "exit_code": state.exit_code, "signal": state.signal, "completed": state.completed,
-                "kind": "bash", "is_backgrounded": true, "explicitly_killed": state.explicitly_killed,
+                "task_id": task.id, "command": task.command, "cwd": task.cwd,
+                "description": task.description, "start_time": task.started,
+                "end_time": state.ended, "output_file": task.log,
+                "output_total_bytes": std::fs::metadata(&task.log).map_or(0, |metadata| metadata.len()),
+                "truncated": state.truncated, "exit_code": state.exit_code, "signal": state.signal,
+                "completed": state.completed, "kind": "bash", "is_backgrounded": true,
+                "explicitly_killed": state.explicitly_killed,
             }))
         }).collect())
     }
 
-    pub async fn kill_all(self) {
-        let tasks = self.close();
-        let deadline = tokio::time::Instant::now() + REAP_TIMEOUT;
-        for task in tasks {
-            let _ = tokio::time::timeout_at(deadline, task.wait()).await;
-        }
+    /// Leaves every background command running with its log; kills nothing.
+    pub fn detach(self) -> Vec<LeftRunning> {
+        lock(&self.state)
+            .tasks
+            .values()
+            .filter_map(|task| {
+                let state = lock(&task.state);
+                (state.background && !state.completed && state.signal.is_none()).then(|| {
+                    LeftRunning {
+                        task_id: task.id,
+                        pid: task.pid,
+                        command: task.command.clone(),
+                        output_file: task.log.clone(),
+                    }
+                })
+            })
+            .collect()
     }
 
-    fn close(&self) -> Vec<Arc<Task>> {
+    pub async fn kill_all(self) {
         let tasks = lock(&self.state)
             .tasks
             .values()
@@ -266,125 +298,42 @@ impl TerminalSession {
         for task in &tasks {
             task.stop("cancelled", false);
         }
-        tasks
-    }
-}
-
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        self.close();
+        let deadline = tokio::time::Instant::now() + REAP_TIMEOUT;
+        for task in &tasks {
+            let _ = tokio::time::timeout_at(deadline, task.wait()).await;
+        }
+        #[cfg(target_os = "linux")]
+        sweep_orphans().await;
     }
 }
 
 struct Task {
+    id: TaskId,
+    pid: libc::pid_t,
+    command: String,
+    description: Option<String>,
+    cwd: PathBuf,
+    log: PathBuf,
+    started: SystemTime,
+    clock: Instant,
     state: Mutex<TaskState>,
     finished: watch::Sender<bool>,
 }
 
+#[derive(Default)]
 struct TaskState {
-    id: TaskId,
-    command: String,
-    description: Option<String>,
-    cwd: PathBuf,
-    started: SystemTime,
-    clock: Instant,
-    ended: Option<SystemTime>,
-    output_file: Option<PathBuf>,
-    output: Vec<u8>,
-    output_limit: usize,
-    total: usize,
-    pid: Option<libc::pid_t>,
-    stop_deadline: Option<Instant>,
-    completed: bool,
     background: bool,
+    completed: bool,
     explicitly_killed: bool,
+    truncated: bool,
+    ended: Option<SystemTime>,
+    stop_deadline: Option<Instant>,
     exit_code: Option<i32>,
     signal: Option<String>,
     error: Option<String>,
 }
 
 impl TaskState {
-    fn new(
-        id: TaskId,
-        command: &str,
-        description: &str,
-        cwd: &Path,
-        output_file: Option<PathBuf>,
-        output_limit: usize,
-    ) -> Self {
-        Self {
-            id,
-            command: command.into(),
-            description: (!description.trim().is_empty()).then(|| description.into()),
-            cwd: cwd.into(),
-            started: SystemTime::now(),
-            clock: Instant::now(),
-            ended: None,
-            output_file,
-            output: Vec::new(),
-            output_limit,
-            total: 0,
-            pid: None,
-            stop_deadline: None,
-            completed: false,
-            background: false,
-            explicitly_killed: false,
-            exit_code: None,
-            signal: None,
-            error: None,
-        }
-    }
-
-    fn check_error(&self) -> Result<()> {
-        if let Some(error) = &self.error {
-            return Err(internal(format!("terminal command failed: {error}")));
-        }
-        Ok(())
-    }
-
-    fn duration(&self) -> f64 {
-        self.ended
-            .and_then(|end| end.duration_since(self.started).ok())
-            .unwrap_or_else(|| self.clock.elapsed())
-            .as_secs_f64()
-    }
-
-    fn text(&self, limit: usize) -> String {
-        let output = if self.output.len() > limit {
-            let half = limit / 2;
-            [
-                self.output[..half].as_ref(),
-                b"\n[... output truncated ...]\n".as_slice(),
-                &self.output[self.output.len() - half..],
-            ]
-            .concat()
-        } else {
-            self.output.clone()
-        };
-        strip_ansi(&String::from_utf8_lossy(&output))
-    }
-
-    fn foreground(&self) -> String {
-        let code = self
-            .signal
-            .as_ref()
-            .map(|s| format!("killed ({s})"))
-            .unwrap_or_else(|| self.exit_code.unwrap_or(-1).to_string());
-        let note = if self.total > PREVIEW_BYTES {
-            format!(
-                " [truncated - full output at: {}]",
-                self.output_file.as_ref().unwrap().display()
-            )
-        } else {
-            String::new()
-        };
-        format!(
-            "Exit code: {code}{note}\n\nCommand output:\n\n```\n{}\n```\n\nCommand completed.\n\nThe previous shell command ended, so on the next invocation of this tool, you will be using a new shell session.\n\nOn the next terminal tool call, the directory of the shell will be {}.",
-            self.text(PREVIEW_BYTES),
-            self.cwd.display()
-        )
-    }
-
     fn status(&self) -> &str {
         if !self.completed {
             "running"
@@ -398,77 +347,93 @@ impl TaskState {
             "failed"
         }
     }
+}
 
-    fn poll(&self, multiple: bool) -> String {
+impl Task {
+    fn check_error(&self) -> Result<()> {
+        if let Some(error) = &lock(&self.state).error {
+            return Err(internal(format!("terminal command failed: {error}")));
+        }
+        Ok(())
+    }
+
+    fn duration(&self, state: &TaskState) -> f64 {
+        state
+            .ended
+            .and_then(|end| end.duration_since(self.started).ok())
+            .unwrap_or_else(|| self.clock.elapsed())
+            .as_secs_f64()
+    }
+
+    fn foreground(&self) -> Result<String> {
+        let (text, total) = read_log(&self.log, PREVIEW_BYTES).context("read command output")?;
+        let state = lock(&self.state);
+        let code = state
+            .signal
+            .as_ref()
+            .map(|s| format!("killed ({s})"))
+            .unwrap_or_else(|| state.exit_code.unwrap_or(-1).to_string());
+        let note = if total > PREVIEW_BYTES as u64 {
+            format!(" [truncated - full output at: {}]", self.log.display())
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "Exit code: {code}{note}\n\nCommand output:\n\n```\n{text}\n```\n\nCommand completed.\n\nThe previous shell command ended, so on the next invocation of this tool, you will be using a new shell session.\n\nOn the next terminal tool call, the directory of the shell will be {}.",
+            self.cwd.display()
+        ))
+    }
+
+    fn poll(&self, multiple: bool) -> Result<String> {
+        let (output, total) = read_log(&self.log, POLL_BYTES).context("read command output")?;
+        let state = lock(&self.state);
         let mut text = if multiple {
             format!(
                 "--- Task {} [{}] ---\nCommand: {}\nDuration: {:.2}s",
                 self.id,
-                self.status(),
+                state.status(),
                 self.command,
-                self.duration()
+                self.duration(&state)
             )
         } else {
             format!(
                 "=== Task {} ===\nCommand: {}\nStatus: {}\nDuration: {:.2}s",
                 self.id,
                 self.command,
-                self.status(),
-                self.duration()
+                state.status(),
+                self.duration(&state)
             )
         };
-        if let Some(code) = self.exit_code {
+        if let Some(code) = state.exit_code {
             text.push_str(&format!("\nExit Code: {code}"));
         }
-        if let Some(path) = &self.output_file {
-            text.push_str(&format!("\nOutput File: {}", path.display()));
-        }
+        text.push_str(&format!("\nOutput File: {}", self.log.display()));
         text.push_str("\n\n=== Output ===\n");
-        text.push_str(if self.output.is_empty() {
-            if self.completed {
+        if output.is_empty() {
+            text.push_str(if state.completed {
                 "(no output)"
             } else {
                 "(no output yet)"
-            }
-        } else {
-            ""
-        });
-        text.push_str(&self.text(POLL_BYTES));
-        if self.total > self.output.len() {
+            });
+        }
+        text.push_str(&output);
+        if total > POLL_BYTES as u64 || state.truncated {
             text.push_str("\n[truncated - use read_file on output_file for full content]");
         }
-        text
+        Ok(text)
     }
 
-    fn append(&mut self, bytes: &[u8]) {
-        self.total = self.total.saturating_add(bytes.len());
-        if self.output_file.is_none() {
-            let keep = bytes
-                .len()
-                .min(self.output_limit.saturating_sub(self.output.len()));
-            self.output.extend_from_slice(&bytes[..keep]);
-        } else {
-            self.output.extend_from_slice(bytes);
-            if self.output.len() > self.output_limit {
-                let half = self.output_limit / 2;
-                self.output.drain(half..self.output.len() - half);
-            }
-        }
-    }
-}
-
-impl Task {
     fn stop(&self, reason: &str, graceful: bool) -> bool {
         let mut state = lock(&self.state);
-        let Some(pid) = state.pid else {
+        if state.completed {
             return false;
-        };
+        }
         state.explicitly_killed |= reason == "cancelled";
         if state.signal.is_none() {
             state.signal = Some(reason.into());
         }
-        signal_group(
-            pid,
+        signal_session(
+            self.pid,
             if graceful {
                 libc::SIGTERM
             } else {
@@ -505,30 +470,311 @@ impl Drop for AbortOnDrop {
     }
 }
 
-fn clean_command(program: &Path, cwd: &Path) -> Command {
+fn create_log(dir: &Path, path: &Path) -> io::Result<File> {
+    std::fs::create_dir_all(dir)?;
+    File::options()
+        .read(true)
+        .append(true)
+        .create_new(true)
+        .open(path)
+}
+
+fn read_log(path: &Path, limit: usize) -> io::Result<(String, u64)> {
+    let mut file = File::open(path)?;
+    let total = file.metadata()?.len();
+    let mut bytes = Vec::new();
+    if total <= limit as u64 {
+        file.take(limit as u64).read_to_end(&mut bytes)?;
+    } else {
+        let half = limit / 2;
+        (&mut file).take(half as u64).read_to_end(&mut bytes)?;
+        bytes.extend_from_slice(TRUNCATED.as_bytes());
+        file.seek(SeekFrom::End(-(half as i64)))?;
+        file.take(half as u64).read_to_end(&mut bytes)?;
+    }
+    Ok((strip_ansi(&String::from_utf8_lossy(&bytes)), total))
+}
+
+// The command appends to the log itself, so the cap cannot hold its output back. Past the cap
+// the log keeps its first half, a marker, and its latest quarter, copied down in place until the
+// length stops changing; only an append between that last check and the truncation is lost.
+fn cap_log(log: &File, path: &Path, kept: &mut Option<u64>) -> io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let mut end = log.metadata()?.len();
+    if end <= MAX_LOG_BYTES {
+        return Ok(false);
+    }
+    // Positional writes need a descriptor without O_APPEND, which Linux applies to pwrite too.
+    let writer = File::options().write(true).open(path)?;
+    let mut to = match *kept {
+        Some(head) => head,
+        None => {
+            writer.write_all_at(TRUNCATED.as_bytes(), MAX_LOG_BYTES / 2)?;
+            MAX_LOG_BYTES / 2 + TRUNCATED.len() as u64
+        }
+    };
+    *kept = Some(to);
+    let mut from = end - MAX_LOG_BYTES / 4;
+    for _ in 0..100 {
+        let mut chunk = vec![0; (end - from) as usize];
+        log.read_exact_at(&mut chunk, from)?;
+        writer.write_all_at(&chunk, to)?;
+        to += chunk.len() as u64;
+        from = end;
+        end = log.metadata()?.len();
+        if end == from {
+            break;
+        }
+    }
+    writer.set_len(to)?;
+    Ok(true)
+}
+
+fn spawn_tracked(command: &mut Command) -> io::Result<(Child, libc::pid_t)> {
+    let mut spawned = lock(&SPAWNED);
+    let child = command.spawn()?;
+    let pid = child.id().expect("an unwaited child has a pid") as libc::pid_t;
+    spawned.insert(pid);
+    Ok((child, pid))
+}
+
+fn signal_session(session: libc::pid_t, signal: libc::c_int) {
+    for pid in processes() {
+        if unsafe { libc::getsid(pid) } == session {
+            unsafe { libc::kill(pid, signal) };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn processes() -> Vec<libc::pid_t> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn processes() -> Vec<libc::pid_t> {
+    let mut pids: Vec<libc::pid_t> = vec![0; 4096];
+    loop {
+        let size = (pids.len() * size_of::<libc::pid_t>()) as libc::c_int;
+        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
+        let Ok(count) = usize::try_from(count) else {
+            return Vec::new();
+        };
+        if count < pids.len() {
+            pids.truncate(count);
+            return pids;
+        }
+        pids.resize(pids.len() * 2, 0);
+    }
+}
+
+// The runner adopts descendants that leave their command's session (setsid, double fork), so
+// kill_all can still find them; it then has to reap them itself.
+#[cfg(target_os = "linux")]
+fn adopt_orphans() -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut children = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+    tokio::spawn(async move {
+        while children.recv().await.is_some() {
+            reap_orphans();
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_table() -> Vec<(libc::pid_t, libc::pid_t, bool)> {
+    processes()
+        .into_iter()
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let mut fields = stat.rsplit_once(") ")?.1.split(' ');
+            let zombie = fields.next()? == "Z";
+            Some((pid, fields.next()?.parse().ok()?, zombie))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn reap_orphans() {
+    let spawned = lock(&SPAWNED);
+    let runner = std::process::id() as libc::pid_t;
+    for (pid, parent, zombie) in process_table() {
+        if zombie && parent == runner && !spawned.contains(&pid) {
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn sweep_orphans() {
+    let runner = std::process::id() as libc::pid_t;
+    for _ in 0..100 {
+        let table = process_table();
+        let mut doomed = {
+            let spawned = lock(&SPAWNED);
+            table
+                .iter()
+                .filter(|(pid, parent, _)| *parent == runner && !spawned.contains(pid))
+                .map(|(pid, _, _)| *pid)
+                .collect::<Vec<_>>()
+        };
+        let mut next = 0;
+        while let Some(&parent) = doomed.get(next) {
+            doomed.extend(
+                table
+                    .iter()
+                    .filter(|(_, p, _)| *p == parent)
+                    .map(|(pid, _, _)| *pid),
+            );
+            next += 1;
+        }
+        doomed.retain(|pid| table.iter().any(|(p, _, zombie)| p == pid && !zombie));
+        if doomed.is_empty() {
+            break;
+        }
+        for pid in doomed {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        reap_orphans();
+    }
+    reap_orphans();
+}
+
+async fn drive(mut child: Child, task: Arc<Task>, log: File) {
+    let deadline = Instant::now() + MAX_RUNTIME;
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    let mut kept = None;
+    loop {
+        tick.tick().await;
+        if Instant::now() >= deadline {
+            task.stop("timeout", false);
+        }
+        let mut state = lock(&task.state);
+        if state.stop_deadline.is_some_and(|end| Instant::now() >= end) {
+            signal_session(task.pid, libc::SIGKILL);
+        }
+        let exit = match observe_exit(task.pid) {
+            Ok(false) => None,
+            Ok(true) => {
+                signal_session(task.pid, libc::SIGKILL);
+                child
+                    .try_wait()
+                    .map_err(|error| format!("reap command: {error}"))
+                    .transpose()
+            }
+            Err(error) => {
+                signal_session(task.pid, libc::SIGKILL);
+                Some(Err(format!("observe command exit: {error}")))
+            }
+        };
+        match cap_log(&log, &task.log, &mut kept) {
+            Ok(cut) => state.truncated |= cut,
+            Err(error) => state.error = Some(format!("truncate command output log: {error}")),
+        }
+        let Some(exit) = exit else {
+            continue;
+        };
+        match exit {
+            Ok(status) => {
+                state.exit_code = Some(status.code().unwrap_or(-1));
+                if state.signal.is_none() {
+                    state.signal = status.signal().map(|s| format!("signal {s}"));
+                }
+            }
+            Err(error) => state.error = Some(error),
+        }
+        state.completed = true;
+        state.ended = Some(SystemTime::now());
+        lock(&SPAWNED).remove(&task.pid);
+        drop(state);
+        task.finished.send_replace(true);
+        return;
+    }
+}
+
+pub async fn capture(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    max_bytes: usize,
+) -> io::Result<(i32, String)> {
     let mut command = Command::new(program);
     command
+        .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // SAFETY: setsid is async-signal-safe and only runs in the child before exec.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
+    let (mut child, pid) = spawn_tracked(&mut command)?;
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let (mut output, mut errors) = (Vec::new(), Vec::new());
+    let deadline = tokio::time::Instant::now() + timeout;
+    let drained = tokio::time::timeout_at(deadline, async {
+        tokio::try_join!(
+            drain(stdout, max_bytes, &mut output),
+            drain(stderr, max_bytes, &mut errors)
+        )
+    })
+    .await;
+    let mut timed_out = drained.is_err();
+    let mut truncated = matches!(drained, Ok(Ok((true, _) | (_, true))));
+    if let Ok(Err(error)) = drained {
+        return Err(error);
     }
-    command
+    if !timed_out
+        && tokio::time::timeout_at(deadline, child.wait())
+            .await
+            .is_err()
+    {
+        timed_out = true;
+    }
+    if timed_out {
+        let _ = child.start_kill();
+    }
+    let status = child.wait().await?;
+    lock(&SPAWNED).remove(&pid);
+    output.extend_from_slice(&errors);
+    truncated |= output.len() > max_bytes;
+    output.truncate(max_bytes);
+    let mut text = String::from_utf8_lossy(&output).into_owned();
+    if truncated {
+        text.push_str("\n[output truncated]");
+    }
+    if timed_out {
+        text.push_str("\n[command ended: timeout]");
+    }
+    Ok((status.code().unwrap_or(-1), text))
 }
 
-fn signal_group(pid: libc::pid_t, signal: libc::c_int) {
-    unsafe {
-        libc::kill(-pid, signal);
+async fn drain(
+    pipe: Option<impl AsyncRead + Unpin>,
+    keep: usize,
+    buffer: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let Some(mut pipe) = pipe else {
+        return Ok(false);
+    };
+    let mut chunk = [0; 8192];
+    let mut truncated = false;
+    loop {
+        let count = pipe.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(truncated);
+        }
+        let room = keep.saturating_sub(buffer.len()).min(count);
+        buffer.extend_from_slice(&chunk[..room]);
+        truncated |= room < count;
     }
 }
 
@@ -551,186 +797,6 @@ fn observe_exit(pid: libc::pid_t) -> io::Result<bool> {
         let child_pid = info.si_pid;
         Ok(child_pid != 0)
     }
-}
-
-fn spawn(
-    mut command: Command,
-    mut state: TaskState,
-    log: Option<tokio::fs::File>,
-    log_limit: usize,
-    timeout: Duration,
-) -> Result<Arc<Task>> {
-    let child = command.spawn().context("spawn command")?;
-    state.pid = child.id().map(|pid| pid as libc::pid_t);
-    let (finished, _) = watch::channel(false);
-    let task = Arc::new(Task {
-        state: Mutex::new(state),
-        finished,
-    });
-    tokio::spawn(drive(child, task.clone(), log, log_limit, timeout));
-    Ok(task)
-}
-
-async fn drive(
-    mut child: Child,
-    task: Arc<Task>,
-    mut log: Option<tokio::fs::File>,
-    log_limit: usize,
-    timeout: Duration,
-) {
-    let mut guard = AbortOnDrop(Some(task.clone()));
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let mut out_buffer = [0u8; 8192];
-    let mut err_buffer = [0u8; 8192];
-    let (mut out_done, mut err_done) = (false, false);
-    let mut written = 0;
-    let mut status: Option<ExitStatus> = None;
-    let mut drain_until = None;
-    let mut tick = tokio::time::interval(Duration::from_millis(10));
-    let deadline = Instant::now() + timeout;
-    loop {
-        let read = tokio::select! {
-            read = stdout.read(&mut out_buffer), if !out_done => Some((true, read)),
-            read = stderr.read(&mut err_buffer), if !err_done => Some((false, read)),
-            _ = tick.tick() => None,
-        };
-        if let Some((is_out, read)) = read {
-            match read {
-                Ok(0) => {
-                    if is_out {
-                        out_done = true
-                    } else {
-                        err_done = true
-                    }
-                }
-                Ok(count) => {
-                    let bytes = if is_out {
-                        &out_buffer[..count]
-                    } else {
-                        &err_buffer[..count]
-                    };
-                    lock(&task.state).append(bytes);
-                    if let Some(file) = &mut log {
-                        let keep = count.min(log_limit.saturating_sub(written));
-                        if let Err(error) = file.write_all(&bytes[..keep]).await {
-                            lock(&task.state).error = Some(format!("write output log: {error}"));
-                            task.stop("output_error", false);
-                        }
-                        written += keep;
-                        if keep < count {
-                            task.stop("output_limit", false);
-                        }
-                    }
-                }
-                Err(error) => {
-                    lock(&task.state).error = Some(format!("read command output: {error}"));
-                    if is_out {
-                        out_done = true
-                    } else {
-                        err_done = true
-                    };
-                    task.stop("output_error", false);
-                }
-            }
-        }
-        let now = Instant::now();
-        if status.is_none() {
-            if now >= deadline {
-                task.stop("timeout", false);
-            }
-            let mut state = lock(&task.state);
-            if let Some(pid) = state.pid {
-                if state.stop_deadline.is_some_and(|end| now >= end) {
-                    signal_group(pid, libc::SIGKILL);
-                }
-                match observe_exit(pid) {
-                    Ok(true) => {
-                        signal_group(pid, libc::SIGKILL);
-                        match child.try_wait() {
-                            Ok(Some(exit)) => {
-                                status = Some(exit);
-                                state.pid = None;
-                                drain_until = Some(now + Duration::from_secs(2));
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                state.pid = None;
-                                state.error = Some(format!("reap command: {error}"));
-                                break;
-                            }
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        state.error = Some(format!("observe command exit: {error}"));
-                        signal_group(pid, libc::SIGKILL);
-                        break;
-                    }
-                }
-            }
-        }
-        if status.is_some() && ((out_done && err_done) || drain_until.is_some_and(|end| now >= end))
-        {
-            break;
-        }
-    }
-    if status.is_none() {
-        task.stop("cancelled", false);
-        let mut state = lock(&task.state);
-        if let Ok(Some(exit)) = child.try_wait() {
-            status = Some(exit);
-        }
-        state.pid = None;
-    }
-    if let Some(file) = &mut log
-        && let Err(error) = file.flush().await
-    {
-        lock(&task.state).error = Some(format!("flush output log: {error}"));
-    }
-    {
-        let mut state = lock(&task.state);
-        state.completed = true;
-        state.ended = Some(SystemTime::now());
-        state.exit_code = status.as_ref().map(|s| s.code().unwrap_or(-1));
-        if state.signal.is_none() {
-            state.signal = status
-                .and_then(|s| s.signal())
-                .map(|s| format!("signal {s}"));
-        }
-    }
-    guard.0 = None;
-    task.finished.send_replace(true);
-}
-
-pub async fn capture(
-    program: &Path,
-    args: &[String],
-    cwd: &Path,
-    timeout: Duration,
-    max_bytes: usize,
-) -> Result<(i32, String)> {
-    let mut command = clean_command(program, cwd);
-    command.args(args);
-    let task = spawn(
-        command,
-        TaskState::new(TaskId(0), "", "", cwd, None, max_bytes),
-        None,
-        0,
-        timeout,
-    )?;
-    let _abort = AbortOnDrop(Some(task.clone()));
-    task.wait().await;
-    let state = lock(&task.state);
-    state.check_error()?;
-    let mut output = String::from_utf8_lossy(&state.output).into_owned();
-    if state.total > state.output.len() {
-        output.push_str("\n[output truncated]");
-    }
-    if let Some(reason) = &state.signal {
-        output.push_str(&format!("\n[command ended: {reason}]"));
-    }
-    Ok((state.exit_code.unwrap_or(-1), output))
 }
 
 fn strip_ansi(text: &str) -> String {

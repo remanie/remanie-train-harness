@@ -268,7 +268,7 @@ async fn todos_merge_and_reset_per_attempt() {
 }
 
 #[tokio::test]
-async fn background_wait_kill_and_shutdown() {
+async fn background_wait_kill_detach_and_kill_all() {
     let (dir, tools) = fixture().await;
     let waited = call(&tools, "run_terminal_cmd", json!({"command":"sleep 0.1; printf finished", "description":"test background waiting", "block_until_ms":1})).await;
     let id = waited.task_id.unwrap();
@@ -313,6 +313,9 @@ async fn background_wait_kill_and_shutdown() {
     assert_process_exited(&pid).await;
     let (dir, tools) = fixture().await;
     let pid = running_pid(&tools, &dir).await;
-    drop(tools);
-    assert_process_exited(&pid).await;
+    let left = tools.detach();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].pid.to_string(), pid);
+    assert_eq!(unsafe { libc::kill(left[0].pid, 0) }, 0);
+    unsafe { libc::kill(left[0].pid, libc::SIGKILL) };
 }

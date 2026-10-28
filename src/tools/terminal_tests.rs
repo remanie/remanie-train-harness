@@ -159,46 +159,47 @@ async fn commands_inherit_the_runner_environment() {
 }
 
 #[tokio::test]
-async fn bounded_logs() {
-    let (dir, terminal) = fixture().await;
-    let (output, _) = run(
+async fn previews_and_polls_mark_where_they_cut_the_log() {
+    let (_dir, terminal) = fixture().await;
+    let (preview, _) = run(
         &terminal,
         "head -c 200000 /dev/zero | tr '\\0' x; printf tail-marker",
         1000,
     )
     .await;
-    assert!(output.len() < PREVIEW_BYTES + 1500);
-    assert!(output.contains("tail-marker") && output.contains("truncated"));
+    assert!(preview.len() < PREVIEW_BYTES + 1500);
+    assert!(preview.contains("tail-marker") && preview.contains("truncated"));
+    let (_, id) = run(&terminal, "seq 1 100000", 0).await;
+    let polled = output(&terminal, &[id], 10_000).await;
+    let shown = polled.split_once("=== Output ===\n").unwrap().1;
+    let (head, tail) = shown.split_once(TRUNCATED).expect("no marker at the cut");
+    assert!(head.starts_with("1\n2\n3\n"), "{head}");
+    assert!(tail.contains("\n99999\n100000"), "{tail}");
+    terminal.kill_all().await;
+}
 
-    let log_path = dir.path().join("small.log");
-    let log = tokio::fs::File::create(&log_path).await.unwrap();
-    let mut command = clean_command(Path::new("/bin/bash"), dir.path());
-    command.args([
-        "--noprofile",
-        "--norc",
-        "-c",
-        "head -c 200000 /dev/zero; sleep 60",
-    ]);
-    let task = spawn(
-        command,
-        TaskState::new(
-            TaskId(1),
-            "",
-            "",
-            dir.path(),
-            Some(log_path.clone()),
-            POLL_BYTES,
-        ),
-        Some(log),
-        1000,
-        Duration::from_secs(60),
+#[tokio::test]
+async fn output_past_the_log_cap_runs_to_completion() {
+    let (_dir, terminal) = fixture().await;
+    let (output, id) = run(
+        &terminal,
+        "head -c 17000000 /dev/zero | tr '\\0' x; printf finished",
+        60_000,
     )
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), task.wait())
-        .await
-        .unwrap();
-    assert_eq!(tokio::fs::metadata(log_path).await.unwrap().len(), 1000);
-    assert_eq!(lock(&task.state).signal.as_deref(), Some("output_limit"));
+    .await;
+    assert!(output.starts_with("Exit code: 0"), "{}", &output[..100]);
+    assert!(
+        output.contains("finished\n```"),
+        "{}",
+        &output[output.len() - 400..]
+    );
+    let log = std::fs::read(terminal.log_dir.join(format!("{id}.log"))).unwrap();
+    assert!(log.len() as u64 <= MAX_LOG_BYTES, "{}", log.len());
+    assert!(
+        log.windows(TRUNCATED.len())
+            .any(|window| window == TRUNCATED.as_bytes())
+    );
+    assert!(log.ends_with(b"finished"));
     terminal.kill_all().await;
 }
 
@@ -249,14 +250,36 @@ async fn capture_bounds_timeout_and_cancellation_reap() {
     assert_reaped(pid).await;
 }
 
-#[tokio::test]
-async fn dropped_session_and_aborted_foreground_leave_no_leader() {
-    let (dir, terminal) = fixture().await;
-    run(&terminal, "printf '%s' $$ > bg.pid; exec sleep 60", 0).await;
-    let pid = read_pid(&dir.path().join("bg.pid")).await;
-    drop(terminal);
-    assert_reaped(pid).await;
+#[test]
+fn background_tasks_outlive_detach_and_the_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (left, server) = runtime.block_on(async {
+        let terminal = TerminalSession::new(dir.path().into(), dir.path().join("logs"))
+            .await
+            .unwrap();
+        let (_, id) = run(&terminal, "printf '%s' $$ > server.pid; exec sleep 60", 0).await;
+        run(&terminal, "sleep 0.01", 1000).await;
+        let (_, killed) = run(&terminal, "sleep 60", 0).await;
+        kill(&terminal, killed).await;
+        let pid = read_pid(&dir.path().join("server.pid")).await;
+        (terminal.detach(), (id, pid))
+    });
+    drop(runtime);
+    std::thread::sleep(Duration::from_millis(100));
+    let alive = unsafe { libc::kill(server.1, 0) } == 0;
+    unsafe { libc::kill(server.1, libc::SIGKILL) };
+    assert!(alive, "background task died when the runtime ended");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!((left[0].task_id, left[0].pid), server);
+    assert!(left[0].output_file.ends_with("task-1.log"));
+}
 
+#[tokio::test]
+async fn aborted_foreground_leaves_no_leader() {
     let (dir, terminal) = fixture().await;
     let arguments = args("printf '%s' $$ > fg.pid; exec sleep 60", 300_000);
     let call = terminal.run(&arguments);
@@ -270,52 +293,84 @@ async fn dropped_session_and_aborted_foreground_leave_no_leader() {
     terminal.kill_all().await;
 }
 
-#[tokio::test]
-async fn kill_shutdown_and_drop_stop_the_entire_process_group() {
-    async fn assert_descendant_stopped(pid: i32) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if unsafe { libc::kill(pid, 0) } < 0 {
-                    break;
-                }
-                #[cfg(target_os = "linux")]
-                if let Ok(stat) = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await
-                    && stat
-                        .rsplit_once(") ")
-                        .is_some_and(|(_, rest)| rest.starts_with("Z "))
-                {
-                    // Docker's PID 1 can delay reaping an orphan that has already exited.
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+async fn assert_stopped(pid: i32) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if unsafe { libc::kill(pid, 0) } < 0 {
+                break;
             }
-        })
-        .await
-        .expect("live descendant survived process-group cleanup");
-    }
+            #[cfg(target_os = "linux")]
+            if let Ok(stat) = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await
+                && stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with("Z "))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("live descendant survived cleanup");
+}
 
-    for action in ["kill", "shutdown", "drop"] {
+#[tokio::test]
+async fn kill_and_kill_all_stop_every_process_in_the_session() {
+    for action in ["kill", "kill_all"] {
         let (dir, terminal) = fixture().await;
         let (_, id) = run(
             &terminal,
-            "printf '%s' $$ > leader.pid; sleep 60 & printf '%s' $! > child.pid; wait",
+            "printf '%s' $$ > leader.pid; sleep 60 & printf '%s' $! > child.pid; set -m; sleep 60 & printf '%s' $! > job.pid; wait",
             0,
         )
         .await;
         let leader = read_pid(&dir.path().join("leader.pid")).await;
         let child = read_pid(&dir.path().join("child.pid")).await;
-        assert_eq!(unsafe { libc::kill(leader, 0) }, 0);
-        assert_eq!(unsafe { libc::kill(child, 0) }, 0);
+        let job = read_pid(&dir.path().join("job.pid")).await;
+        assert_ne!(unsafe { libc::getpgid(job) }, leader);
         match action {
-            "kill" => {
-                kill(&terminal, id).await;
-            }
-            "shutdown" => terminal.kill_all().await,
-            "drop" => drop(terminal),
-            _ => unreachable!(),
+            "kill" => assert!(kill(&terminal, id).await.starts_with("killed:")),
+            _ => terminal.kill_all().await,
         }
         assert_reaped(leader).await;
-        assert_descendant_stopped(child).await;
+        assert_stopped(child).await;
+        assert_stopped(job).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn kill_all_reaches_descendants_that_left_the_session() {
+    let (dir, terminal) = fixture().await;
+    run(
+        &terminal,
+        "timeout 600 sh -c 'printf %s $$ > timeout.pid; exec sleep 4001'; echo end",
+        0,
+    )
+    .await;
+    run(
+        &terminal,
+        "setsid -f sh -c 'printf %s $$ > setsid.pid; exec sleep 912'",
+        5000,
+    )
+    .await;
+    run(
+        &terminal,
+        "(setsid sh -c 'printf %s $$ > forked.pid; exec sleep 913' &)",
+        5000,
+    )
+    .await;
+    let pids = [
+        read_pid(&dir.path().join("timeout.pid")).await,
+        read_pid(&dir.path().join("setsid.pid")).await,
+        read_pid(&dir.path().join("forked.pid")).await,
+    ];
+    for pid in pids {
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    }
+    terminal.kill_all().await;
+    for pid in pids {
+        assert_stopped(pid).await;
     }
 }
 
