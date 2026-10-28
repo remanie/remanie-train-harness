@@ -40,6 +40,14 @@ def distro_notices(paths):
     return notices
 
 
+def launcher_script(name: str, loader: str) -> str:
+    return (
+        "#!/bin/sh\n"
+        "here=${0%/*}\n"
+        f'exec "$here/lib/{loader}" --library-path "$here/lib" "$here/bin/{name}" "$@"\n'
+    )
+
+
 def package(binary: Path, destination: Path) -> None:
     if sys.platform != "linux" or not shutil.which("dpkg-query"):
         raise RuntimeError("Run packaging on Debian/Ubuntu on the same architecture as the build")
@@ -64,6 +72,9 @@ def package(binary: Path, destination: Path) -> None:
         if not source.is_file():
             raise RuntimeError(f"Missing required project notice: {source}")
         license_sources[name] = source
+    contract = Path(__file__).resolve().parent / "assets/contract.json"
+    if not contract.is_file():
+        raise RuntimeError(f"Missing runner contract: {contract}")
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "bin").mkdir()
     (destination / "lib").mkdir()
@@ -78,13 +89,9 @@ def package(binary: Path, destination: Path) -> None:
                 raise RuntimeError(f"Conflicting library: {path.name}")
             shutil.copy2(path, library)
         launcher = destination / name
-        launcher.write_text(
-            "#!/bin/sh\n"
-            f"exec /opt/remanie-train-harness/lib/{loader.name} "
-            "--library-path /opt/remanie-train-harness/lib "
-            f'/opt/remanie-train-harness/bin/{name} "$@"\n'
-        )
+        launcher.write_text(launcher_script(name, loader.name))
         launcher.chmod(0o755)
+    shutil.copyfile(contract, destination / "contract.json")
     notices = destination / "licenses"
     notices.mkdir()
     for name, source in sorted(license_sources.items()):

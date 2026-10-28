@@ -1,3 +1,7 @@
+import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import package_linux
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harbor"))
+from remanie_agent import Bundle
 
 
 class PackageNoticesTest(unittest.TestCase):
@@ -33,6 +40,34 @@ class PackageNoticesTest(unittest.TestCase):
                 (licenses / "LGPL-2.1").unlink()
                 with self.assertRaisesRegex(RuntimeError, "Missing referenced Debian license"):
                     package_linux.distro_notices(paths)
+
+
+class LauncherTest(unittest.TestCase):
+    def test_launcher_runs_the_bundle_it_sits_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "first"
+            (bundle / "lib").mkdir(parents=True)
+            loader = bundle / "lib/ld-linux-x86-64.so.2"
+            loader.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            loader.chmod(0o755)
+            launcher = bundle / "rg"
+            launcher.write_text(package_linux.launcher_script("rg", loader.name))
+            launcher.chmod(0o755)
+            moved = bundle.rename(Path(directory) / "moved bundle")
+            output = subprocess.run(
+                [str(moved / "rg"), "--version", "a b"], cwd="/", capture_output=True, text=True, check=True,
+            ).stdout.splitlines()
+            self.assertEqual(output, ["--library-path", f"{moved}/lib", f"{moved}/bin/rg", "--version", "a b"])
+
+
+@unittest.skipUnless(os.environ.get("REMANIE_BUNDLE"), "set REMANIE_BUNDLE to a package_linux.py output")
+class PackagedBundleTest(unittest.TestCase):
+    def test_bundle_carries_the_contract_the_adapter_reads(self):
+        root = Path(os.environ["REMANIE_BUNDLE"])
+        manifest = json.loads((root / "manifest.json").read_text())
+        self.assertIn("contract.json", manifest["files"])
+        self.assertEqual(Bundle.load(root).architecture, manifest["architecture"])
+        subprocess.run([str(root / "rg"), "--version"], cwd="/", check=True, capture_output=True)
 
 
 if __name__ == "__main__":
