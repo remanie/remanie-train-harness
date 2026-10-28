@@ -955,6 +955,60 @@ async fn an_endpoint_context_length_rejection_is_a_graded_overflow() {
 }
 
 #[tokio::test]
+async fn a_turn_refused_for_its_length_is_compacted_once_and_sent_again() {
+    let refusal = || {
+        ResponseTemplate::new(400).set_body_string(
+            "This model's maximum context length is 32768 tokens. However, you requested 40000 tokens.",
+        )
+    };
+    let summary = || {
+        reply(
+            json!({"role": "assistant", "content": "<summary>Listed the workspace.</summary>"}),
+            "stop",
+            100,
+        )
+    };
+    let compacting = |responses| async {
+        let mut f = fixture(responses).await;
+        f.config["compaction"] = json!({"threshold_tokens": 20_000, "max_tokens": 1024});
+        f
+    };
+
+    let f = compacting(vec![
+        tool_reply(vec![list_dir("first")], 100),
+        refusal(),
+        summary(),
+        final_reply(),
+    ])
+    .await;
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+    let requests = f.requests().await;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2]["tool_choice"], "none");
+    assert_eq!(requests[3]["messages"].as_array().unwrap().len(), 3);
+
+    let f = compacting(vec![
+        tool_reply(vec![list_dir("first")], 100),
+        refusal(),
+        summary(),
+        refusal(),
+        final_reply(),
+    ])
+    .await;
+    let result = f.run().await;
+    assert_eq!(result["cause"]["kind"], "endpoint_rejected", "{result}");
+    assert_eq!(result["compactions"], 1);
+    assert_eq!(f.requests().await.len(), 4);
+
+    let f = compacting(vec![refusal(), summary(), final_reply()]).await;
+    let result = f.run().await;
+    assert_eq!(result["cause"]["kind"], "config", "{result}");
+    assert_eq!(f.requests().await.len(), 1);
+}
+
+#[tokio::test]
 async fn a_full_context_window_ends_the_attempt_before_sending() {
     let mut f = fixture(vec![tool_reply(vec![list_dir("list")], 990), final_reply()]).await;
     f.config["context_window_tokens"] = json!(1200);

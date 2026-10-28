@@ -335,20 +335,28 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
         finish,
         usage,
         context_tokens,
-    } = proceed(
-        cx.model
-            .sample(
-                Request {
-                    kind: CallKind::Turn,
-                    turn: cx.tally.turns + 1,
-                    prompt: cx.segment.range(),
-                    messages: cx.segment.messages(),
-                    max_tokens_override: None,
-                },
-                cx.trace,
-            )
-            .await,
-    )?;
+    } = loop {
+        let request = Request {
+            kind: CallKind::Turn,
+            turn: cx.tally.turns + 1,
+            prompt: cx.segment.range(),
+            messages: cx.segment.messages(),
+            max_tokens_override: None,
+        };
+        match cx.model.sample(request, cx.trace).await {
+            Err(Outcome::ContextOverflow(Overflow::EndpointRejected { .. }))
+                if input.compaction.is_some()
+                    && cx
+                        .segment
+                        .messages()
+                        .iter()
+                        .any(|message| message["role"] == "assistant") =>
+            {
+                proceed(compact(cx).await)?;
+            }
+            sampled => break proceed(sampled)?,
+        }
+    };
     cx.tally.turns += 1;
     cx.tally.count_response(usage);
     let reply = read_reply(&message);
