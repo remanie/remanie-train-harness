@@ -500,7 +500,7 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
 
 fn summary(sampled: &Sampled) -> Option<String> {
     let reply = read_reply(&sampled.message).ok()?;
-    if sampled.finish != Finish::Stop || !reply.calls.is_empty() {
+    if !matches!(sampled.finish, Finish::Stop | Finish::Length) || !reply.calls.is_empty() {
         return None;
     }
     let summary = format_compact_summary(&reply.content?);

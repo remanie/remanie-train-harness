@@ -766,10 +766,6 @@ async fn an_unusable_summary_ends_the_attempt_and_keeps_the_transcript() {
             "stop",
         ),
         (
-            json!({"role": "assistant", "content": "unfinished summary"}),
-            "length",
-        ),
-        (
             json!({"role": "assistant", "content": "summary", "tool_calls": {}}),
             "stop",
         ),
@@ -800,6 +796,29 @@ async fn an_unusable_summary_ends_the_attempt_and_keeps_the_transcript() {
             "kept"
         );
     }
+}
+
+#[tokio::test]
+async fn a_summary_cut_off_at_max_tokens_is_kept() {
+    let cut = "<summary>\n1. Primary Request and Intent: create result.txt\n8. Current Work: wri";
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("first")], 30_000),
+        reply(json!({"role": "assistant", "content": cut}), "length", 100),
+        final_reply(),
+    ])
+    .await;
+    f.config["compaction"] = json!({"threshold_tokens": 20_000, "max_tokens": 1024});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+    let continuation = &f.requests().await[2]["messages"][2]["content"];
+    assert!(
+        continuation
+            .as_str()
+            .unwrap()
+            .ends_with("\n1. Primary Request and Intent: create result.txt\n8. Current Work: wri"),
+        "{continuation}"
+    );
 }
 
 #[tokio::test]
