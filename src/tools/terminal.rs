@@ -40,7 +40,7 @@ const NON_INTERACTIVE_ENV: [(&str, &str); 13] = [
     ("GPG_TTY", ""),
 ];
 
-static SPAWNED: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
+static CHILDREN_WITH_HANDLES: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -499,10 +499,10 @@ fn read_log(path: &Path, limit: usize) -> io::Result<(String, u64)> {
 }
 
 fn spawn_tracked(command: &mut Command) -> io::Result<(Child, libc::pid_t)> {
-    let mut spawned = lock(&SPAWNED);
+    let mut with_handles = lock(&CHILDREN_WITH_HANDLES);
     let child = command.spawn()?;
     let pid = child.id().expect("an unwaited child has a pid") as libc::pid_t;
-    spawned.insert(pid);
+    with_handles.insert(pid);
     Ok((child, pid))
 }
 
@@ -563,7 +563,7 @@ struct Process {
 }
 
 #[cfg(target_os = "linux")]
-fn adopted_processes() -> Vec<Process> {
+fn processes_outside_own_session() -> Vec<Process> {
     let own_session = unsafe { libc::getsid(0) };
     processes()
         .into_iter()
@@ -582,10 +582,10 @@ fn adopted_processes() -> Vec<Process> {
 
 #[cfg(target_os = "linux")]
 fn reap_orphans() {
-    let spawned = lock(&SPAWNED);
+    let with_handles = lock(&CHILDREN_WITH_HANDLES);
     let runner = std::process::id() as libc::pid_t;
-    for process in adopted_processes() {
-        if process.zombie && process.parent == runner && !spawned.contains(&process.pid) {
+    for process in processes_outside_own_session() {
+        if process.zombie && process.parent == runner && !with_handles.contains(&process.pid) {
             unsafe { libc::waitpid(process.pid, std::ptr::null_mut(), libc::WNOHANG) };
         }
     }
@@ -595,12 +595,12 @@ fn reap_orphans() {
 async fn sweep_orphans() {
     let runner = std::process::id() as libc::pid_t;
     for _ in 0..100 {
-        let table = adopted_processes();
+        let table = processes_outside_own_session();
         let mut doomed = {
-            let spawned = lock(&SPAWNED);
+            let with_handles = lock(&CHILDREN_WITH_HANDLES);
             table
                 .iter()
-                .filter(|process| process.parent == runner && !spawned.contains(&process.pid))
+                .filter(|process| process.parent == runner && !with_handles.contains(&process.pid))
                 .map(|process| process.pid)
                 .collect::<Vec<_>>()
         };
@@ -676,7 +676,7 @@ async fn drive(mut child: Child, task: Arc<Task>) {
         }
         state.completed = true;
         state.ended = Some(SystemTime::now());
-        lock(&SPAWNED).remove(&task.pid);
+        lock(&CHILDREN_WITH_HANDLES).remove(&task.pid);
         drop(state);
         task.finished.send_replace(true);
         return;
@@ -725,7 +725,7 @@ pub async fn capture(
         let _ = child.start_kill();
     }
     let status = child.wait().await?;
-    lock(&SPAWNED).remove(&pid);
+    lock(&CHILDREN_WITH_HANDLES).remove(&pid);
     output.extend_from_slice(&errors);
     truncated |= output.len() > max_bytes;
     output.truncate(max_bytes);
