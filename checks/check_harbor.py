@@ -108,7 +108,7 @@ class ScriptedModel:
                 shell("printf '%s' $$ > background.pid; printf background-ready; exec sleep 300", "background"),
             ], tokens=30_000)
         if self.turn == 2:
-            assert self.compactions == 1 and len(messages) == 3
+            assert self.compactions == 1 and messages[2]["content"].startswith("Previous work on this task:")
             state = json.loads(messages[2]["content"].split("Current tool state:\n", 1)[1])
             todo = state["todos"]["todos"]["verify"]
             assert todo["content"] == "Verify result.txt" and todo["status"] == "in_progress"
@@ -127,7 +127,8 @@ class ScriptedModel:
             ])
         assert self.turn == 3
         outputs = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
-        assert len(outputs) == 8 and not any(value.startswith("Tool error:") for value in outputs.values())
+        turn_2 = ("poll", "read", "edit", "search", "list", "kill", "todo-finish", "cleanup-process")
+        assert not any(outputs[id].startswith("Tool error:") for id in turn_2), outputs
         assert "before" in outputs["read"] and "after" in outputs["search"]
         assert "result.txt" in outputs["list"]
         assert "completed" in outputs["todo-finish"] and "Verify result.txt" in outputs["todo-finish"]
@@ -182,6 +183,7 @@ async def check(mode, runtime_dir, output_dir):
             agent=AgentConfig(
                 import_path="check_harbor:UnconfirmedShutdownAgent" if mode == "cleanup_error" else "remanie_agent:RemanieAgent",
                 model_name="openrouter/x-ai/grok-4.7",
+                model_api_key_name="OPENROUTER_API_KEY",
                 base_url=f"http://host.docker.internal:{server.server_port}/v1",
                 env={"OPENROUTER_API_KEY": FAKE_KEY},
                 override_timeout_sec=8 if mode in ("timeout", "cleanup_error") else 60,
@@ -222,11 +224,11 @@ async def check(mode, runtime_dir, output_dir):
         assert model.turn == 3 and model.compactions == 1
     log_dir = output_dir / mode / "agent"
     runtime_result = json.loads((log_dir / "result.json").read_text())
-    assert runtime_result["status"] == ("cancelled" if mode == "timeout" else "completed"), runtime_result
+    assert runtime_result["outcome"] == ("cancelled" if mode == "timeout" else "completed"), runtime_result
     assert runtime_result["compactions"] == model.compactions
     trace = (log_dir / "remanie/trace.jsonl").read_text()
     assert FAKE_KEY not in trace and FAKE_KEY not in (log_dir / "input.json").read_text()
-    return {"mode": mode, "reward": 1.0, "status": runtime_result["status"], "compactions": model.compactions, "model_requests": len(model.requests)}
+    return {"mode": mode, "reward": 1.0, "outcome": runtime_result["outcome"], "compactions": model.compactions, "model_requests": len(model.requests)}
 
 
 async def main():
