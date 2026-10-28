@@ -43,7 +43,7 @@ When the selected key has no value on the host, `run` raises before it executes 
 
 - Exit 0. The adapter returns and Harbor runs the verifier.
 - Exit 70. The adapter raises `RemanieInfrastructureError` and Harbor skips the verifier.
-- Any other exit. The runner died. The adapter raises an error with the exit code and Harbor skips the verifier. The policy's commands share the runner's user and PID namespace, so a command can kill the runner; that trial is skipped like any other death, and its exit code is in the trial metadata.
+- Any other exit. The runner died. The adapter raises an error with the exit code and Harbor skips the verifier. Commands the model runs share the runner's user and PID namespace, so a command can kill the runner. The adapter handles that exit the same way.
 - Harbor's agent timeout. The adapter sends TERM to the runner's process group and waits up to 5 s. If the runner exits 0 in that time, the adapter re-raises the cancellation, and Harbor records `AgentTimeoutError` and still runs the verifier. Otherwise the adapter sends KILL and raises an error, and Harbor skips the verifier.
 
 On every path the adapter sets `context.metadata["remanie"]` to the runner's `exit_code`, the bundle's `bundle_sha256`, and `result`, the parsed `result.json` or null when there is none. When `usage.complete` is true it also sets `n_input_tokens`, `n_output_tokens`, and `n_cache_tokens`.
