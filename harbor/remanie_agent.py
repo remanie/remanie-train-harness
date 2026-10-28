@@ -192,12 +192,13 @@ class RemanieAgent(BaseInstalledAgent):
             if identity is None and stream == "stdout" and (match := IDENTITY.search(text)):
                 identity = match.groups()
 
-        execution = asyncio.create_task(environment.exec(
-            command=f"exec setsid --wait bash -c {shlex.quote(script)}"
-        ))
+        # The task copies the context, and with it the callback, when it is created.
+        with environment.scoped_output_callback(capture_identity):
+            execution = asyncio.create_task(environment.exec(
+                command=f"exec setsid --wait bash -c {shlex.quote(script)}"
+            ))
         try:
-            with environment.scoped_output_callback(capture_identity):
-                result = await asyncio.shield(execution)
+            result = await asyncio.shield(execution)
         except BaseException:
             await self._stop_after_interruption(environment, identity, execution)
             raise

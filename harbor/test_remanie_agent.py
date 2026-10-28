@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import hashlib
 import importlib.util
 import json
@@ -8,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -80,16 +81,13 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         environment.default_user = None
         environment.calls = []
         environment.uploads = {}
-
-        @contextmanager
-        def output_callback(callback):
-            environment.output_callback = callback
-            yield
+        environment._output_callbacks = contextvars.ContextVar("output_callbacks", default=())
 
         async def execute(**kwargs):
             environment.calls.append(kwargs)
             command = kwargs["command"]
             if command.startswith("exec setsid") and launch:
+                environment.output_callback = BaseEnvironment._output_callback(environment)
                 return await launch(environment)
             if "uname -m" in command:
                 return ExecResult(stdout=f"{machine}\n", return_code=0)
@@ -98,7 +96,7 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         async def upload(source, target):
             environment.uploads[target] = Path(source).read_text()
 
-        environment.scoped_output_callback = output_callback
+        environment.scoped_output_callback = partial(BaseEnvironment.scoped_output_callback, environment)
         environment.exec.side_effect = execute
         environment.upload_file.side_effect = upload
         return environment
