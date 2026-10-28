@@ -611,9 +611,14 @@ async fn todos_preserve_insertion_order_partial_updates_and_duplicate_atomicity(
     assert!(output.starts_with("- [completed] b: second\n- [pending] a: first\n"));
     tools.call("todo_write", &json!({"todos":[{"id":"b","content":""},{"id":"c","content":"","status":"cancelled"}]})).await.unwrap();
     let before = tools.snapshot().await;
-    assert_eq!(before["todos"]["b"]["content"], "second");
-    assert_eq!(before["todos"]["c"]["content"], "c");
-    assert_eq!(before["todos"]["c"]["priority"], "medium");
+    assert_eq!(
+        before[0],
+        json!({"id":"b","content":"second","status":"completed"})
+    );
+    assert_eq!(
+        before[2],
+        json!({"id":"c","content":"c","status":"cancelled"})
+    );
     assert!(tools.call("todo_write", &json!({"todos":[{"id":"a","content":"changed"},{"id":"a","status":"completed"}],"merge":false})).await.is_err());
     assert_eq!(tools.snapshot().await, before);
     tools
@@ -625,13 +630,13 @@ async fn todos_preserve_insertion_order_partial_updates_and_duplicate_atomicity(
         .unwrap();
     assert_eq!(
         tools.snapshot().await,
-        json!({"todos":{"b":{"content":"b","priority":"medium","status":"pending"}}})
+        [json!({"id":"b","content":"b","status":"pending"})]
     );
     tools
         .call("todo_write", &json!({"todos":[],"merge":false}))
         .await
         .unwrap();
-    assert_eq!(tools.snapshot().await, json!({"todos":{}}));
+    assert!(tools.snapshot().await.is_empty());
 }
 
 #[tokio::test]

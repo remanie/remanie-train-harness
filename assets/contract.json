@@ -40,13 +40,15 @@
       "compaction": {
         "type": ["object", "null"],
         "additionalProperties": false,
-        "required": ["threshold_tokens", "max_tokens"],
+        "required": ["max_tokens"],
         "properties": {
           "threshold_tokens": {"type": "integer", "minimum": 1},
           "max_tokens": {"type": "integer", "minimum": 1, "maximum": 4294967295}
         }
       }
-    }
+    },
+    "if": {"required": ["compaction"], "properties": {"compaction": {"type": "object", "not": {"required": ["threshold_tokens"]}}}},
+    "then": {"required": ["context_window_tokens"], "properties": {"context_window_tokens": {"type": "integer"}}}
   },
   "result": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

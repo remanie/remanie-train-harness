@@ -79,7 +79,6 @@ pub enum Event<'a> {
         from_segment: u32,
         to_segment: u32,
         summary_call: u32,
-        kept_messages: usize,
     },
     Result(&'a RunResult),
 }

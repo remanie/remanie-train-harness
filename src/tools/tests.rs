@@ -265,14 +265,14 @@ async fn todos_merge_and_reset_per_attempt() {
         json!({"todos":[{"id":"a", "status":"completed"}], "merge":true}),
     )
     .await;
-    let state = tools.state().await;
-    assert_eq!(state["todos"]["todos"]["a"]["content"], "first");
-    assert_eq!(state["todos"]["todos"]["a"]["status"], "completed");
-    assert_eq!(state["todos"]["todos"]["b"]["content"], "second");
+    assert_eq!(
+        tools.state().await,
+        json!({"tasks": [], "todos": [{"id": "b", "content": "second", "status": "pending"}], "completed": 1, "cancelled": 0})
+    );
     let (_other_dir, other) = fixture().await;
-    assert_eq!(other.state().await["todos"]["todos"], json!({}));
+    assert_eq!(other.state().await["todos"], json!([]));
     call(&tools, "todo_write", json!({"todos":[], "merge":false})).await;
-    assert_eq!(tools.state().await["todos"]["todos"], json!({}));
+    assert_eq!(tools.state().await["completed"], 0);
     tools.kill_all().await;
     other.kill_all().await;
 }
@@ -291,7 +291,9 @@ async fn background_wait_kill_detach_and_kill_all() {
     assert!(output.content.contains("finished"));
     assert!(output.content.contains("completed"));
     assert!(
-        tools.state().await["background_tasks"]
+        tools
+            .terminal
+            .background_tasks()
             .as_array()
             .unwrap()
             .iter()
@@ -309,7 +311,9 @@ async fn background_wait_kill_detach_and_kill_all() {
     assert!(output.content.contains("running"));
     call(&tools, "kill_terminal_command", json!({"task_id":id})).await;
     assert!(
-        tools.state().await["background_tasks"]
+        tools
+            .terminal
+            .background_tasks()
             .as_array()
             .unwrap()
             .iter()

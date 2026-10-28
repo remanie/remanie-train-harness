@@ -330,6 +330,7 @@ async fn invalid_input_is_a_config_outcome_with_a_result_file() {
             "compaction",
             json!({"threshold_tokens": 0, "max_tokens": 1}),
         ),
+        ("compaction", json!({"max_tokens": 1})),
         ("max_response_tokens", json!(4096)),
     ] {
         let mut f = fixture(vec![final_reply()]).await;
@@ -578,58 +579,69 @@ async fn compaction_is_off_unless_configured() {
 }
 
 #[tokio::test]
-async fn compaction_keeps_the_last_two_turns_and_the_todo_list_after_the_summary() {
-    let todo = call(
+async fn compaction_at_85_percent_replaces_the_history_with_the_summary_and_reminder() {
+    let todos = call(
         "todo",
         "todo_write",
-        json!({"todos": [{"id": "work", "content": "verify result", "status": "in_progress"}]}),
+        json!({"todos": [
+            {"id": "work", "content": "verify result", "status": "in_progress"},
+            {"id": "setup", "content": "create result", "status": "completed"}
+        ]}),
     );
+    let server = call(
+        "server",
+        "run_terminal_cmd",
+        json!({"command": "exec sleep 60", "description": "start a server", "block_until_ms": 0}),
+    );
+    let summary = "<summary>\n1. Primary Request and Intent: create result.txt\n9. Optional Next Step: verify it\n</summary>";
     let mut f = fixture(vec![
-        tool_reply(vec![todo], 100),
-        tool_reply(vec![list_dir("second")], 100),
-        tool_reply(vec![list_dir("third")], 30_000),
+        tool_reply(vec![todos, server], 8_000),
+        tool_reply(vec![list_dir("second")], 8_490),
         reply(
-            json!({"role": "assistant", "content": "<summary>The work is half done.</summary>"}),
+            json!({"role": "assistant", "content": summary}),
             "stop",
             100,
         ),
         final_reply(),
     ])
     .await;
-    f.config["compaction"] = json!({"threshold_tokens": 20_000, "max_tokens": 1024});
+    f.config["context_window_tokens"] = json!(10_000);
+    f.config["sampling_params"]["max_tokens"] = json!(1000);
+    f.config["compaction"] = json!({"max_tokens": 1024});
     let result = f.run().await;
-    assert_eq!(result["outcome"], "completed");
+    let server = result["background_tasks_left_running"][0]["pid"]
+        .as_i64()
+        .unwrap();
+    unsafe { libc::kill(server as i32, libc::SIGKILL) };
+    assert_eq!(result["outcome"], "completed", "{result}");
     assert_eq!(result["compactions"], 1);
-    assert_eq!(result["turns"], 4);
-    assert_eq!(result["model_calls"], 5);
+    assert_eq!(result["turns"], 3);
     let requests = f.requests().await;
-    assert_eq!(requests.len(), 5);
-    let summary_request = &requests[3];
+    assert_eq!(requests.len(), 4);
+    let summary_request = &requests[2];
     assert_eq!(summary_request["tool_choice"], "none");
     assert_eq!(summary_request["max_tokens"], 1024);
-    assert_eq!(summary_request["tools"], requests[0]["tools"]);
     let before = summary_request["messages"].as_array().unwrap();
-    assert_eq!(before.len(), 9);
-    assert_eq!(before[8]["role"], "user");
-    let after = requests[4]["messages"].as_array().unwrap();
-    assert_eq!(requests[4]["max_tokens"], 2048);
+    assert_eq!(before.len(), 8);
+    let prompt = before[7]["content"].as_str().unwrap();
+    assert!(prompt.starts_with("Your task is to produce a faithful, concise summary"));
+    assert!(prompt.contains("a few thousand words.\n\nCRITICAL:"));
+    assert!(prompt.ends_with("from the conversation text only.\n"));
+    let after = requests[3]["messages"].as_array().unwrap();
+    assert_eq!(after.len(), 3);
     assert_eq!(after[..2], before[..2]);
-    let continuation = after[2]["content"].as_str().unwrap();
-    assert!(continuation.contains("Summary:\nThe work is half done."));
-    let state: Value =
-        serde_json::from_str(continuation.split_once("Current tool state:\n").unwrap().1).unwrap();
-    assert_eq!(state["todos"]["todos"]["work"]["status"], "in_progress");
-    assert_eq!(after[3..], before[4..8]);
-    assert_eq!(after.len(), 7);
+    assert_eq!(
+        after[2],
+        json!({"role": "user", "content": "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. Primary Request and Intent: create result.txt\n9. Optional Next Step: verify it\n\n<system-reminder>\n## Running Background Tasks\nThese tasks are still running:\n- \"task-1\": `exec sleep 60` (running, run_terminal_cmd)\n\n## TODO List\nThis is your task list from before the conversation was compacted — it is still active. Keep working through the items below and update their status as you make progress:\n- [in_progress] work: verify result\n(1 completed)\n</system-reminder>"})
+    );
     let compaction = &f.events("compaction")[0];
     assert_eq!(
         (
             &compaction["from_segment"],
             &compaction["to_segment"],
-            &compaction["summary_call"],
-            &compaction["kept_messages"]
+            &compaction["summary_call"]
         ),
-        (&json!(0), &json!(1), &json!(4), &json!(4))
+        (&json!(0), &json!(1), &json!(3))
     );
     let segment: Vec<_> = f
         .events("message")
@@ -637,44 +649,47 @@ async fn compaction_keeps_the_last_two_turns_and_the_todo_list_after_the_summary
         .filter(|event| event["segment"] == 1)
         .map(|event| event["message"].clone())
         .collect();
-    assert_eq!(segment[..7], after[..]);
+    assert_eq!(segment[..3], after[..]);
 }
 
 #[tokio::test]
-async fn after_compaction_the_budget_starts_from_the_endpoint_count_not_bytes() {
-    let read = |id| call(id, "read_file", json!({"target_file": "big.txt"}));
+async fn without_a_reminder_the_continuation_ends_with_the_summary() {
     let mut f = fixture(vec![
-        tool_reply(vec![read("r1")], 4_900),
-        tool_reply(vec![read("r2")], 12_900),
-        tool_reply(vec![read("r3")], 20_900),
+        tool_reply(vec![list_dir("first")], 30_000),
         reply(
-            json!({"role": "assistant", "content": "<summary>Read big.txt three times.</summary>"}),
+            json!({"role": "assistant", "content": "<summary>Listed the workspace.</summary>"}),
             "stop",
-            21_500,
+            100,
         ),
         final_reply(),
     ])
     .await;
-    let lines: String = (0..600)
-        .map(|i| format!("line {i:04} {}\n", "x".repeat(89)))
-        .collect();
-    std::fs::write(f.workspace().join("big.txt"), lines).unwrap();
-    f.config["context_window_tokens"] = json!(60_000);
-    f.config["sampling_params"]["max_tokens"] = json!(1000);
-    f.config["compaction"] = json!({"threshold_tokens": 50_000, "max_tokens": 2048});
+    f.config["compaction"] = json!({"threshold_tokens": 20_000, "max_tokens": 1024});
+    assert_eq!(f.run().await["compactions"], 1);
+    assert_eq!(
+        f.requests().await[2]["messages"][2]["content"],
+        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nListed the workspace."
+    );
+}
+
+#[tokio::test]
+async fn compaction_runs_before_a_turn_that_would_not_fit() {
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("first")], 7_000),
+        reply(
+            json!({"role": "assistant", "content": "<summary>Listed the workspace.</summary>"}),
+            "stop",
+            100,
+        ),
+        final_reply(),
+    ])
+    .await;
+    f.config["context_window_tokens"] = json!(10_000);
+    f.config["sampling_params"]["max_tokens"] = json!(4_000);
+    f.config["compaction"] = json!({"max_tokens": 1024});
     let result = f.run().await;
     assert_eq!(result["outcome"], "completed", "{result}");
     assert_eq!(result["compactions"], 1);
-    let requests = f.requests().await;
-    let after = requests.last().unwrap()["messages"].as_array().unwrap();
-    let kept_bytes: usize = after
-        .iter()
-        .map(|message| serde_json::to_vec(message).unwrap().len())
-        .sum();
-    assert!(
-        kept_bytes as u64 / 2 + 1000 > 60_000,
-        "the kept turns alone must exceed the window at two bytes per token"
-    );
 }
 
 #[tokio::test]
@@ -693,36 +708,6 @@ async fn after_compaction_the_budget_never_exceeds_the_new_segment_bytes() {
     f.config["context_window_tokens"] = json!(60_000);
     f.config["sampling_params"]["max_tokens"] = json!(1000);
     f.config["compaction"] = json!({"threshold_tokens": 50_000, "max_tokens": 2048});
-    let result = f.run().await;
-    assert_eq!(result["outcome"], "completed", "{result}");
-    assert_eq!(result["compactions"], 1);
-}
-
-#[tokio::test]
-async fn after_compaction_the_budget_leaves_out_the_dropped_turns() {
-    let read = |id, file| call(id, "read_file", json!({"target_file": file}));
-    let mut f = fixture(vec![
-        tool_reply(vec![read("r1", "a.txt")], 900),
-        tool_reply(vec![read("r2", "a.txt")], 8_900),
-        tool_reply(vec![read("r3", "a.txt")], 16_900),
-        tool_reply(vec![read("r4", "b1.txt"), read("r5", "b2.txt")], 24_900),
-        reply(
-            json!({"role": "assistant", "content": "<summary>Read a.txt three times and b1/b2 once.</summary>"}),
-            "stop",
-            60_300,
-        ),
-        final_reply(),
-    ])
-    .await;
-    for (name, lines) in [("a.txt", 300), ("b1.txt", 900), ("b2.txt", 400)] {
-        let text: String = (0..lines)
-            .map(|i| format!("{name} {i:04} {}\n", "x".repeat(78)))
-            .collect();
-        std::fs::write(f.workspace().join(name), text).unwrap();
-    }
-    f.config["context_window_tokens"] = json!(65_536);
-    f.config["sampling_params"]["max_tokens"] = json!(8192);
-    f.config["compaction"] = json!({"threshold_tokens": 56_000, "max_tokens": 2048});
     let result = f.run().await;
     assert_eq!(result["outcome"], "completed", "{result}");
     assert_eq!(result["compactions"], 1);

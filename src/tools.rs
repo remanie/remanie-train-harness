@@ -186,9 +186,14 @@ impl ToolSession {
     }
 
     pub async fn state(&self) -> Value {
+        let todos = self.files.snapshot().await;
+        let count = |status: &str| todos.iter().filter(|todo| todo["status"] == status).count();
+        let tasks = self.terminal.background_tasks();
         json!({
-            "todos": self.files.snapshot().await,
-            "background_tasks": self.terminal.background_tasks()
+            "tasks": tasks.as_array().into_iter().flatten().filter(|task| task["completed"] == false).collect::<Vec<_>>(),
+            "todos": todos.iter().filter(|todo| todo["status"] == "pending" || todo["status"] == "in_progress").collect::<Vec<_>>(),
+            "completed": count("completed"),
+            "cancelled": count("cancelled"),
         })
     }
 

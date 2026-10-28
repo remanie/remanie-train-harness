@@ -54,8 +54,13 @@ impl FileTools {
         }
     }
 
-    pub(super) async fn snapshot(&self) -> Value {
-        json!({"todos": *self.todos.lock().await})
+    pub(super) async fn snapshot(&self) -> Vec<Value> {
+        self.todos
+            .lock()
+            .await
+            .iter()
+            .map(|(id, item)| json!({"id": id, "content": item["content"], "status": item["status"]}))
+            .collect()
     }
 
     fn path(&self, input: &str) -> Result<PathBuf> {
@@ -500,9 +505,9 @@ impl FileTools {
             todos.clear();
         }
         for update in input.todos {
-            let item = todos.entry(update.id.clone()).or_insert_with(
-                || json!({"content":update.id,"priority":"medium","status":"pending"}),
-            );
+            let item = todos
+                .entry(update.id.clone())
+                .or_insert_with(|| json!({"content":update.id,"status":"pending"}));
             if let Some(content) = update.content.filter(|s| !s.is_empty()) {
                 item["content"] = content.into();
             }

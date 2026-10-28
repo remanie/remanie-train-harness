@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,8 @@ struct Input {
 
 #[derive(Debug, Deserialize)]
 struct Compaction {
-    threshold_tokens: u64,
+    #[serde(default)]
+    threshold_tokens: Option<u64>,
     max_tokens: u64,
 }
 
@@ -123,7 +124,6 @@ async fn attempt(
         segment: Segment::new(0, initial.clone(), trace),
         trace,
         budget: ContextBudget::default(),
-        turn_prompts: HashMap::new(),
         initial,
         tally,
         compact_next: false,
@@ -219,7 +219,7 @@ fn render(name: &str, source: &str, context: Value) -> Result<String, Cause> {
         .add_template(name, source)
         .and_then(|()| env.get_template(name)?.render(context))
         .map_err(|error| internal(format!("render {name}: {error}")))?;
-    Ok(rendered.trim_end_matches('\n').to_owned())
+    Ok(rendered)
 }
 
 fn initial_messages(query: &str) -> Result<Vec<Value>, Cause> {
@@ -247,7 +247,8 @@ struct ContextBudget {
     appended_bytes: u64,
 }
 
-const BYTES_PER_TOKEN: u64 = 2;
+const BYTES_PER_TOKEN: u64 = 4;
+const COMPACT_AT_PERCENT: u64 = 85;
 
 impl ContextBudget {
     fn counted(&mut self, tokens: u64) {
@@ -258,22 +259,12 @@ impl ContextBudget {
     }
 
     fn append(&mut self, message: &Value) {
-        self.appended_bytes += bytes(message);
-    }
-
-    fn at_most(&mut self, tokens: u64) {
-        if tokens < self.estimate() {
-            self.counted(tokens);
-        }
+        self.appended_bytes += serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64);
     }
 
     fn estimate(&self) -> u64 {
         self.counted + self.appended_bytes / BYTES_PER_TOKEN
     }
-}
-
-fn bytes(message: &Value) -> u64 {
-    serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64)
 }
 
 struct Attempt<'a> {
@@ -284,7 +275,6 @@ struct Attempt<'a> {
     segment: Segment,
     initial: Vec<Value>,
     budget: ContextBudget,
-    turn_prompts: HashMap<usize, u64>,
     tally: &'a mut Tally,
     compact_next: bool,
 }
@@ -352,10 +342,6 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
     cx.tally.turns += 1;
     cx.tally.count_response(usage);
     let reply = read_reply(&message);
-    if let Some(usage) = usage {
-        cx.turn_prompts
-            .insert(cx.segment.messages().len(), usage.prompt_tokens);
-    }
     cx.segment.push(message, cx.trace);
     match context_tokens {
         Some(tokens) => cx.budget.counted(tokens),
@@ -423,8 +409,15 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
             latency_ms: started.elapsed().as_millis() as u64,
         });
     }
+    let estimate = cx.budget.estimate();
+    let window = input.context_window_tokens;
     cx.compact_next = input.compaction.as_ref().is_some_and(|compaction| {
-        cx.budget.estimate() + max_tokens.max(compaction.max_tokens) >= compaction.threshold_tokens
+        let reached = match (compaction.threshold_tokens, window) {
+            (Some(threshold), _) => estimate >= threshold,
+            (None, Some(window)) => estimate * 100 >= window * COMPACT_AT_PERCENT,
+            (None, None) => false,
+        };
+        reached || window.is_some_and(|window| estimate + max_tokens > window)
     });
     ControlFlow::Continue(())
 }
@@ -433,9 +426,6 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let Some(compaction) = &cx.input.compaction else {
         return Ok(());
     };
-    let messages = cx.segment.messages();
-    let kept_start = kept_turns_start(messages);
-    let kept = messages[kept_start..].to_vec();
     let prompt = render(
         "compaction",
         include_str!("../assets/compaction.jinja2"),
@@ -461,11 +451,12 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let summary = summary(&sampled);
     cx.segment.push(sampled.message, cx.trace);
     let summary = summary.ok_or(Outcome::InvalidResponse(Misbehaviour::InvalidSummary))?;
-    let state = cx.tools.state().await;
+    let mut state = cx.tools.state().await;
+    state["summary"] = summary.into();
     let continuation = render(
         "continuation",
         include_str!("../assets/continuation.jinja2"),
-        json!({"summary": summary, "tool_state": state.to_string()}),
+        state,
     )
     .map_err(Outcome::Infrastructure)?;
     let from = cx.segment.index();
@@ -473,43 +464,16 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         from_segment: from,
         to_segment: from + 1,
         summary_call: cx.model.calls(),
-        kept_messages: kept.len(),
     });
-    let continuation = json!({"role": "user", "content": continuation});
-    let summary_prompt = sampled.usage.map(|usage| usage.prompt_tokens);
-    let counted = match (summary_prompt, cx.turn_prompts.get(&kept_start)) {
-        (Some(summary), Some(&dropped)) => Some(
-            summary.saturating_sub(dropped)
-                + cx.initial.iter().map(bytes).sum::<u64>() / BYTES_PER_TOKEN,
-        ),
-        _ => sampled.context_tokens,
-    }
-    .map(|tokens| tokens + bytes(&continuation) / BYTES_PER_TOKEN);
     let mut messages = cx.initial.clone();
-    messages.push(continuation);
-    messages.extend(kept);
+    messages.push(json!({"role": "user", "content": continuation}));
     cx.segment = Segment::new(from + 1, messages, cx.trace);
-    cx.turn_prompts.clear();
     cx.budget = ContextBudget::default();
     for message in cx.segment.messages() {
         cx.budget.append(message);
     }
-    if let Some(tokens) = counted {
-        cx.budget.at_most(tokens);
-    }
     cx.tally.compactions += 1;
     Ok(())
-}
-
-fn kept_turns_start(messages: &[Value]) -> usize {
-    let mut assistants = messages
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, message)| message["role"] == "assistant")
-        .map(|(index, _)| index);
-    let last = assistants.next();
-    assistants.next().or(last).unwrap_or(messages.len())
 }
 
 fn summary(sampled: &Sampled) -> Option<String> {
