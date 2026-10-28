@@ -219,15 +219,28 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         for call in environment.calls:
             self.assertNotIn(SECRET, json.dumps(await compose_argv(call)))
 
-    async def test_keyless_endpoint_needs_no_key(self):
-        os.environ.pop("OPENROUTER_API_KEY")
-        agent = self.agent(base_url="http://127.0.0.1:30000/v1")
+    async def test_a_custom_endpoint_gets_no_key_unless_one_is_selected(self):
+        for host_key in (SECRET, None):
+            with self.subTest(host_key=host_key), patch.dict(os.environ, clear=True):
+                if host_key:
+                    os.environ["OPENROUTER_API_KEY"] = host_key
+                agent = self.agent(base_url="http://127.0.0.1:30000/v1")
+                environment = self.environment()
+                await agent.run("task", environment, AgentContext())
+                config = json.loads(environment.uploads["/logs/agent/input.json"])
+                self.assertIsNone(config["api_key_env"])
+                self.assertEqual(config["base_url"], "http://127.0.0.1:30000/v1")
+                self.assertEqual(set(environment.uploads), {"/logs/agent/input.json"})
+                for call in environment.calls:
+                    self.assertNotIn("OPENROUTER_API_KEY", call["command"])
+
+    async def test_a_selected_key_reaches_a_custom_endpoint(self):
+        agent = self.agent(base_url="http://127.0.0.1:30000/v1", model_api_key_name="OPENROUTER_API_KEY")
         environment = self.environment()
         await agent.run("task", environment, AgentContext())
         config = json.loads(environment.uploads["/logs/agent/input.json"])
-        self.assertIsNone(config["api_key_env"])
-        self.assertEqual(config["base_url"], "http://127.0.0.1:30000/v1")
-        self.assertEqual(set(environment.uploads), {"/logs/agent/input.json"})
+        self.assertEqual(config["api_key_env"], "OPENROUTER_API_KEY")
+        self.assertIn(SECRET + "\n", environment.uploads.values())
 
     async def test_a_selected_or_default_key_is_required_before_any_exec(self):
         os.environ.pop("OPENROUTER_API_KEY")

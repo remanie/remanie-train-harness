@@ -130,10 +130,9 @@ class RemanieAgent(BaseInstalledAgent):
 
     def _credential(self) -> tuple[str, str] | None:
         connection = self.model_connection
-        if self._model_api_key_name or connection.base_url_is_default:
-            require_model_api_key(connection, self.name())
-        if not connection.api_key:
+        if not (self._model_api_key_name or connection.base_url_is_default):
             return None
+        require_model_api_key(connection, self.name())
         return connection.api_key_destination_name, connection.api_key
 
     async def _upload_private(self, environment: BaseEnvironment, content: str, remote_path: str) -> None:
