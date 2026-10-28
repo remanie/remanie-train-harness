@@ -1,34 +1,45 @@
-Local Harbor integration check
+Checks
 
-Use Harbor 0.25, Docker, host.docker.internal resolving to the host, and the
-bundled Linux runtime in ../runtime. The runtime and Docker worker must use the
-same CPU architecture. From the repository root:
+Run each command from the repository root. .venv is the Python environment
+from harbor/README.md with pytest also installed.
 
-  python checks/check_harbor.py
+cargo fmt --check
+  Rust formatting against rustfmt.toml.
 
-The selected Python must have harbor/requirements.txt installed. Optional
---runtime-dir and --output-dir select the bundle and a fresh evidence directory.
-By default, evidence is retained under the operating system's temporary folder.
+cargo clippy --locked --all-targets -- -D warnings
+  Rust lints, with every warning an error.
 
-This runs the actual Harbor AgentFactory, Trial, Docker environment, adapter,
-Rust tools, compaction, and Harbor verifier against a scripted local HTTP server.
-The sandbox calls that server directly through host.docker.internal. This
-address belongs to the local fixture, not the agent adapter. The server listens
-on the host's network interfaces and accepts only a fixed fake API key. No paid
-model endpoint is used. A pinned multi-architecture Debian image supplies the
-OS. Docker may download that image if it is not already cached.
+cargo test --locked
+  Rust unit tests. Needs rg on PATH or RG_BIN_PATH.
 
-The completed trial exercises all eight tools, forces one compaction, checks
-that the todo and live background task survive it, then verifies the edited
-file and cleanup of both explicitly stopped and leftover background processes.
-The second trial has an eight-second Harbor timeout and a longer Rust deadline;
-it also overwrites the old PID-file location. The verifier requires its
-background process to be gone before verification. The third trial forces a
-missing host process identity and checks that Harbor skips verification and
-tears down the environment.
-The fourth trial kills the Rust runner while its tool process keeps running.
-Harbor must skip verification and destroy the environment.
-The verifier shares the task's process namespace so it can test that cleanup.
+python3 checks/licenses.py --check
+  Fails when THIRD-PARTY-NOTICES differs from the notices rebuilt from
+  Cargo.lock. It runs cargo --offline, so run cargo fetch --locked first.
+  Without --check it rewrites the file.
 
-A passing reward belongs only to this integration fixture. It is not a
-Terminal-Bench score or evidence of model task-solving ability.
+.venv/bin/python -m pytest harbor/ checks/ -q
+  Adapter, trace reader and packaging unit tests. Set REMANIE_BUNDLE to a
+  bundle directory to also check that the bundle carries contract.json and a
+  working rg.
+
+.venv/bin/python checks/check_harbor.py
+  Real Harbor trials in Docker against a scripted local endpoint, with no paid
+  model calls. Needs Docker, host.docker.internal resolving to the host, and
+  the bundle in runtime/ built for the Docker worker's CPU architecture.
+  --runtime-dir picks another bundle. --output-dir picks a new directory for
+  the trial output, which otherwise goes under the system temp folder.
+  It runs five trials:
+    completed       all eight tools and one compaction, graded with reward 1
+    timeout         Harbor's timeout cancels the runner, still graded
+    cleanup_error   the stop is never confirmed, verifier skipped
+    crash           the runner is killed, verifier skipped
+    infrastructure  the endpoint returns 401, exit 70, verifier skipped
+  A passing reward says the integration works. It is not a Terminal-Bench
+  score.
+
+CI
+
+.github/workflows/checks.yml runs on every pull request and every push to
+main. It runs cargo fmt --check, cargo clippy, cargo test, licenses.py
+--check, builds and packages the bundle, runs pytest with REMANIE_BUNDLE set,
+and compiles every tracked Python file. It does not run check_harbor.py.
