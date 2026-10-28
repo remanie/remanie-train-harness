@@ -1,4 +1,4 @@
-// Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
+// Adapted from Grok Build 2bdd1d6a. NOTICE names the source.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -204,7 +204,7 @@ impl TerminalSession {
         let ids = args["task_ids"].as_array().context("missing task_ids")?;
         ensure!(
             !ids.is_empty() && ids.len() <= 20,
-            "task_ids must have 1–20 entries"
+            "task_ids must have 1 to 20 entries"
         );
         let timeout = args["timeout_ms"].as_u64().unwrap_or(0);
         ensure!(timeout <= 300_000, "timeout_ms exceeds 300000");

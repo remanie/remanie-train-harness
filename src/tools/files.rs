@@ -1,4 +1,4 @@
-// Adapted from Grok Build 2bdd1d6a for this standalone runner; see NOTICE.
+// Adapted from Grok Build 2bdd1d6a. NOTICE names the source.
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -103,7 +103,7 @@ impl FileTools {
         }
         ensure!(
             extension != "pptx" && !is_binary(&extension, sample),
-            "non-text tool output is unsupported"
+            "cannot read a non-text file"
         );
         let start = input.offset.unwrap_or(1);
         ensure!(start > 0, "offset must be at least 1");
@@ -128,7 +128,7 @@ impl FileTools {
                     saw_bytes = true;
                     last_newline = segment.ends_with(b"\n");
                     if line_number >= start {
-                        ensure!(raw.len().saturating_add(segment.len()) <= READ_MAX_BYTES + MAX_LINES + 1, "file content exceeds 25000 tokens; use offset and limit to read a shorter range");
+                        ensure!(raw.len().saturating_add(segment.len()) <= READ_MAX_BYTES + MAX_LINES + 1, "file content exceeds 25000 tokens. Use offset and limit to read a shorter range");
                         raw.extend_from_slice(segment);
                     }
                     consumed += segment.len();
@@ -172,12 +172,12 @@ impl FileTools {
         }
         ensure!(
             output.len() <= READ_MAX_BYTES,
-            "file content exceeds 25000 tokens; use offset and limit to read a shorter range"
+            "file content exceeds 25000 tokens. Use offset and limit to read a shorter range"
         );
         if more && input.limit.is_none_or(|limit| limit >= MAX_LINES) {
             write!(
                 output,
-                "\n[lines {start}-{} shown; file continues, use offset={end}]",
+                "\n[lines {start}-{} shown. The file continues at offset={end}.]",
                 end - 1
             )?;
         }
@@ -395,7 +395,7 @@ impl FileTools {
         let mut lines = output.lines();
         let mut text = lines.by_ref().take(limit).collect::<Vec<_>>().join("\n");
         if lines.next().is_some() {
-            text.push_str("\n... [output truncated; narrow the path or pattern] ...");
+            text.push_str("\n... [output truncated. Narrow the path or pattern.] ...");
         }
         Ok(text)
     }
@@ -427,7 +427,7 @@ impl FileTools {
             None => {
                 ensure!(
                     count > 0 && count <= 10,
-                    "PDF has {count} pages; use pages to select up to 20 pages per call"
+                    "PDF has {count} pages. Use pages to select up to 20 pages per call"
                 );
                 (1..=count).collect()
             }
@@ -457,7 +457,7 @@ impl FileTools {
             ensure!(code == 0, "pdftotext failed (exit {code}): {text}");
             ensure!(
                 !text.ends_with("\n[output truncated]"),
-                "PDF text exceeds 25000 tokens; select fewer pages"
+                "PDF text exceeds 25000 tokens. Select fewer pages"
             );
             if !output.is_empty() {
                 output.push('\n');
@@ -466,7 +466,7 @@ impl FileTools {
             output.push_str(&text);
             ensure!(
                 output.len() <= READ_MAX_BYTES,
-                "PDF text exceeds 25000 tokens; select fewer pages"
+                "PDF text exceeds 25000 tokens. Select fewer pages"
             );
         }
         let output = output
@@ -477,7 +477,7 @@ impl FileTools {
             .join("\n");
         ensure!(
             output.len() <= READ_MAX_BYTES,
-            "PDF text exceeds 25000 tokens; select fewer pages"
+            "PDF text exceeds 25000 tokens. Select fewer pages"
         );
         Ok(output)
     }
@@ -522,8 +522,8 @@ impl FileTools {
     }
 }
 
-// In place rather than rename, so the inode, owner, mode and hardlinks survive; a crash
-// mid-write can leave the file partly written.
+// Writes in place rather than renaming, so the inode, owner, mode, and hard links survive. A
+// crash mid-write can leave the file partly written.
 fn write_file(
     path: &Path,
     existing: Option<&(std::fs::File, std::fs::Metadata)>,
@@ -540,8 +540,8 @@ fn write_file(
             .open(path)?;
         return Ok(file.write_all(text.as_bytes())?);
     };
-    let current =
-        std::fs::symlink_metadata(path).context("file changed during edit; read_file again")?;
+    let current = std::fs::symlink_metadata(path)
+        .context("file changed during the edit. Call read_file again")?;
     let fingerprint = |metadata: &std::fs::Metadata| {
         (
             metadata.dev(),
@@ -555,7 +555,7 @@ fn write_file(
     };
     ensure!(
         current.is_file() && fingerprint(&current) == fingerprint(expected),
-        "file changed during edit; read_file again"
+        "file changed during the edit. Call read_file again"
     );
     file.write_all_at(text.as_bytes(), 0)?;
     file.set_len(text.len() as u64)?;

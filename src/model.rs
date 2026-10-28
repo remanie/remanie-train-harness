@@ -184,8 +184,9 @@ pub fn http_client() -> Result<reqwest::Client, Cause> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
-        // A pooled connection the server closed while tools ran would fail after send, which
-        // is never retried; one connection per request keeps that from looking like a lost reply.
+        // A pooled connection that the server closed while tools ran would fail after the send,
+        // and the runner never retries such a failure. One connection per request keeps it from
+        // looking like a lost reply.
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|error| Cause::Internal {
