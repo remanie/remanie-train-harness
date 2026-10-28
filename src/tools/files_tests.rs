@@ -799,3 +799,28 @@ fn test_pdf(texts: &[&str]) -> Vec<u8> {
     .unwrap();
     pdf.into_bytes()
 }
+
+#[tokio::test]
+async fn overlapping_matches_are_ambiguous_unless_replace_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = FileTools::new(dir.path().to_path_buf(), dir.path().join("home"));
+    let path = dir.path().join("closing.rb");
+    tokio::fs::write(&path, "end\nend\nend\n").await.unwrap();
+    let edit = json!({"file_path":"closing.rb","old_string":"end\nend","new_string":"done"});
+    let error = tools.call("search_replace", &edit).await.unwrap_err();
+    assert!(
+        error.to_string().contains("found multiple times"),
+        "{error}"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "end\nend\nend\n"
+    );
+    let mut edit = edit;
+    edit["replace_all"] = json!(true);
+    tools.call("search_replace", &edit).await.unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&path).await.unwrap(),
+        "done\nend\n"
+    );
+}

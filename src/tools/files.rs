@@ -243,8 +243,12 @@ impl FileTools {
                 count > 0,
                 "The string to replace was not found in the file, use the read_file tool to see the correct string."
             );
+            let overlapping = matching.find(needle.as_ref()).is_some_and(|start| {
+                let next = start + needle.chars().next().map_or(1, char::len_utf8);
+                matching[next..].contains(needle.as_ref())
+            });
             ensure!(
-                count == 1 || input.replace_all,
+                (count == 1 && !overlapping) || input.replace_all,
                 "The string to replace was found multiple times in the file. Use replace_all to replace all occurrences, or include more context to only edit one occurrence."
             );
             let replacement = if normalize {
