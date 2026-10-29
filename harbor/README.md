@@ -11,6 +11,8 @@ cargo build --release --locked
 python3 package_linux.py target/release/remanie-train-harness runtime
 ```
 
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the x86_64 bundle as the release asset `remanie-train-harness-<tag>-linux-x86_64.tar.gz` beside its `.sha256`. The archive holds `runtime/`.
+
 The output directory must be new. It holds the runner, `rg`, their Linux loader and shared libraries, the license notices, `contract.json`, and `manifest.json` with the architecture and each file's sha256.
 
 ## Job settings

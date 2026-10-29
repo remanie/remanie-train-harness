@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: rustup toolchain install
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - run: python3 package_linux.py target/release/remanie-train-harness runtime
+      - name: Archive the bundle with its checksum
+        run: |
+          name="remanie-train-harness-${GITHUB_REF_NAME}-linux-$(uname -m).tar.gz"
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$(git log -1 --format=%ct)" -cf - runtime | gzip -n > "$name"
+          sha256sum "$name" > "$name.sha256"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+      - run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "$(cat "$ARCHIVE.sha256")" "$ARCHIVE" "$ARCHIVE.sha256"
+        env:
+          GH_TOKEN: ${{ github.token }}
