@@ -1,0 +1,16 @@
+Remanie training harness
+
+This project includes modified source and prompt assets from Grok Build,
+Copyright 2023-2026 SpaceXAI, licensed under the Apache License, Version 2.0.
+The upstream source used by the harness is pinned at commit
+2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8.
+
+Retained material includes the compaction summary formatter, directory-listing
+core, todo and edit behavior, POSIX background/heredoc token helpers, terminal
+tool contracts, the per-path tool-call lock key, and prompt assets. The source has been adapted into a standalone
+eight-tool harness; the application, registry, remote tool runtime, and unused
+tools have been removed. See LICENSE for the Apache License text.
+
+THIRD-PARTY-NOTICES contains the license and attribution texts for the retained
+Rust dependencies. Packaged external executables and system libraries have
+separate notices in the runtime bundle's licenses directory.

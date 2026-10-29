@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "exit_codes": {
+    "gradable": 0,
+    "infrastructure": 70
+  },
+  "outcomes": {
+    "completed": {"gradable": true, "causes": []},
+    "max_turns": {"gradable": true, "causes": []},
+    "max_tokens": {"gradable": true, "causes": []},
+    "context_overflow": {"gradable": true, "causes": ["context_window", "request_size", "endpoint_rejected"]},
+    "invalid_response": {"gradable": true, "causes": ["empty_turn", "malformed_message", "malformed_tool_call", "duplicate_call_id", "unexpected_finish", "invalid_summary"]},
+    "deadline": {"gradable": true, "causes": []},
+    "cancelled": {"gradable": true, "causes": []},
+    "infrastructure": {"gradable": false, "causes": ["config", "endpoint_unavailable", "endpoint_status", "connection_lost", "endpoint_response", "tool_runtime", "internal"]}
+  },
+  "input": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["base_url", "model", "user_query", "workspace", "session_dir", "sampling_params", "max_turns", "deadline_secs"],
+    "properties": {
+      "base_url": {"type": "string", "pattern": "^https?://[^/?#@\\s]+(/[^?#\\s]*)?/v1/?$"},
+      "api_key_env": {"type": ["string", "null"], "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+      "model": {"type": "string", "pattern": "\\S"},
+      "user_query": {"type": "string", "pattern": "\\S"},
+      "workspace": {"type": "string", "pattern": "^/"},
+      "session_dir": {"type": "string", "pattern": "^/"},
+      "sampling_params": {
+        "type": "object",
+        "required": ["max_tokens"],
+        "properties": {
+          "max_tokens": {"type": "integer", "minimum": 1, "maximum": 4294967295}
+        },
+        "propertyNames": {"not": {"enum": ["model", "messages", "tools", "tool_choice", "stream"]}}
+      },
+      "max_turns": {"type": "integer", "minimum": 1, "maximum": 512},
+      "deadline_secs": {"type": "integer", "minimum": 1, "maximum": 86400},
+      "context_window_tokens": {"type": ["integer", "null"], "minimum": 1},
+      "compaction": {
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "required": ["max_tokens"],
+        "properties": {
+          "threshold_tokens": {"type": "integer", "minimum": 1},
+          "max_tokens": {"type": "integer", "minimum": 1, "maximum": 4294967295}
+        }
+      }
+    },
+    "if": {"required": ["compaction"], "properties": {"compaction": {"type": "object", "not": {"required": ["threshold_tokens"]}}}},
+    "then": {"required": ["context_window_tokens"], "properties": {"context_window_tokens": {"type": "integer"}}}
+  },
+  "result": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["contract", "outcome", "gradable", "final_answer", "turns", "compactions", "model_calls", "usage", "tool_calls", "background_tasks_left_running", "trace_truncated", "wall_time_ms"],
+    "properties": {
+      "contract": {"const": 1},
+      "outcome": {"enum": ["completed", "max_turns", "max_tokens", "context_overflow", "invalid_response", "deadline", "cancelled", "infrastructure"]},
+      "cause": {"type": "object"},
+      "gradable": {"type": "boolean"},
+      "final_answer": {"type": "string"},
+      "turns": {"type": "integer", "minimum": 0},
+      "compactions": {"type": "integer", "minimum": 0},
+      "model_calls": {"type": "integer", "minimum": 0},
+      "usage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["prompt_tokens", "completion_tokens", "cached_tokens", "complete"],
+        "properties": {
+          "prompt_tokens": {"type": "integer", "minimum": 0},
+          "completion_tokens": {"type": "integer", "minimum": 0},
+          "cached_tokens": {"type": "integer", "minimum": 0},
+          "complete": {"type": "boolean"}
+        }
+      },
+      "tool_calls": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["total", "ok", "failed", "invalid_arguments", "unknown_tool"],
+        "properties": {
+          "total": {"type": "integer", "minimum": 0},
+          "ok": {"type": "integer", "minimum": 0},
+          "failed": {"type": "integer", "minimum": 0},
+          "invalid_arguments": {"type": "integer", "minimum": 0},
+          "unknown_tool": {"type": "integer", "minimum": 0}
+        }
+      },
+      "background_tasks_left_running": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["task_id", "pid", "command"],
+          "properties": {
+            "task_id": {"type": "string"},
+            "pid": {"type": "integer"},
+            "command": {"type": "string"}
+          }
+        }
+      },
+      "trace_truncated": {"type": "boolean"},
+      "wall_time_ms": {"type": "integer", "minimum": 0}
+    },
+    "allOf": [
+      {
+        "if": {"properties": {"outcome": {"const": "infrastructure"}}},
+        "then": {"required": ["cause"], "properties": {"gradable": {"const": false}}},
+        "else": {"properties": {"gradable": {"const": true}}}
+      },
+      {
+        "if": {"properties": {"outcome": {"enum": ["context_overflow", "invalid_response", "infrastructure"]}}},
+        "then": {"required": ["cause"], "properties": {"cause": {"required": ["kind"], "properties": {"kind": {"type": "string"}}}}}
+      },
+      {
+        "if": {"properties": {"outcome": {"const": "deadline"}}},
+        "then": {
+          "required": ["cause"],
+          "properties": {"cause": {"additionalProperties": false, "required": ["request_in_flight"], "properties": {"request_in_flight": {"type": "boolean"}}}}
+        }
+      },
+      {
+        "if": {"properties": {"outcome": {"enum": ["completed", "max_turns", "max_tokens", "cancelled"]}}},
+        "then": {"not": {"required": ["cause"]}}
+      }
+    ]
+  }
+}

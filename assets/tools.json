@@ -1,0 +1,243 @@
+{
+  "run_terminal_cmd": {
+    "description": "Run a bash command and return its output.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The bash command to run."
+        },
+        "description": {
+          "type": "string",
+          "description": "One sentence explanation as to why this command needs to be run and how it contributes to the goal."
+        },
+        "block_until_ms": {
+          "type": "integer",
+          "description": "How long to block and wait for the command to complete before moving it to background (in milliseconds). Defaults to 30000ms. Set to 0 to immediately run the command in the background. The timer includes the shell startup time."
+        }
+      },
+      "required": [
+        "command",
+        "description"
+      ]
+    }
+  },
+  "get_terminal_command_output": {
+    "description": "Get output and status from a background terminal command.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "task_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Task IDs to get output from. Pass one or more; for a single task use a one-element array. With a positive timeout_ms, multiple ids wait until all complete. Omit timeout_ms or pass 0 for a non-blocking snapshot."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "maximum": 3600000,
+          "description": "Max wait time in milliseconds, up to 3600000 (~1 h). A positive value waits for completion; omit or pass 0 for a non-blocking status poll."
+        }
+      },
+      "required": []
+    }
+  },
+  "kill_terminal_command": {
+    "description": "Terminate a running background terminal command.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The task ID to terminate"
+        }
+      },
+      "required": [
+        "task_id"
+      ]
+    }
+  },
+  "read_file": {
+    "description": "Read a file.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target_file": {
+          "type": "string",
+          "description": "The path of the file to read. You can use either a relative path in the workspace or an absolute path. If an absolute path is provided, it will be preserved as is."
+        },
+        "offset": {
+          "type": "integer",
+          "default": 1,
+          "description": "The line number to start reading from. Only provide if the file is too large to read at once."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "The number of lines to read. Only provide if the file is too large to read at once."
+        },
+        "pages": {
+          "type": "string",
+          "description": "Page range for PDF files (e.g. '1-5', '3', '10-'). Required for PDFs with more than 10 pages. Max 20 pages per call. Ignored for non-PDF files."
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "image",
+            "text"
+          ],
+          "default": "image",
+          "description": "Output format for PDF files. 'image' (default) renders pages as images. 'text' extracts text content. Ignored for non-PDF files."
+        }
+      },
+      "required": [
+        "target_file"
+      ]
+    }
+  },
+  "search_replace": {
+    "description": "Replace an exact string in a file.\n\n- `read_file` prefixes each line with \"LINE_NUMBER→\". That prefix is not part of the file: match only what comes after the →, with its exact indentation.\n- `old_string` must match exactly one place in the file. If it appears more than once, add surrounding lines to make it unique, or set `replace_all` to change every occurrence (handy for renaming an identifier).\n- To create a new file, set `old_string` to an empty string.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "The path to the file to modify. You can use either a relative path in the workspace or an absolute path."
+        },
+        "old_string": {
+          "type": "string",
+          "description": "The text to replace"
+        },
+        "new_string": {
+          "type": "string",
+          "description": "The text to replace it with (must be different from old_string)"
+        },
+        "replace_all": {
+          "type": "boolean",
+          "default": false,
+          "description": "Replace all occurrences of old_string (default false)"
+        }
+      },
+      "required": [
+        "file_path",
+        "old_string",
+        "new_string"
+      ]
+    }
+  },
+  "list_dir": {
+    "description": "Lists files and directories in a given path.\nThe 'target_directory' parameter can be relative to the workspace root or absolute.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target_directory": {
+          "type": "string",
+          "description": "Path to directory to list contents of, relative to the workspace root or absolute."
+        }
+      },
+      "required": [
+        "target_directory"
+      ]
+    }
+  },
+  "grep": {
+    "description": "Search file contents with regular expressions (ripgrep).\n\n- Full regex syntax, so escape literal special characters: `functionCall\\(`, or `interface\\{\\}` to find interface{} in Go.\n- Pass pattern as a raw regex string — no surrounding quotes.\n- Respects .gitignore unless you pass a broad glob like '--glob *'.\n- Only filter by 'type' or 'glob' when you are sure of the file type; import paths may not match source file types (.js vs .ts).\n- Output is ripgrep-style: ':' marks match lines, '-' marks context lines, grouped by file. Large results are capped and report \"at least\" counts.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "The regular expression pattern to search for in file contents (rg --regexp)"
+        },
+        "path": {
+          "type": "string",
+          "description": "File or directory to search in (rg pattern -- PATH). Defaults to workspace path."
+        },
+        "glob": {
+          "type": "string",
+          "description": "Glob pattern (rg --glob GLOB -- PATH) to filter files (e.g. \"*.js\", \"*.{ts,tsx}\")."
+        },
+        "-B": {
+          "type": "integer",
+          "description": "Number of lines to show before each match (rg -B)."
+        },
+        "-A": {
+          "type": "integer",
+          "description": "Number of lines to show after each match (rg -A)."
+        },
+        "-C": {
+          "type": "integer",
+          "description": "Number of lines to show before and after each match (rg -C)."
+        },
+        "-i": {
+          "type": "boolean",
+          "default": false,
+          "description": "Case insensitive search (rg -i)."
+        },
+        "type": {
+          "type": "string",
+          "description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than glob for standard file types."
+        },
+        "head_limit": {
+          "type": "integer",
+          "description": "Limit output to first N lines/entries, equivalent to \"| head -N\". Defaults to 200 lines or 500 entries."
+        },
+        "multiline": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall)."
+        }
+      },
+      "required": [
+        "pattern"
+      ]
+    }
+  },
+  "todo_write": {
+    "description": "Create and manage a structured task list. The user sees this list live — it is your primary way to show progress.\n\nUse for any task with 3+ steps. Skip for trivial single-step work.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "merge": {
+          "type": "boolean",
+          "default": true,
+          "description": "Optional. When true (default), merges the provided todos into the existing list by id — send only the items you are changing, and to flip status without changing content send just id + status. When false, the provided todos replace the existing list."
+        },
+        "todos": {
+          "type": "array",
+          "description": "Array of todo items to write to the workspace",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique identifier for the todo item"
+              },
+              "content": {
+                "type": "string",
+                "description": "The description/content of the todo item"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed",
+                  "cancelled"
+                ],
+                "description": "The status of the todo item: pending, in_progress, completed, or cancelled"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        }
+      },
+      "required": [
+        "todos"
+      ]
+    }
+  }
+}

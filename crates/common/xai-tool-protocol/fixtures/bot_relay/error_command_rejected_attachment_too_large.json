@@ -1,6 +1,0 @@
-{
-  "code": "command_rejected",
-  "retryable": false,
-  "detail": {},
-  "reason": "attachment_too_large"
-}

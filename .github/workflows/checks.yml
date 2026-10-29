@@ -1,0 +1,35 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo fetch --locked
+      - run: python3 checks/licenses.py --check
+      - run: cargo build --release --locked
+      - run: python3 package_linux.py target/release/remanie-train-harness runtime
+      - run: python3 -m pip install -r harbor/requirements.txt pytest==9.2.0
+      - run: |
+          python3 checks/make_trace_fixture.py target/release/remanie-train-harness
+          git diff --exit-code harbor/fixtures/requests.jsonl
+      - run: python3 -m pytest harbor/ checks/ -q
+        env:
+          REMANIE_BUNDLE: runtime
+      - run: git ls-files -z '*.py' | xargs -0 python3 -m py_compile

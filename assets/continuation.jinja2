@@ -1,0 +1,33 @@
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+{{ summary }}
+{%- if tasks or todos %}
+
+
+<system-reminder>
+{% if tasks %}
+## Running Background Tasks
+These tasks are still running:
+{% for task in tasks %}
+- "{{ task.task_id }}": `{{ task.command }}` (running, run_terminal_cmd)
+{% endfor %}
+{% if todos %}
+
+{% endif %}
+{% endif %}
+{% if todos %}
+## TODO List
+This is your task list from before the conversation was compacted — it is still active. Keep working through the items below and update their status as you make progress:
+{% for todo in todos %}
+- [{{ todo.status }}] {{ todo.id }}: {{ todo.content }}
+{% endfor %}
+{% if completed and cancelled %}
+({{ completed }} completed, {{ cancelled }} cancelled)
+{% elif completed %}
+({{ completed }} completed)
+{% elif cancelled %}
+({{ cancelled }} cancelled)
+{% endif %}
+{% endif %}
+</system-reminder>
+{%- endif %}

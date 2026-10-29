@@ -1,140 +1,118 @@
-<div align="center">
+# remanie-train-harness
 
-<h1>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://media.x.ai/v1/website/spacexai-symbol-white-transparent-0c31957f.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png">
-    <img alt="SpaceXAI logo" src="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png" width="96">
-  </picture>
-  <br>
-  Grok Build (<code>grok</code>)
-</h1>
+`remanie-train-harness` is the agent runtime a model trains through on Harbor tasks. One process runs one attempt inside the task sandbox. It reads one JSON object on stdin, sends every model call to one OpenAI-compatible `/v1/chat/completions` endpoint, runs the tool calls, and exits with a code that tells Harbor whether to grade the sandbox. In training the endpoint is Miles' session server, which records token ids and log-probs. The runner never sees them and never computes a reward.
 
-**Grok Build** is SpaceXAI's terminal-based AI coding agent. It runs as a
-full-screen TUI that understands your codebase, edits files, executes shell
-commands, searches the web, and manages long-running tasks — interactively,
-headlessly for scripting/CI, or embedded in editors via the Agent Client
-Protocol (ACP).
+Each request carries the two-sentence system prompt from `assets/system_prompt.jinja2`, the first user message from `assets/user_query.jinja2` (Grok Build's `<user_info>` block with the OS, the shell, the workspace path and the date, then the task wrapped once in `<user_query>` tags), and the eight tool definitions from `assets/tools.json`. Turn requests send `tool_choice: "auto"`, and compaction requests send `tool_choice: "none"`. The endpoint applies the chat template and parses the tool calls. Until a compaction, the history only grows. The runner appends each assistant message exactly as the endpoint returned it, runs its tool calls at the same time, and appends one tool message per call in the order the calls are listed. Grok Build appends them in the order they finish, but Qwen3's chat template drops `tool_call_id`, so the model can tell which result answers which call only by position. Calls in one reply that name the same file in `file_path`, `path`, or `target_file` run one at a time, in the order listed, if any of them writes. Compaction runs only when the input sets `compaction`. The runner records every message, model call, and tool call in `trace.jsonl` during the attempt.
 
-[Installing the released binary](#installing-the-released-binary) ·
-[Building from source](#building-from-source) ·
-[Documentation](#documentation) ·
-[Repository layout](#repository-layout) ·
-[Development](#development) ·
-[Contributing](#contributing) ·
-[License](#license)
+It has no interactive mode, no permission prompts, and no workspace confinement. The sandbox isolates the task.
 
-![Grok Build TUI](https://media.x.ai/v1/website/universe-tui-screenshot-6f7a0837.png)
+## Input
 
-**Learn more about Grok Build at [x.ai/cli](https://x.ai/cli)**
+`assets/contract.json` holds the input schema. The runner embeds it, and the Harbor adapter checks job settings against it on the host. The runner reads at most 1 MiB from stdin and refuses unknown fields.
 
-This repository contains the Rust source for the `grok` CLI/TUI and its agent
-runtime. It is synced periodically from the SpaceXAI monorepo.
+| Field | Required | Meaning |
+|---|---|---|
+| `base_url` | yes | `http` or `https` URL whose path ends in `/v1`, with no credentials, query, or fragment. |
+| `model` | yes | Model name sent with every request. |
+| `api_key_env` | no | Environment variable that holds the key. The runner reads it and removes it before any tool starts. When it is null or absent, requests carry no `Authorization` header. |
+| `user_query` | yes | The task text. |
+| `workspace` | yes | Existing absolute directory. Commands start here. |
+| `session_dir` | yes | Absolute path that must not exist yet. Its parent must exist. It receives `trace.jsonl` and `result.json`. |
+| `sampling_params` | yes | Forwarded verbatim. Must contain `max_tokens`, 1 to 4294967295. Must not set `model`, `messages`, `tools`, `tool_choice`, or `stream`. |
+| `max_turns` | yes | Turn requests allowed, 1 to 512. Compaction requests do not count. |
+| `deadline_secs` | yes | Wall-clock limit, 1 to 86400. Set it below Harbor's agent timeout. |
+| `context_window_tokens` | no | The model's context size. After the first reply, the runner ends the attempt as `context_overflow` before sending a turn request that cannot fit. Before the first reply, such a request ends the attempt as `infrastructure` with cause `config`. A compaction request is sized to fit instead, as described below. |
+| `compaction` | no | `{max_tokens, threshold_tokens}`. `threshold_tokens` is optional, and without it `context_window_tokens` is required. When `compaction` is null or absent, the runner never compacts. |
 
-A small `SOURCE_REV` file at the root records the full monorepo commit SHA
-for the version of the code present in this tree.
+The runner estimates a turn request's prompt tokens as the endpoint's last `usage.total_tokens` plus a quarter of the bytes of the tool messages appended since. The request fits when the estimate plus `sampling_params.max_tokens` is at most `context_window_tokens`. With compaction on, the runner compacts before a turn request once the estimate reaches `threshold_tokens`, or 85% of `context_window_tokens` when `threshold_tokens` is absent. It also compacts once the estimate plus `sampling_params.max_tokens` exceeds `context_window_tokens`, or once the estimate plus the summary prompt's estimate plus `compaction.max_tokens` does. When the endpoint refuses a turn request for its length and the segment holds a reply, the runner compacts and sends the turn again, as Grok Build does. For the compaction request, the runner appends Grok Build's summary prompt from `assets/compaction.jinja2` as a user message and sends `compaction.max_tokens` in place of `sampling_params.max_tokens`. With `context_window_tokens` set, it caps that at 95% of the window minus the estimate, with the summary prompt counted. When that leaves nothing, the attempt ends as `context_overflow` with cause `context_window`, and the request is not sent. The reply's `<summary>` block becomes a `Summary:` heading. A summary cut off at that `max_tokens` is kept, as Grok Build keeps it. The next segment holds the system prompt, the task, and one user message from `assets/continuation.jinja2`. That message holds Grok Build's preamble saying the session continues, followed by the summary. When background tasks are still running or todos are open, the message ends with a `<system-reminder>` that lists them. No earlier turn is kept. The estimate then restarts at a quarter of the new segment's bytes.
 
-</div>
+## Exit codes and result
 
----
+| Exit | Meaning |
+|---|---|
+| 0 | Gradable. The sandbox state is the policy's product. |
+| 70 | Infrastructure failure. Do not grade. |
+| anything else | The process died, for example a panic (101) or a signal. Do not grade. |
 
-## Installing the released binary
+`contract.json` lists each outcome and the `cause.kind` values it can carry.
 
-Prebuilt binaries are published for macOS, Linux, and Windows:
+| `outcome` | Exit | When |
+|---|---|---|
+| `completed` | 0 | The model replied without tool calls. |
+| `max_turns` | 0 | The runner sent `max_turns` turn requests. The last turn's tools ran. |
+| `max_tokens` | 0 | The reply ended with `finish_reason: "length"`. |
+| `context_overflow` | 0 | After the first reply, the next request does not fit `context_window_tokens` (`context_window`) or exceeds 16 MiB (`request_size`), or the endpoint refuses it for its length (`endpoint_rejected`). |
+| `invalid_response` | 0 | `empty_turn`, `malformed_message`, `malformed_tool_call`, `duplicate_call_id` within one reply, `unexpected_finish`, or `invalid_summary`. |
+| `deadline` | 0 | `deadline_secs` passed. `cause.request_in_flight` says whether a model request was abandoned. |
+| `cancelled` | 0 | The runner received SIGTERM or SIGINT. |
+| `infrastructure` | 70 | `config`, `endpoint_unavailable`, `endpoint_status`, `connection_lost`, `endpoint_response`, `tool_runtime`, or `internal`. |
 
-```sh
-curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux / Git Bash
-irm https://x.ai/cli/install.ps1 | iex          # Windows PowerShell
-grok --version
-```
+Before the first reply, a request that does not fit ends the attempt as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` or `"error"` ends the attempt as `infrastructure` with cause `endpoint_response`, and the runner does not resend the request.
 
-See the [changelog](https://x.ai/build/changelog) for the latest fixes,
-features, and improvements in each release.
+The runner resends a request with identical bytes only when the endpoint did not process it. It keeps resending while the next wait, at most 30 s, ends before `deadline_secs`.
 
-## Building from source
+Once the runner has created `session_dir`, it writes `<session_dir>/result.json` atomically on every exit it controls. It prints the same object on stdout. Its fields are `contract`, `outcome`, `cause`, `gradable`, `final_answer`, `turns`, `compactions`, `model_calls`, `usage`, `tool_calls`, `background_tasks_left_running`, `trace_truncated`, and `wall_time_ms`. `usage` holds `prompt_tokens`, `completion_tokens`, `cached_tokens`, and `complete`, which is false when any response lacked usage. `tool_calls` holds `total`, `ok`, `failed`, `invalid_arguments`, and `unknown_tool`. Each `background_tasks_left_running` entry holds `task_id`, `pid`, `command`, and `output_file`.
 
-Requirements:
+On exit 0 background tasks keep running so the verifier can reach them. On exit 70 the runner kills them. When writing `result.json` fails after a gradable outcome, the runner exits 70 with them still running.
 
-- **Rust** — the toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml);
-  `rustup` installs it automatically on first build.
-- **[DotSlash](https://dotslash-cli.com)** — required so hermetic tools under
-  [`bin/`](bin/) (notably [`bin/protoc`](bin/protoc)) can download and run.
-  Install it and ensure `dotslash` is on your `PATH` **before** building:
+## Trace
 
-  ```sh
-  cargo install dotslash
-  # or: prebuilt packages — https://dotslash-cli.com/docs/installation/
-  /usr/bin/env dotslash --help   # sanity check
-  ```
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `harbor/remanie_trace.py` reads the file and rebuilds the body of any request from the `header` and a message range.
 
-- **protoc** — proto codegen resolves [`bin/protoc`](bin/protoc) via DotSlash,
-  or falls back to a `protoc` on `PATH` / `$PROTOC`.
-- macOS and Linux are supported build hosts; Windows builds are best-effort
-  and not currently tested from this tree.
+| `event` | Written | Fields |
+|---|---|---|
+| `header` | once, first | `contract`, `started_at_unix_ms`, `config` (the input object), `tools` |
+| `message` | when a message is appended | `segment`, `index`, `message` |
+| `tool_call` | after each tool message | `call_id`, `name`, `class` (`ok`, `unknown_tool`, `invalid_arguments`, or `failed`), `task_id`, `latency_ms` |
+| `model_call` | per accepted response | `call`, `turn`, `kind` (`turn` or `compaction`), `prompt` (`segment`, `end`), `max_tokens_override` (compaction calls only), `attempts`, `latency_ms`, `response` verbatim |
+| `endpoint_error` | per failed attempt | `call`, `turn`, `attempt`, `failure` (`connect`, `lost`, `status`, or `response`) with that failure's fields, `retry_in_ms` |
+| `compaction` | per compaction | `from_segment`, `to_segment`, `summary_call` |
+| `result` | once, last | the `result.json` object |
 
-```sh
-cargo run -p xai-grok-pager-bin              # build + launch the TUI
-cargo build -p xai-grok-pager-bin --release  # release binary: target/release/xai-grok-pager
-cargo check -p xai-grok-pager-bin            # fast validation
-```
+When a write fails or the trace would pass 256 MiB, the runner stops tracing, finishes the attempt, and sets `trace_truncated`.
 
-The binary artifact is named `xai-grok-pager`; official installs ship it as
-`grok`. On first launch it opens your browser to authenticate — see the
-[authentication guide](crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md).
+## Tools
 
-## Documentation
+`assets/tools.json` holds Grok Build's tool descriptions without their usage notes. Its parameter names, types, descriptions, required lists, defaults, and bounds are Grok Build's too, except that `read_file`'s `format` accepts only `image` or `text` and defaults to `image`. An unknown tool name, arguments that are not JSON or fail the schema, a bound the runner checks, and a tool's own error go back to the model as the tool message. They do not end the attempt.
 
-Full online documentation is available at
-[docs.x.ai/build/overview](https://docs.x.ai/build/overview).
+| Tool | Enforced limits |
+|---|---|
+| `run_terminal_cmd` | Runs `/bin/bash --noprofile --norc -c` in `workspace` with the runner's environment, after setting 13 variables such as `TERM=dumb` and `PAGER=cat`. `block_until_ms` defaults to 30000 and is capped at 36,000,000. A command still running after `block_until_ms` becomes a background task with an id the runner assigns, such as `task-1`. If `deadline_secs` passes while the tool waits, the attempt ends as `deadline` and the runner kills the command. An unwaited `&` is refused. To run a command in the background, pass `block_until_ms` 0. The reply shows at most 20,000 bytes of output, taken from its start and end. Each command logs to `.remanie-terminal/<pid>-<n>/task-N.log` under the sandbox's temp dir, or under `/var/tmp` when `workspace` is or holds the temp dir. The log keeps every byte with no size cap, so a command that never stops writing can fill the sandbox's disk. A command runs at most 36,000 s. |
+| `get_terminal_command_output` | 1 to 20 task ids. `timeout_ms` at most 3,600,000, and 0 or no `timeout_ms` returns a snapshot. Up to 40,000 bytes per task. |
+| `kill_terminal_command` | Sends SIGTERM to every process in one task's session, then SIGKILL after 1 s, and waits up to 5 s for the task to exit. |
+| `read_file` | At most 1000 lines and about 100,000 bytes per call. When a full 1000-line window leaves lines unread, the output ends with a note naming the next `offset`. A window over about 100,000 bytes is a tool error. A read stops after 30 s. A PDF read returns `Vision is not available in this environment.` unless `format` is `text`. A read of a PNG, JPEG, GIF, or WebP file, recognized by its first bytes as in Grok Build, returns the same text as a successful read. When `format` is `text`, the tool reads a PDF of at most 50 MiB through Poppler and stops after 60 s. A PDF over 10 pages needs `pages`, at most 20 per call. |
+| `search_replace` | `old_string` must match exactly once, overlapping matches included, unless `replace_all`. The tool edits UTF-8 files up to 50 MiB, writes in place, and keeps the file's line endings. |
+| `list_dir` | Hides ignored and dot files. Scans up to 100,000 entries and stops the listing at about 10,000 bytes. |
+| `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. The tool keeps at most 40,000 bytes of `rg` output and then at most `head_limit` lines, and a result cut at `head_limit` ends with an "at least" count of the lines `rg` printed. `rg` cuts lines at 1000 columns and skips files over 5 MiB. A search stops after 20 s. When `rg` cannot read a file but finds matches, the tool returns the matches followed by the first three of `rg`'s error messages and a count of the rest. |
+| `todo_write` | `merge` defaults to `true` and updates by `id`. Each `id` may appear once per call. The list survives a compaction, and the continuation message shows the open todos. |
 
-The user guide ships with the pager crate:
-[`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
-— getting started, keyboard shortcuts, slash commands, configuration, theming,
-MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
+Paths may be absolute and may point outside `workspace`. `~` expands to the sandbox's `$HOME`.
 
-## Repository layout
+## Build and test
 
-| Path | Contents |
-|------|----------|
-| `crates/codegen/xai-grok-pager-bin` | Composition-root package; builds the `xai-grok-pager` binary |
-| `crates/codegen/xai-grok-pager` | The TUI: scrollback, prompt, modals, rendering |
-| `crates/codegen/xai-grok-shell` | Agent runtime + leader/stdio/headless entry points |
-| `crates/codegen/xai-grok-tools` | Tool implementations (terminal, file edit, search, ...) |
-| `crates/codegen/xai-grok-workspace` | Host filesystem, VCS, execution, checkpoints |
-| `crates/codegen/...` | The rest of the CLI crate closure (config, MCP, markdown, sandbox, ...) |
-| `crates/common/`, `crates/build/`, `prod/mc/` | Small shared leaf crates pulled in by the closure |
-| `third_party/` | Vendored upstream source (Mermaid diagram stack) — see below |
-
-> [!IMPORTANT]
-> The root `Cargo.toml` (workspace members, dependency versions, lints,
-> profiles) is **generated** — treat it as read-only. Prefer editing per-crate
-> `Cargo.toml` files.
-
-## Development
+`rust-toolchain.toml` pins Rust 1.94.0 with rustfmt and clippy. Install ripgrep. The tools run `rg` from `PATH`, or from the path in `RG_BIN_PATH` when it is set.
 
 ```sh
-cargo check -p <crate>        # always target specific crates; full-workspace builds are slow
-cargo test -p xai-grok-config # per-crate tests
-cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
-cargo fmt --all               # rustfmt.toml at the repo root
+cargo build --release --locked
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
 ```
 
-## Contributing
+The Rust tests run on Linux and macOS. The runtime bundle and the Harbor trials are Linux-only. On macOS, build the bundle in a Debian container and run the Harbor check against Docker. [checks/README.txt](checks/README.txt) lists every check, and [harbor/README.md](harbor/README.md) covers the runtime bundle and Harbor jobs.
 
-> [!NOTE]
-> External contributions are not accepted. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+## What the sandbox must provide
 
-## License
+- Linux on the bundle's CPU architecture.
+- `/bin/bash` and `setsid`.
+- `rg`, which the Harbor bundle carries.
+- Network access to `base_url`.
+- `pdfinfo` and `pdftotext` from Poppler, only for reading a PDF as text.
 
-First-party code in this repository is licensed under the **Apache License,
-Version 2.0** — see [`LICENSE`](LICENSE).
+## Known limits
 
-Third-party and vendored code remains under its original licenses. See:
+- Code in the sandbox can read the key from the runner's process through `/proc`. Use a key with a spending cap, or an endpoint that needs none.
+- The file tools and commands can reach any path the sandbox user can.
+- Harbor's local Docker environment does not enforce a task's disk quota.
+- A model response over 16 MiB ends the attempt with exit 70.
 
-- [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES) — crates.io / git dependencies,
-  bundled UI themes, and **in-tree source ports** (including openai/codex and
-  sst/opencode tool implementations)
-- [`crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md`](crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md)
-  — crate-local notice for the codex and opencode ports (license texts +
-  Apache §4(b) change notice)
-- [`third_party/NOTICE`](third_party/NOTICE) — vendored Mermaid-stack index
+This project derives from Grok Build. [NOTICE](NOTICE) names the source and the retained code.

@@ -1,1 +1,0 @@
-could not lock config file /opt/ws-fixture/homedir/.gitconfig: Operation not permitted

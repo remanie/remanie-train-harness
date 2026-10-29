@@ -1,1 +1,0 @@
-ls: /opt/ws-fixture/homedir/.ssh: Operation not permitted

@@ -1,1 +1,0 @@
-ls: link/: Operation not permitted

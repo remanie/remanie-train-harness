@@ -1,3 +1,0 @@
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-socket.gaierror: [Errno 8] nodename nor servname provided, or not known
