@@ -470,6 +470,34 @@ async fn an_aborted_generation_is_infrastructure_and_not_retried() {
 }
 
 #[tokio::test]
+async fn a_generation_that_errored_mid_reply_is_infrastructure_and_not_retried() {
+    let failed = ResponseTemplate::new(200).set_body_json(json!({
+        "id": "chatcmpl-test",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "partial answ"},
+            "finish_reason": "error",
+            "error": {"code": 502, "message": "Upstream error from host"}
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+    }));
+    let f = fixture(vec![
+        tool_reply(vec![list_dir("list")], 10),
+        failed,
+        final_reply(),
+    ])
+    .await;
+    let (result, exit) = f.launch(None).await;
+    assert_eq!(
+        (result["outcome"].as_str(), exit),
+        (Some("infrastructure"), 70)
+    );
+    assert_eq!(result["cause"]["kind"], "endpoint_response");
+    assert_eq!(result["gradable"], false);
+    assert_eq!(f.requests().await.len(), 2);
+}
+
+#[tokio::test]
 async fn duplicate_ids_in_one_reply_reject_the_batch_before_writing() {
     let edits = ["first.txt", "second.txt"]
         .into_iter()

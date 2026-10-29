@@ -47,7 +47,7 @@ The runner estimates a turn request's prompt tokens as the endpoint's last `usag
 | `cancelled` | 0 | The runner received SIGTERM or SIGINT. |
 | `infrastructure` | 70 | `config`, `endpoint_unavailable`, `endpoint_status`, `connection_lost`, `endpoint_response`, `tool_runtime`, or `internal`. |
 
-Before the first reply, a request that does not fit ends the attempt as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` ends the attempt as `infrastructure` with cause `endpoint_response`, and the runner does not resend the request.
+Before the first reply, a request that does not fit ends the attempt as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` or `"error"` ends the attempt as `infrastructure` with cause `endpoint_response`, and the runner does not resend the request.
 
 The runner resends a request with identical bytes only when the endpoint did not process it. It keeps resending while the next wait, at most 30 s, ends before `deadline_secs`.
 

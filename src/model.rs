@@ -395,6 +395,7 @@ fn parse(body: Vec<u8>) -> Result<(Value, Finish), Failure> {
         Some("tool_calls") => Finish::ToolCalls,
         Some("length") => Finish::Length,
         Some("abort") => return Err(unusable("generation aborted by the endpoint".into())),
+        Some("error") => return Err(unusable("generation failed at the endpoint".into())),
         Some(other) => Finish::Other(other.into()),
         None => return Err(unusable("finish_reason is missing".into())),
     };
