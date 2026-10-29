@@ -115,7 +115,7 @@ class RemanieAgent(BaseInstalledAgent):
 
     @staticmethod
     def name() -> str:
-        return "remanie_train"
+        return "remanie-train"
 
     async def install(self, environment: BaseEnvironment) -> None:
         probe = await self.exec_as_root(
