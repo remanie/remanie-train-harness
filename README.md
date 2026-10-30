@@ -57,7 +57,7 @@ On exit 0 background tasks keep running so the verifier can reach them. On exit 
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `harbor/remanie_trace.py` reads the file and rebuilds the body of any request from the `header` and a message range.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `checks/fixtures/` holds a trace recorded from one run against a scripted endpoint and the request bodies it sent; CI re-records it and fails when the bodies differ. remanie-tooling's `research/agents/remanie_train/remanie_trace.py` reads the file and rebuilds the body of any request from the `header` and a message range.
 
 | `event` | Written | Fields |
 |---|---|---|
@@ -98,7 +98,24 @@ cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-The Rust tests run on Linux and macOS. The runtime bundle and the Harbor trials are Linux-only. On macOS, build the bundle in a Debian container and run the Harbor check against Docker. [checks/README.txt](checks/README.txt) lists every check, and [harbor/README.md](harbor/README.md) covers the runtime bundle and Harbor jobs.
+The Rust tests run on Linux and macOS. The runtime bundle is Linux-only; on macOS, build it in a Debian container. [checks/README.txt](checks/README.txt) lists every check.
+
+## Build the bundle
+
+On Debian or Ubuntu, with the CPU architecture of the machines that will run it, run from the repository root:
+
+```sh
+cargo build --release --locked
+python3 package_linux.py target/release/remanie-train-harness runtime
+```
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the x86_64 bundle as the release asset `remanie-train-harness-<tag>-linux-x86_64.tar.gz` beside its `.sha256`. The archive holds `runtime/`.
+
+The output directory must be new. It holds the runner, `rg`, their Linux loader and shared libraries, the license notices, `contract.json`, and `manifest.json` with the architecture and each file's sha256.
+
+## Running under Harbor
+
+The runner knows nothing about Harbor. The Harbor agent that installs a bundle in a task sandbox, runs one attempt and converts the trace to an ATIF trajectory is `research/agents/remanie_train/` in remanie-tooling, which pins the release it runs.
 
 ## What the sandbox must provide
 

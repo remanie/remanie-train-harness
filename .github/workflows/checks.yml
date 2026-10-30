@@ -25,11 +25,11 @@ jobs:
       - run: python3 checks/licenses.py --check
       - run: cargo build --release --locked
       - run: python3 package_linux.py target/release/remanie-train-harness runtime
-      - run: python3 -m pip install -r harbor/requirements.txt pytest==9.2.0
+      - run: python3 -m pip install pytest==9.2.0
       - run: |
           python3 checks/make_trace_fixture.py target/release/remanie-train-harness
-          git diff --exit-code harbor/fixtures/requests.jsonl
-      - run: python3 -m pytest harbor/ checks/ -q
+          git diff --exit-code checks/fixtures/requests.jsonl
+      - run: python3 -m pytest checks/ -q
         env:
           REMANIE_BUNDLE: runtime
       - run: git ls-files -z '*.py' | xargs -0 python3 -m py_compile

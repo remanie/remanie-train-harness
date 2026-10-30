@@ -1,7 +1,6 @@
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,8 +10,6 @@ from unittest.mock import patch
 import package_linux
 from licenses import license_files
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harbor"))
-from remanie_agent import Bundle
 
 
 class PackageNoticesTest(unittest.TestCase):
@@ -90,11 +87,13 @@ class LauncherTest(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("REMANIE_BUNDLE"), "set REMANIE_BUNDLE to a package_linux.py output")
 class PackagedBundleTest(unittest.TestCase):
-    def test_bundle_carries_the_contract_the_adapter_reads(self):
+    def test_bundle_carries_what_the_harbor_agent_reads(self):
         root = Path(os.environ["REMANIE_BUNDLE"]).resolve()
         manifest = json.loads((root / "manifest.json").read_text())
         self.assertIn("contract.json", manifest["files"])
-        self.assertEqual(Bundle.load(root).architecture, manifest["architecture"])
+        self.assertEqual(json.loads((root / "contract.json").read_text())["exit_codes"], {"gradable": 0, "infrastructure": 70})
+        for name in ("remanie-train-harness", "rg"):
+            self.assertTrue(os.access(root / name, os.X_OK), name)
         subprocess.run([str(root / "rg"), "--version"], cwd="/", check=True, capture_output=True)
 
 
