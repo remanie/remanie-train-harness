@@ -924,6 +924,10 @@ async fn a_summary_request_that_cannot_fit_is_never_sent() {
     assert_eq!(result["compactions"], 0);
     assert_eq!(f.requests().await.len(), 2);
     assert!(f.events("compaction").is_empty());
+    assert_eq!(
+        f.events("message").last().unwrap()["message"]["role"],
+        "tool"
+    );
 }
 
 fn write_big_file(f: &Fixture) {

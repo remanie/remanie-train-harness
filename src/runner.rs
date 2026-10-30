@@ -498,8 +498,11 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let Some(compaction) = &cx.input.compaction else {
         return Ok(());
     };
-    cx.segment.push(cx.summary_prompt.clone(), cx.trace);
     let mut request = summary_request(cx, compaction, false)?;
+    let mut lossy = summary_request(cx, compaction, true)
+        .ok()
+        .filter(|lossy| lossy.messages.len() < request.messages.len());
+    cx.segment.push(cx.summary_prompt.clone(), cx.trace);
     let sampled = loop {
         let sampled = cx
             .model
@@ -515,13 +518,8 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
             )
             .await;
         match sampled {
-            Err(rejected @ Outcome::ContextOverflow(Overflow::EndpointRejected { .. }))
-                if request.input != CompactionInput::Lossy =>
-            {
-                request = summary_request(cx, compaction, true)
-                    .ok()
-                    .filter(|lossy| lossy.messages.len() < request.messages.len())
-                    .ok_or(rejected)?;
+            Err(rejected @ Outcome::ContextOverflow(Overflow::EndpointRejected { .. })) => {
+                request = lossy.take().ok_or(rejected)?;
             }
             sampled => break sampled?,
         }
@@ -565,7 +563,7 @@ struct SummaryRequest {
 
 const LOSSY_INPUT_PERCENT: u64 = 70;
 
-/// Builds the request for a segment that ends with the summary prompt. It drops the oldest turns,
+/// Builds the summary request: the segment, then the summary prompt. It drops the oldest turns,
 /// each an assistant message with the tool messages that answer it, until the request fits, as
 /// Grok Build's `fit_conversation_to_budget` does. The last turn always stays.
 fn summary_request(
@@ -624,11 +622,12 @@ fn summary_request(
     };
     let mut messages = history[..first].to_vec();
     messages.extend_from_slice(&history[keep_from..]);
+    messages.push(cx.summary_prompt.clone());
     Ok(SummaryRequest {
         messages,
         prompt: MessageRange {
             segment: cx.segment.index(),
-            end: history.len(),
+            end: history.len() + 1,
             omitted: omitted.into_iter().collect(),
         },
         max_tokens,
