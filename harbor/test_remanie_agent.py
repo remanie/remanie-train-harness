@@ -372,6 +372,64 @@ class RemanieAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(metadata["result_invalid"])
         self.assertNotIn("secret-must-not-be-read", json.dumps(metadata))
 
+    def test_trace_becomes_an_atif_trajectory(self):
+        agent = self.agent()
+        lines = (REPO / "harbor/fixtures/trace.jsonl").read_text().splitlines(keepends=True)
+        session = self.logs / "remanie"
+        session.mkdir()
+        (session / "trace.jsonl").write_text("".join(lines))
+        (self.logs / "result.json").write_text(json.dumps({"outcome": "completed", "usage": {
+            "prompt_tokens": 34800, "completion_tokens": 70, "cached_tokens": 8000, "complete": True}}))
+        context = AgentContext()
+        agent.populate_context_post_run(context)
+        trajectory = json.loads((self.logs / "trajectory.json").read_text())
+        self.assertTrue(trajectory["schema_version"].startswith("ATIF-v1."))
+        self.assertEqual(trajectory["agent"]["name"], "remanie-train")
+        self.assertEqual(trajectory["agent"]["model_name"], "x-ai/grok-4.7")
+        self.assertEqual([tool["function"]["name"] for tool in trajectory["agent"]["tool_definitions"]][:1], ["run_terminal_cmd"])
+        steps = trajectory["steps"]
+        self.assertEqual([step["source"] for step in steps], ["system", "user", "agent", "user", "agent", "system", "user", "user", "agent"])
+        self.assertEqual([step["step_id"] for step in steps], list(range(1, 10)))
+        first = steps[2]
+        self.assertEqual([call["function_name"] for call in first["tool_calls"]], ["search_replace", "read_file"])
+        self.assertEqual(first["tool_calls"][1]["arguments"], {"target_file": "hello.txt"})
+        self.assertEqual([(r["source_call_id"], r["content"]) for r in first["observation"]["results"]],
+                         [("call-write", "The file hello.txt has been created."), ("call-read", "1\u2192hello\n")])
+        self.assertEqual(first["metrics"], {"prompt_tokens": 17000, "completion_tokens": 40, "cached_tokens": 0})
+        self.assertEqual(steps[4]["metrics"], {"prompt_tokens": 17200, "completion_tokens": 20, "cached_tokens": 8000})
+        self.assertEqual([step.get("is_copied_context") for step in steps[5:8]], [True, True, None])
+        self.assertEqual(steps[8]["model_name"], "fixture-model")
+        self.assertEqual(trajectory["final_metrics"], {
+            "total_prompt_tokens": 34800, "total_completion_tokens": 70, "total_cached_tokens": 8000, "total_steps": 9})
+        self.assertIsNone(context.cost_usd)
+        self.assertEqual((context.n_input_tokens, context.n_output_tokens, context.n_cache_tokens), (34800, 70, 8000))
+
+        priced = []
+        for line in lines:
+            event = json.loads(line)
+            if event["event"] == "model_call":
+                event["response"]["usage"]["cost"] = 0.25
+            priced.append(json.dumps(event) + "\n")
+        (session / "trace.jsonl").write_text("".join(priced))
+        context = AgentContext()
+        agent.populate_context_post_run(context)
+        trajectory = json.loads((self.logs / "trajectory.json").read_text())
+        self.assertEqual(trajectory["steps"][2]["metrics"]["cost_usd"], 0.25)
+        self.assertEqual(trajectory["final_metrics"]["total_cost_usd"], 0.75)
+        self.assertEqual(context.cost_usd, 0.75)
+
+        (session / "trace.jsonl").write_text("".join(lines).rstrip("\n"))
+        agent.populate_context_post_run(AgentContext())
+        trajectory = json.loads((self.logs / "trajectory.json").read_text())
+        self.assertEqual(trajectory["final_metrics"], {"total_steps": 9})
+
+        (self.logs / "trajectory.json").unlink()
+        (session / "trace.jsonl").unlink()
+        context = AgentContext()
+        agent.populate_context_post_run(context)
+        self.assertFalse((self.logs / "trajectory.json").exists())
+        self.assertEqual(context.n_input_tokens, 34800)
+
 
 if __name__ == "__main__":
     unittest.main()

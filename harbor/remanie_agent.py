@@ -21,6 +21,18 @@ from harbor.agents.options import InstalledAgentOptions
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.model_api_format import ModelApiFormat
+from harbor.models.trajectories import (
+    Agent,
+    FinalMetrics,
+    Metrics,
+    Observation,
+    ObservationResult,
+    Step,
+    ToolCall,
+    Trajectory,
+)
+
+import remanie_trace
 
 RUNTIME = PurePosixPath("/opt/remanie-train-harness")
 MAX_RESULT_BYTES = 16 * 1024 * 1024
@@ -80,7 +92,7 @@ class RemanieOptions(InstalledAgentOptions):
 
 class RemanieAgent(BaseInstalledAgent):
     options_model = RemanieOptions
-    capabilities = AgentCapabilities(base_url=True)
+    capabilities = AgentCapabilities(base_url=True, atif=True)
     MODEL_CONNECTION = ModelConnectionSpec(
         default_provider="openrouter",
         agent_provider_access=ProviderAccess(
@@ -278,3 +290,95 @@ exit 1
             if all(type(count) is int and count >= 0 for count in counts):
                 context.n_input_tokens, context.n_output_tokens, context.n_cache_tokens = counts
         context.metadata = {**(context.metadata or {}), "remanie": metadata}
+        try:
+            trace = remanie_trace.read(self.logs_dir / "remanie")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self.logger.warning(f"No trajectory written: the trace could not be read: {error!r}")
+            return
+        trajectory = self._trajectory(trace)
+        (self.logs_dir / "trajectory.json").write_text(
+            json.dumps(trajectory.to_json_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        if trajectory.final_metrics and trajectory.final_metrics.total_cost_usd is not None:
+            context.cost_usd = trajectory.final_metrics.total_cost_usd
+
+    def _trajectory(self, trace: remanie_trace.Trace) -> Trajectory:
+        # The runner appends a call's reply at the index its prompt ended, so (segment, end) names the reply.
+        replies = {(call.segment, call.end): call for call in trace.calls}
+        steps: list[Step] = []
+        by_call_id: dict[str, Step] = {}
+        earlier: set[tuple[str, str]] = set()
+        costs: list[float] = []
+        for segment_index, segment in enumerate(trace.segments):
+            for index, message in enumerate(segment):
+                role, content = message.get("role"), message.get("content")
+                text = content if isinstance(content, str) else "" if content is None else json.dumps(content)
+                if role == "tool":
+                    step = by_call_id.get(message.get("tool_call_id"))
+                    if step is not None and step.observation is not None:
+                        step.observation.results.append(
+                            ObservationResult(source_call_id=message.get("tool_call_id"), content=text)
+                        )
+                    continue
+                if role != "assistant":
+                    copied = segment_index > 0 and (role, text) in earlier
+                    steps.append(Step(step_id=len(steps) + 1, source=role, message=text, is_copied_context=copied or None))
+                    continue
+                call = replies.get((segment_index, index))
+                usage = call.response.get("usage") if call else None
+                metrics = None
+                if isinstance(usage, dict):
+                    details = usage.get("prompt_tokens_details")
+                    cost = usage.get("cost")
+                    cost = float(cost) if type(cost) in (int, float) else None
+                    if cost is not None:
+                        costs.append(cost)
+                    metrics = Metrics(
+                        prompt_tokens=_count(usage.get("prompt_tokens")),
+                        completion_tokens=_count(usage.get("completion_tokens")),
+                        cached_tokens=_count(details.get("cached_tokens")) if isinstance(details, dict) else None,
+                        cost_usd=cost,
+                    )
+                step = Step(
+                    step_id=len(steps) + 1,
+                    source="agent",
+                    model_name=(call.response.get("model") if call else None) or self._parsed_model_name,
+                    message=text,
+                    reasoning_content=message.get("reasoning") or message.get("reasoning_content") or None,
+                    llm_call_count=1,
+                    metrics=metrics,
+                )
+                if message.get("tool_calls"):
+                    step.tool_calls, step.observation = [], Observation(results=[])
+                    for tool_call in message["tool_calls"]:
+                        function = tool_call.get("function") or {}
+                        raw = function.get("arguments")
+                        try:
+                            arguments = json.loads(raw) if isinstance(raw, str) else raw
+                        except ValueError:
+                            arguments = None
+                        step.tool_calls.append(ToolCall(
+                            tool_call_id=tool_call["id"],
+                            function_name=function.get("name") or "",
+                            arguments=arguments if isinstance(arguments, dict) else {"raw": raw},
+                        ))
+                        by_call_id[tool_call["id"]] = step
+                steps.append(step)
+            earlier.update((message.get("role"), message.get("content")) for message in segment if isinstance(message.get("content"), str))
+        usage = trace.usage()
+        final = FinalMetrics(
+            total_prompt_tokens=usage.prompt_tokens if usage.complete else None,
+            total_completion_tokens=usage.completion_tokens if usage.complete else None,
+            total_cached_tokens=usage.cached_tokens if usage.complete else None,
+            total_cost_usd=sum(costs) if usage.complete and len(costs) == len(trace.calls) else None,
+            total_steps=len(steps),
+        )
+        return Trajectory(
+            agent=Agent(name=self.name(), version=self.bundle.sha256[:12], model_name=self._parsed_model_name, tool_definitions=trace.header.get("tools")),
+            steps=steps,
+            final_metrics=final,
+        )
+
+
+def _count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
