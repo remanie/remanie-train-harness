@@ -910,6 +910,153 @@ async fn a_summary_request_that_cannot_fit_is_never_sent() {
     assert_eq!(result["cause"]["kind"], "context_window");
     assert_eq!(result["cause"]["max_tokens"], 4096);
     assert_eq!(f.requests().await.len(), 1);
+
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("first")], 100),
+        tool_reply(vec![list_dir("second")], 31_000),
+        final_reply(),
+    ])
+    .await;
+    f.config["context_window_tokens"] = json!(32_768);
+    f.config["compaction"] = json!({"max_tokens": 4096});
+    let result = f.run().await;
+    assert_eq!(result["cause"]["kind"], "context_window", "{result}");
+    assert_eq!(result["compactions"], 0);
+    assert_eq!(f.requests().await.len(), 2);
+    assert!(f.events("compaction").is_empty());
+}
+
+fn write_big_file(f: &Fixture) {
+    let line = "a line of tool output that the model reads again and again\n";
+    std::fs::write(f.workspace().join("big.txt"), line.repeat(1000)).unwrap();
+}
+
+fn read_big_file(id: &str) -> Value {
+    call(id, "read_file", json!({"target_file": "big.txt"}))
+}
+
+fn summary_reply() -> ResponseTemplate {
+    reply(
+        json!({"role": "assistant", "content": "<summary>Listed the workspace.</summary>"}),
+        "stop",
+        100,
+    )
+}
+
+fn refusal() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_string(
+        "This model's maximum context length is 32768 tokens. However, you requested 40000 tokens.",
+    )
+}
+
+#[tokio::test]
+async fn a_summary_request_that_does_not_fit_drops_the_oldest_turns_first() {
+    let mut f = fixture(vec![
+        tool_reply(vec![read_big_file("read")], 100),
+        tool_reply(vec![list_dir("second")], 29_000),
+        summary_reply(),
+        final_reply(),
+    ])
+    .await;
+    write_big_file(&f);
+    f.config["context_window_tokens"] = json!(32_768);
+    f.config["compaction"] = json!({"max_tokens": 4096});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+    let requests = f.requests().await;
+    assert_eq!(requests.len(), 4);
+    let summary_request = &requests[2];
+    assert_eq!(summary_request["tool_choice"], "none");
+    assert_eq!(summary_request["max_tokens"], 4096);
+    let history: Vec<Value> = f
+        .events("message")
+        .into_iter()
+        .filter(|event| event["segment"] == 0)
+        .map(|event| event["message"].clone())
+        .collect();
+    assert_eq!(history.len(), 8);
+    assert_eq!(history[2]["tool_calls"][0]["id"], "read");
+    let sent = summary_request["messages"].as_array().unwrap();
+    assert_eq!(sent.len(), 5);
+    assert_eq!(sent[..2], history[..2]);
+    assert_eq!(sent[2..], history[4..7]);
+    assert_eq!(sent[2]["tool_calls"][0]["id"], "second");
+    let summary_call = &f.events("model_call")[2];
+    assert_eq!(summary_call["kind"], "compaction");
+    assert_eq!(
+        summary_call["prompt"],
+        json!({"segment": 0, "end": 7, "omitted": [[2, 4]]})
+    );
+    assert_eq!(f.events("compaction")[0]["input"], "fitted");
+    assert_eq!(rebuilt_requests(&f.trace()), f.raw_requests().await);
+}
+
+#[tokio::test]
+async fn a_summary_request_refused_for_its_length_is_trimmed_to_70_percent_and_sent_again() {
+    let compacting = |f: &mut Fixture| {
+        f.config["context_window_tokens"] = json!(32_768);
+        f.config["compaction"] = json!({"threshold_tokens": 20_000, "max_tokens": 4096});
+    };
+
+    let mut f = fixture(vec![
+        tool_reply(vec![read_big_file("read")], 100),
+        tool_reply(vec![list_dir("second")], 24_000),
+        refusal(),
+        summary_reply(),
+        final_reply(),
+    ])
+    .await;
+    write_big_file(&f);
+    compacting(&mut f);
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    assert_eq!(result["compactions"], 1);
+    let requests = f.requests().await;
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[2]["messages"].as_array().unwrap().len(), 7);
+    assert_eq!(requests[3]["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(requests[3]["max_tokens"], 4096);
+    let calls = f.events("model_call");
+    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        calls[2]["prompt"],
+        json!({"segment": 0, "end": 7, "omitted": [[2, 4]]})
+    );
+    assert_eq!(f.events("endpoint_error")[0]["call"], 3);
+    assert_eq!(calls[2]["call"], 4);
+    let compaction = &f.events("compaction")[0];
+    assert_eq!(compaction["input"], "lossy");
+    assert_eq!(compaction["summary_call"], 4);
+    let mut accepted = f.raw_requests().await;
+    accepted.remove(2);
+    assert_eq!(rebuilt_requests(&f.trace()), accepted);
+
+    let mut f = fixture(vec![
+        tool_reply(vec![read_big_file("read")], 100),
+        tool_reply(vec![list_dir("second")], 24_000),
+        refusal(),
+        refusal(),
+        final_reply(),
+    ])
+    .await;
+    write_big_file(&f);
+    compacting(&mut f);
+    let result = f.run().await;
+    assert_eq!(result["cause"]["kind"], "endpoint_rejected", "{result}");
+    assert_eq!(result["compactions"], 0);
+    assert_eq!(f.requests().await.len(), 4);
+
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("only")], 24_000),
+        refusal(),
+        final_reply(),
+    ])
+    .await;
+    compacting(&mut f);
+    let result = f.run().await;
+    assert_eq!(result["cause"]["kind"], "endpoint_rejected", "{result}");
+    assert_eq!(f.requests().await.len(), 2);
 }
 
 #[tokio::test]
@@ -996,18 +1143,7 @@ async fn an_endpoint_context_length_rejection_is_a_graded_overflow() {
 
 #[tokio::test]
 async fn a_turn_refused_for_its_length_is_compacted_once_and_sent_again() {
-    let refusal = || {
-        ResponseTemplate::new(400).set_body_string(
-            "This model's maximum context length is 32768 tokens. However, you requested 40000 tokens.",
-        )
-    };
-    let summary = || {
-        reply(
-            json!({"role": "assistant", "content": "<summary>Listed the workspace.</summary>"}),
-            "stop",
-            100,
-        )
-    };
+    let summary = summary_reply;
     let compacting = |responses| async {
         let mut f = fixture(responses).await;
         f.config["compaction"] = json!({"threshold_tokens": 20_000, "max_tokens": 1024});
@@ -1306,11 +1442,22 @@ async fn every_request_is_rebuilt_byte_for_byte_from_the_trace() {
     f.config["max_turns"] = json!(8);
     assert_eq!(f.run().await["outcome"], "completed");
     let trace = f.trace();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| event["event"] == "message" && event["index"] == 0)
+            .count(),
+        2
+    );
+    assert_eq!(rebuilt_requests(&trace), f.raw_requests().await);
+}
+
+fn rebuilt_requests(trace: &[Value]) -> Vec<Vec<u8>> {
     let header = &trace[0];
     assert_eq!(header["event"], "header");
     let mut segments: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
     let mut rebuilt = Vec::new();
-    for event in &trace {
+    for event in trace {
         match event["event"].as_str().unwrap() {
             "message" => {
                 let segment = segments
@@ -1321,8 +1468,19 @@ async fn every_request_is_rebuilt_byte_for_byte_from_the_trace() {
             }
             "model_call" => {
                 let prompt = &event["prompt"];
-                let messages = &segments[&prompt["segment"].as_u64().unwrap()]
-                    [..prompt["end"].as_u64().unwrap() as usize];
+                let segment = &segments[&prompt["segment"].as_u64().unwrap()];
+                let omitted: Vec<[usize; 2]> = prompt
+                    .get("omitted")
+                    .map(|ranges| serde_json::from_value(ranges.clone()).unwrap())
+                    .unwrap_or_default();
+                let messages: Vec<Value> = segment[..prompt["end"].as_u64().unwrap() as usize]
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        !omitted.iter().any(|[from, to]| (from..to).contains(&index))
+                    })
+                    .map(|(_, message)| message.clone())
+                    .collect();
                 let mut body = header["config"]["sampling_params"]
                     .as_object()
                     .unwrap()
@@ -1331,7 +1489,7 @@ async fn every_request_is_rebuilt_byte_for_byte_from_the_trace() {
                     body.insert("max_tokens".into(), max_tokens.clone());
                 }
                 body.insert("model".into(), header["config"]["model"].clone());
-                body.insert("messages".into(), Value::Array(messages.to_vec()));
+                body.insert("messages".into(), Value::Array(messages));
                 let tool_choice = if event["kind"] == "compaction" {
                     "none"
                 } else {
@@ -1348,8 +1506,7 @@ async fn every_request_is_rebuilt_byte_for_byte_from_the_trace() {
             _ => {}
         }
     }
-    assert_eq!(segments.len(), 2);
-    assert_eq!(rebuilt, f.raw_requests().await);
+    rebuilt
 }
 
 #[tokio::test]

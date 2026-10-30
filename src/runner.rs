@@ -15,7 +15,9 @@ use crate::compaction::format_compact_summary;
 use crate::model::{Finish, ModelClient, Request, Sampled, SamplingParams, bearer_header};
 use crate::outcome::{CONTRACT, Cause, Misbehaviour, Outcome, Overflow, RunResult, Tally};
 use crate::tools::ToolSession;
-use crate::trace::{CallKind, Event, MAX_TRACE_BYTES, Segment, Trace};
+use crate::trace::{
+    CallKind, CompactionInput, Event, MAX_TRACE_BYTES, MessageRange, Segment, Trace,
+};
 
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
@@ -496,33 +498,34 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let Some(compaction) = &cx.input.compaction else {
         return Ok(());
     };
-    let mut max_tokens = compaction.max_tokens;
-    if let Some(window) = cx.input.context_window_tokens {
-        let estimated = cx.budget.estimate_with(&cx.summary_prompt);
-        let room = window.saturating_sub(estimated + window / 20);
-        if room == 0 {
-            return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
-                estimated_prompt_tokens: estimated,
-                max_tokens,
-                context_window_tokens: window,
-            }));
-        }
-        max_tokens = max_tokens.min(room);
-    }
     cx.segment.push(cx.summary_prompt.clone(), cx.trace);
-    let sampled = cx
-        .model
-        .sample(
-            Request {
-                kind: CallKind::Compaction,
-                turn: cx.tally.turns,
-                prompt: cx.segment.range(),
-                messages: cx.segment.messages(),
-                max_tokens_override: Some(max_tokens),
-            },
-            cx.trace,
-        )
-        .await?;
+    let mut request = summary_request(cx, compaction, false)?;
+    let sampled = loop {
+        let sampled = cx
+            .model
+            .sample(
+                Request {
+                    kind: CallKind::Compaction,
+                    turn: cx.tally.turns,
+                    prompt: request.prompt.clone(),
+                    messages: &request.messages,
+                    max_tokens_override: Some(request.max_tokens),
+                },
+                cx.trace,
+            )
+            .await;
+        match sampled {
+            Err(rejected @ Outcome::ContextOverflow(Overflow::EndpointRejected { .. }))
+                if request.input != CompactionInput::Lossy =>
+            {
+                request = summary_request(cx, compaction, true)
+                    .ok()
+                    .filter(|lossy| lossy.prompt.omitted != request.prompt.omitted)
+                    .ok_or(rejected)?;
+            }
+            sampled => break sampled?,
+        }
+    };
     cx.tally.count_response(sampled.usage);
     let summary = summary(&sampled);
     cx.segment.push(sampled.message, cx.trace);
@@ -540,6 +543,7 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
         from_segment: from,
         to_segment: from + 1,
         summary_call: cx.model.calls(),
+        input: request.input,
     });
     let mut messages = cx.initial.clone();
     messages.push(json!({"role": "user", "content": continuation}));
@@ -550,6 +554,86 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     }
     cx.tally.compactions += 1;
     Ok(())
+}
+
+struct SummaryRequest {
+    messages: Vec<Value>,
+    prompt: MessageRange,
+    max_tokens: u64,
+    input: CompactionInput,
+}
+
+const LOSSY_INPUT_PERCENT: u64 = 70;
+
+/// Builds the request for a segment that ends with the summary prompt. It drops the oldest turns,
+/// each an assistant message with the tool messages that answer it, until the request fits, as
+/// Grok Build's `fit_conversation_to_budget` does. The last turn always stays.
+fn summary_request(
+    cx: &Attempt<'_>,
+    compaction: &Compaction,
+    lossy: bool,
+) -> Result<SummaryRequest, Outcome> {
+    let history = cx.segment.messages();
+    let reply_at = |from: usize| {
+        history
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, message)| message["role"] == "assistant")
+            .map(|(index, _)| index)
+    };
+    let full = cx.budget.estimate_with(&cx.summary_prompt);
+    let mut estimated = full;
+    let mut max_tokens = compaction.max_tokens;
+    let first = reply_at(0).unwrap_or(history.len());
+    let mut keep_from = first;
+    if let Some(window) = cx.input.context_window_tokens {
+        let ceiling = window - window / 20;
+        let budget = if lossy {
+            window * LOSSY_INPUT_PERCENT / 100
+        } else {
+            ceiling.saturating_sub(max_tokens)
+        };
+        let mut dropped_bytes = 0;
+        while estimated > budget {
+            let Some(next) = reply_at(keep_from + 1) else {
+                break;
+            };
+            dropped_bytes += history[keep_from..next]
+                .iter()
+                .map(|message| serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64))
+                .sum::<u64>();
+            estimated = full.saturating_sub(dropped_bytes / BYTES_PER_TOKEN);
+            keep_from = next;
+        }
+        let room = ceiling.saturating_sub(estimated);
+        if room == 0 {
+            return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
+                estimated_prompt_tokens: estimated,
+                max_tokens,
+                context_window_tokens: window,
+            }));
+        }
+        max_tokens = max_tokens.min(room);
+    }
+    let omitted = (keep_from > first).then_some([first, keep_from]);
+    let input = match (omitted, lossy) {
+        (None, _) => CompactionInput::Verbatim,
+        (Some(_), false) => CompactionInput::Fitted,
+        (Some(_), true) => CompactionInput::Lossy,
+    };
+    let mut messages = history[..first].to_vec();
+    messages.extend_from_slice(&history[keep_from..]);
+    Ok(SummaryRequest {
+        messages,
+        prompt: MessageRange {
+            segment: cx.segment.index(),
+            end: history.len(),
+            omitted: omitted.into_iter().collect(),
+        },
+        max_tokens,
+        input,
+    })
 }
 
 fn summary(sampled: &Sampled) -> Option<String> {

@@ -12,10 +12,12 @@ use crate::tools::{TaskId, ToolErrorKind};
 
 pub const MAX_TRACE_BYTES: u64 = 256 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageRange {
     pub segment: u32,
     pub end: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<[usize; 2]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -32,6 +34,14 @@ impl CallKind {
             CallKind::Compaction => "none",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionInput {
+    Verbatim,
+    Fitted,
+    Lossy,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +89,7 @@ pub enum Event<'a> {
         from_segment: u32,
         to_segment: u32,
         summary_call: u32,
+        input: CompactionInput,
     },
     Result(&'a RunResult),
 }
@@ -201,6 +212,7 @@ impl Segment {
         MessageRange {
             segment: self.index,
             end: self.messages.len(),
+            omitted: Vec::new(),
         }
     }
 }
