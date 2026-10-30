@@ -563,9 +563,6 @@ struct SummaryRequest {
 
 const LOSSY_INPUT_PERCENT: u64 = 70;
 
-/// Builds the summary request: the segment, then the summary prompt. It drops the oldest turns,
-/// each an assistant message with the tool messages that answer it, until the request fits, as
-/// Grok Build's `fit_conversation_to_budget` does. The last turn always stays.
 fn summary_request(
     cx: &Attempt<'_>,
     compaction: &Compaction,
