@@ -39,13 +39,18 @@ SCRIPT = [
     (503, {"error": "scripted overload"}),
     (200, reply({
         "content": None,
-        "reasoning_content": "Write the file, then read it back.",
+        "reasoning_content": "Write the file and check that the shell counts.",
         "tool_calls": [
             tool_call("call-write", "search_replace", {"file_path": "hello.txt", "old_string": "", "new_string": "hello\n"}),
-            tool_call("call-read", "read_file", {"target_file": "hello.txt"}),
+            tool_call("call-count", "run_terminal_cmd", {"command": "seq 1 500", "description": "Check that the shell runs."}),
         ],
-    }, "tool_calls", 17000, 40, 0)),
-    (200, reply({"content": "<summary>Wrote hello.txt and read it back.</summary>"}, "stop", 17200, 20, 8000)),
+    }, "tool_calls", 9000, 40, 0)),
+    (200, reply({
+        "content": None,
+        "reasoning_content": "Read the file back.",
+        "tool_calls": [tool_call("call-read", "read_file", {"target_file": "hello.txt"})],
+    }, "tool_calls", 18000, 40, 0)),
+    (200, reply({"content": "<summary>Wrote hello.txt and read it back.</summary>"}, "stop", 18300, 20, 8000)),
     (200, reply({"content": "hello.txt contains hello."}, "stop", 600, 10, 0)),
 ]
 
@@ -99,8 +104,11 @@ def main():
         server.shutdown()
         result = json.loads(run.stdout)
         assert run.returncode == 0 and result["outcome"] == "completed", (run.returncode, run.stdout, run.stderr)
-        assert result["compactions"] == 1 and result["tool_calls"]["ok"] == 2, result
+        assert result["compactions"] == 1 and result["tool_calls"]["ok"] == 3, result
         assert len(requests) == len(SCRIPT), len(requests)
+        events = [json.loads(line) for line in (root / "session/trace.jsonl").read_bytes().splitlines()]
+        compaction = next(event for event in events if event["event"] == "compaction")
+        assert compaction["input"] == "fitted", compaction
         FIXTURES.mkdir(exist_ok=True)
         (FIXTURES / "trace.jsonl").write_bytes((root / "session/trace.jsonl").read_bytes())
         (FIXTURES / "requests.jsonl").write_bytes(b"".join(body + b"\n" for body in requests))
