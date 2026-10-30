@@ -57,7 +57,7 @@ On exit 0 background tasks keep running so the verifier can reach them. On exit 
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `checks/fixtures/` holds a trace recorded from one run against a scripted endpoint and the request bodies it sent; CI re-records it and fails when the bodies differ. remanie-tooling's `research/agents/remanie_train/remanie_trace.py` reads the file and rebuilds the body of any request from the `header`, a message range, and the omitted ranges.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `checks/fixtures/` holds a trace recorded from one run against a scripted endpoint and the request bodies it sent; CI re-records it and fails when the bodies differ. remanie-tooling's `research/agents/remanie_train/remanie_trace.py` reads the file and rebuilds the body of any accepted request from the `header`, a message range, and the omitted ranges.
 
 | `event` | Written | Fields |
 |---|---|---|
