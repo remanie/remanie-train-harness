@@ -26,9 +26,9 @@ python3 checks/make_trace_fixture.py target/debug/remanie-train-harness   (on Li
   Rewrites checks/fixtures/trace.jsonl and checks/fixtures/requests.jsonl
   from one run against a scripted endpoint: a 503 retry, three tool calls,
   and a compaction whose request drops the first turn to fit the window. The
-  trace reader tests in remanie-tooling read the trace.
+  trace reader tests in remanie-tooling read both files.
   Rerun it after any change to the trace or the request body, commit the
-  result, and copy trace.jsonl to remanie-tooling's
+  result, and copy both files to remanie-tooling's
   research/agents/remanie_train/fixtures/.
 
 CI
