@@ -520,7 +520,7 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
             {
                 request = summary_request(cx, compaction, true)
                     .ok()
-                    .filter(|lossy| lossy.prompt.omitted != request.prompt.omitted)
+                    .filter(|lossy| lossy.messages.len() < request.messages.len())
                     .ok_or(rejected)?;
             }
             sampled => break sampled?,

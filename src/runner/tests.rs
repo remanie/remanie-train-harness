@@ -1057,6 +1057,23 @@ async fn a_summary_request_refused_for_its_length_is_trimmed_to_70_percent_and_s
     let result = f.run().await;
     assert_eq!(result["cause"]["kind"], "endpoint_rejected", "{result}");
     assert_eq!(f.requests().await.len(), 2);
+
+    let mut f = fixture(vec![
+        tool_reply(vec![read_big_file("read")], 100),
+        tool_reply(vec![list_dir("second")], 21_000),
+        refusal(),
+        summary_reply(),
+        final_reply(),
+    ])
+    .await;
+    write_big_file(&f);
+    compacting(&mut f);
+    f.config["compaction"]["max_tokens"] = json!(10_000);
+    let result = f.run().await;
+    assert_eq!(result["cause"]["kind"], "endpoint_rejected", "{result}");
+    let requests = f.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2]["messages"].as_array().unwrap().len(), 5);
 }
 
 #[tokio::test]
