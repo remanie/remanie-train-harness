@@ -990,6 +990,25 @@ async fn a_summary_request_that_does_not_fit_drops_the_oldest_turns_first() {
     );
     assert_eq!(f.events("compaction")[0]["input"], "fitted");
     assert_eq!(rebuilt_requests(&f.trace()), f.raw_requests().await);
+
+    let mut f = fixture(vec![
+        tool_reply(vec![list_dir("first")], 21_000),
+        summary_reply(),
+        tool_reply(vec![read_big_file("read")], 100),
+        tool_reply(vec![list_dir("second")], 29_000),
+        summary_reply(),
+        final_reply(),
+    ])
+    .await;
+    write_big_file(&f);
+    f.config["context_window_tokens"] = json!(32_768);
+    f.config["compaction"] = json!({"threshold_tokens": 20_000, "max_tokens": 4096});
+    assert_eq!(f.run().await["compactions"], 2);
+    assert_eq!(
+        f.events("model_call")[4]["prompt"],
+        json!({"segment": 1, "end": 8, "omitted": [[3, 5]]})
+    );
+    assert_eq!(rebuilt_requests(&f.trace()), f.raw_requests().await);
 }
 
 #[tokio::test]
