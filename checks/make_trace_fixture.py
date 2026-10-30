@@ -10,7 +10,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-FIXTURES = Path(__file__).resolve().parents[1] / "harbor/fixtures"
+FIXTURES = Path(__file__).resolve().parents[1] / "checks/fixtures"
 
 
 if sys.platform != "linux":
