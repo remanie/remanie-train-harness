@@ -1,25 +1,25 @@
 [package]
 name = "remanie-train-harness"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-anyhow = "1"
+bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
-ignore = "0.4"
-indexmap = { version = "2", features = ["serde"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 jsonschema = { version = "0.30", default-features = false }
 libc = "0.2"
-minijinja = "2.9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v5"] }
 
 [dev-dependencies]
 tempfile = "3"
-wiremock = "0.6"
 
 [profile.release]
 lto = "thin"
