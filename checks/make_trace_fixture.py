@@ -13,9 +13,6 @@ from pathlib import Path
 FIXTURES = Path(__file__).resolve().parents[1] / "checks/fixtures"
 
 
-if sys.platform != "linux":
-    sys.exit("Record the fixture on Linux, where CI checks it: the first user message names the OS. On a Mac: docker run --rm -v \"$PWD\":/w -w /w rust:1.94-slim-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq ripgrep python3 >/dev/null && cargo build -q && python3 checks/make_trace_fixture.py target/debug/remanie-train-harness'")
-
 def reply(message, finish, prompt_tokens, completion_tokens, cached_tokens):
     return {
         "id": "chatcmpl-fixture",
@@ -55,22 +52,53 @@ SCRIPT = [
 ]
 
 
-def serve(requests):
+def chunks(completion):
+    choice = completion["choices"][0]
+    head = {"id": completion["id"], "object": "chat.completion.chunk", "created": 0, "model": completion["model"]}
+    deltas = [
+        {"tool_calls": [{"index": index, **call} for index, call in enumerate(value)]} if key == "tool_calls" else {key: value}
+        for key, value in choice["message"].items()
+        if key != "role" and value is not None
+    ] or [{}]
+    deltas[0] = {"role": "assistant", **deltas[0]}
+    return [
+        *({**head, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]} for delta in deltas),
+        {**head, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]},
+        {**head, "choices": [], "usage": completion["usage"]},
+    ]
+
+
+def serve(answer):
+    """Serve on a free port. answer(method, path, body) returns (status, payload, headers); a 200 to a request that sets stream goes out as chat.completion.chunk events."""
+    lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
+        def do_GET(self):
+            self.respond(b"")
+
         def do_POST(self):
-            requests.append(self.rfile.read(int(self.headers["Content-Length"])))
-            status, body = SCRIPT[len(requests) - 1] if len(requests) <= len(SCRIPT) else (500, {"error": "script exhausted"})
-            payload = json.dumps(body).encode()
+            self.respond(self.rfile.read(int(self.headers["Content-Length"])))
+
+        def respond(self, body):
+            with lock:
+                status, payload, headers = answer(self.command, self.path, body)
+            if status == 200 and body and json.loads(body).get("stream") is True:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"".join(b"data: %s\n\n" % json.dumps(chunk).encode() for chunk in chunks(payload)) + b"data: [DONE]\n\n")
+                return
+            data = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            if status == 503:
-                self.send_header("Retry-After", "0")
+            self.send_header("Content-Length", str(len(data)))
+            for name, value in headers.items():
+                self.send_header(name, value)
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(data)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -78,12 +106,20 @@ def serve(requests):
 
 
 def main():
+    if sys.platform != "linux":
+        sys.exit("Record the fixture on Linux, where CI checks it: the first user message names the OS. On a Mac: docker run --rm -v \"$PWD\":/w -w /w rust:1.94-slim-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq ripgrep python3 >/dev/null && cargo build -q && python3 checks/make_trace_fixture.py target/debug/remanie-train-harness'")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runner", type=Path)
     parser.add_argument("--scratch", default="/tmp/remanie-trace-fixture", help="emptied, used for the run, then deleted")
     args = parser.parse_args()
     requests: list[bytes] = []
-    server = serve(requests)
+
+    def answer(_method, _path, body):
+        requests.append(body)
+        status, payload = SCRIPT[len(requests) - 1] if len(requests) <= len(SCRIPT) else (500, {"error": "script exhausted"})
+        return status, payload, {"Retry-After": "0"} if status == 503 else {}
+
+    server = serve(answer)
     root = Path(args.scratch)
     shutil.rmtree(root, ignore_errors=True)
     (root / "workspace").mkdir(parents=True)

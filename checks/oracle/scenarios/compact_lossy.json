@@ -1,0 +1,70 @@
+{
+  "about": "The only turn reads a file whose text alone is larger than the window, so the summary request cannot fit even with every earlier turn dropped.",
+  "user_query": "Read big.txt and report its last line.",
+  "files": {
+    "big.txt": {
+      "line": "line {n:04d}: lorem ipsum dolor sit amet, consectetur adipiscing elit\n",
+      "count": 1000
+    }
+  },
+  "job": {
+    "sampling_params": {
+      "max_tokens": 512,
+      "temperature": 1.0
+    },
+    "max_turns": 6,
+    "deadline_secs": 120,
+    "context_window_tokens": 16000,
+    "compaction": {
+      "max_tokens": 4096
+    }
+  },
+  "replies": {
+    "turn": [
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-big",
+              "name": "read_file",
+              "arguments": {
+                "target_file": "big.txt"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [
+          3000,
+          40,
+          0
+        ]
+      },
+      {
+        "message": {
+          "content": "The last line of big.txt is line 1000."
+        },
+        "finish_reason": "stop",
+        "usage": [
+          2000,
+          12,
+          0
+        ]
+      }
+    ],
+    "compaction": [
+      {
+        "message": {
+          "content": "<summary>\n1. Primary Request and Intent: The user asked to read big.txt and report its last line.\n2. Key Technical Concepts: read_file in the workspace.\n3. Files and Code Sections: big.txt has 1000 numbered lines, line 0001 to line 1000, each repeating lorem ipsum text.\n4. Errors and Fixes: None.\n5. Problem Solving: The whole file came back in one read; its last line is numbered 1000.\n6. All User Messages: \"Read big.txt and report its last line.\"\n7. Pending Tasks: Report the last line to the user.\n8. Current Work: The read finished; nothing else is running.\n9. Optional Next Step: Tell the user that the last line is line 1000.\n</summary>"
+        },
+        "finish_reason": "stop",
+        "usage": [
+          12000,
+          160,
+          0
+        ]
+      }
+    ]
+  }
+}
