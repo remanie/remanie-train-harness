@@ -24,8 +24,9 @@ python3 checks/licenses.py --check
 
 python3 checks/make_trace_fixture.py target/debug/remanie-train-harness   (on Linux; the script prints the Docker one-liner for a Mac)
   Rewrites checks/fixtures/trace.jsonl and checks/fixtures/requests.jsonl
-  from one run against a scripted endpoint: a 503 retry, three tool calls,
-  and a compaction whose request drops the first turn to fit the window. The
+  from one run against a scripted endpoint: a 503 retry, five tool calls, a
+  compaction whose request drops the first turn to fit the window, and a
+  second compaction whose lossy request leaves out two long tool results. The
   trace reader tests in remanie-tooling read both files.
   Rerun it after any change to the trace or the request body, commit the
   result, and copy both files to remanie-tooling's

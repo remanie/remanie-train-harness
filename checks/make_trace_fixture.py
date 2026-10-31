@@ -51,6 +51,15 @@ SCRIPT = [
         "tool_calls": [tool_call("call-read", "read_file", {"target_file": "hello.txt"})],
     }, "tool_calls", 18000, 40, 0)),
     (200, reply({"content": "<summary>Wrote hello.txt and read it back.</summary>"}, "stop", 18300, 20, 8000)),
+    (200, reply({
+        "content": None,
+        "reasoning_content": "Print two long logs.",
+        "tool_calls": [
+            tool_call("call-log-1", "run_terminal_cmd", {"command": "seq 1 3800", "description": "Print the first log."}),
+            tool_call("call-log-2", "run_terminal_cmd", {"command": "seq 3801 7000", "description": "Print the second log."}),
+        ],
+    }, "tool_calls", 8000, 40, 0)),
+    (200, reply({"content": "<summary>Wrote hello.txt, read it back, and printed two logs.</summary>"}, "stop", 9100, 20, 0)),
     (200, reply({"content": "hello.txt contains hello."}, "stop", 600, 10, 0)),
 ]
 
@@ -104,11 +113,11 @@ def main():
         server.shutdown()
         result = json.loads(run.stdout)
         assert run.returncode == 0 and result["outcome"] == "completed", (run.returncode, run.stdout, run.stderr)
-        assert result["compactions"] == 1 and result["tool_calls"]["ok"] == 3, result
+        assert result["compactions"] == 2 and result["tool_calls"]["ok"] == 5, result
         assert len(requests) == len(SCRIPT), len(requests)
         events = [json.loads(line) for line in (root / "session/trace.jsonl").read_bytes().splitlines()]
-        compaction = next(event for event in events if event["event"] == "compaction")
-        assert compaction["input"] == "fitted", compaction
+        inputs = [event["input"] for event in events if event["event"] == "compaction"]
+        assert inputs == ["fitted", "lossy"], inputs
         FIXTURES.mkdir(exist_ok=True)
         (FIXTURES / "trace.jsonl").write_bytes((root / "session/trace.jsonl").read_bytes())
         (FIXTURES / "requests.jsonl").write_bytes(b"".join(body + b"\n" for body in requests))
