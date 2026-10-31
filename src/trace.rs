@@ -18,6 +18,8 @@ pub struct MessageRange {
     pub end: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub omitted: Vec<[usize; 2]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<(usize, Value)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -213,6 +215,7 @@ impl Segment {
             segment: self.index,
             end: self.messages.len(),
             omitted: Vec::new(),
+            replaced: Vec::new(),
         }
     }
 }

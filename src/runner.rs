@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::compaction::format_compact_summary;
+use crate::compaction::{format_compact_summary, lossy_reply, truncate_text_to_bytes};
 use crate::model::{Finish, ModelClient, Request, Sampled, SamplingParams, bearer_header};
 use crate::outcome::{CONTRACT, Cause, Misbehaviour, Outcome, Overflow, RunResult, Tally};
 use crate::tools::ToolSession;
@@ -296,7 +296,7 @@ impl ContextBudget {
     }
 
     fn append(&mut self, message: &Value) {
-        self.appended_bytes += serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64);
+        self.appended_bytes += size(message);
     }
 
     fn estimate(&self) -> u64 {
@@ -498,10 +498,11 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
     let Some(compaction) = &cx.input.compaction else {
         return Ok(());
     };
-    let mut request = summary_request(cx, compaction, false)?;
-    let mut lossy = summary_request(cx, compaction, true)
-        .ok()
-        .filter(|lossy| lossy.messages.len() < request.messages.len());
+    let lossy = summary_request(cx, compaction, true);
+    let (mut request, mut resend) = match summary_request(cx, compaction, false) {
+        Ok(fitted) => (fitted, lossy.ok()),
+        Err(_) => (lossy?, None),
+    };
     cx.segment.push(cx.summary_prompt.clone(), cx.trace);
     let sampled = loop {
         let sampled = cx
@@ -519,7 +520,7 @@ async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
             .await;
         match sampled {
             Err(rejected @ Outcome::ContextOverflow(Overflow::EndpointRejected { .. })) => {
-                request = lossy.take().ok_or(rejected)?;
+                request = resend.take().ok_or(rejected)?;
             }
             sampled => break sampled?,
         }
@@ -561,6 +562,13 @@ struct SummaryRequest {
     input: CompactionInput,
 }
 
+struct Turn {
+    range: Range<usize>,
+    bytes: u64,
+    sent: Option<Value>,
+    sent_bytes: u64,
+}
+
 const LOSSY_INPUT_PERCENT: u64 = 70;
 
 fn summary_request(
@@ -569,19 +577,33 @@ fn summary_request(
     lossy: bool,
 ) -> Result<SummaryRequest, Outcome> {
     let history = cx.segment.messages();
-    let reply_at = |from: usize| {
-        history
-            .iter()
-            .enumerate()
-            .skip(from)
-            .find(|(_, message)| message["role"] == "assistant")
-            .map(|(index, _)| index)
-    };
+    let starts: Vec<usize> = (0..history.len())
+        .filter(|&index| history[index]["role"] == "assistant")
+        .collect();
+    let first = starts.first().copied().unwrap_or(history.len());
+    let ends = starts.iter().skip(1).copied().chain([history.len()]);
+    let mut turns: Vec<Turn> = starts
+        .iter()
+        .zip(ends)
+        .map(|(&start, end)| {
+            let bytes = history[start..end].iter().map(size).sum();
+            let sent = lossy.then(|| lossy_reply(&history[start]));
+            Turn {
+                range: start..end,
+                bytes,
+                sent_bytes: sent.as_ref().map_or(bytes, size),
+                sent,
+            }
+        })
+        .collect();
     let full = cx.budget.estimate_with(&cx.summary_prompt);
-    let mut estimated = full;
+    let estimate = |removed: u64| full.saturating_sub(removed / BYTES_PER_TOKEN);
+    let mut removed: u64 = turns
+        .iter()
+        .map(|turn| turn.bytes.saturating_sub(turn.sent_bytes))
+        .sum();
+    let mut dropped = 0;
     let mut max_tokens = compaction.max_tokens;
-    let first = reply_at(0).unwrap_or(history.len());
-    let mut keep_from = first;
     if let Some(window) = cx.input.context_window_tokens {
         let ceiling = window - window / 20;
         let budget = if lossy {
@@ -589,20 +611,27 @@ fn summary_request(
         } else {
             ceiling.saturating_sub(max_tokens)
         };
-        let mut dropped_bytes = 0;
-        while estimated > budget {
-            let Some(next) = reply_at(keep_from + 1) else {
-                break;
-            };
-            dropped_bytes += history[keep_from..next]
-                .iter()
-                .map(|message| serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64))
-                .sum::<u64>();
-            estimated = full.saturating_sub(dropped_bytes / BYTES_PER_TOKEN);
-            keep_from = next;
+        while estimate(removed) > budget && dropped + 1 < turns.len() {
+            removed += turns[dropped].sent_bytes;
+            dropped += 1;
         }
+        if estimate(removed) > budget
+            && let Some(last) = turns.last_mut()
+            && let Some(message) = &mut last.sent
+        {
+            let room = budget.saturating_sub(estimate(removed + last.sent_bytes));
+            if let Some(text) = message["content"]
+                .as_str()
+                .and_then(|text| truncate_text_to_bytes(text, (room * BYTES_PER_TOKEN) as usize))
+            {
+                message["content"] = text.into();
+                removed = (removed + last.sent_bytes).saturating_sub(size(message));
+                last.sent_bytes = size(message);
+            }
+        }
+        let estimated = estimate(removed);
         let room = ceiling.saturating_sub(estimated);
-        if room == 0 {
+        if room == 0 || (!lossy && room < max_tokens) {
             return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
                 estimated_prompt_tokens: estimated,
                 max_tokens,
@@ -611,25 +640,44 @@ fn summary_request(
         }
         max_tokens = max_tokens.min(room);
     }
-    let omitted = (keep_from > first).then_some([first, keep_from]);
-    let input = match (omitted, lossy) {
-        (None, _) => CompactionInput::Verbatim,
-        (Some(_), false) => CompactionInput::Fitted,
-        (Some(_), true) => CompactionInput::Lossy,
-    };
     let mut messages = history[..first].to_vec();
-    messages.extend_from_slice(&history[keep_from..]);
+    let mut omitted = Vec::new();
+    let mut replaced = Vec::new();
+    if dropped > 0 {
+        omitted.push([first, turns[dropped].range.start]);
+    }
+    for turn in turns.into_iter().skip(dropped) {
+        let Some(message) = turn.sent else {
+            messages.extend_from_slice(&history[turn.range]);
+            continue;
+        };
+        if turn.range.len() > 1 {
+            omitted.push([turn.range.start + 1, turn.range.end]);
+        }
+        replaced.push((turn.range.start, message.clone()));
+        messages.push(message);
+    }
     messages.push(cx.summary_prompt.clone());
+    let input = match (lossy, omitted.is_empty()) {
+        (true, _) => CompactionInput::Lossy,
+        (false, true) => CompactionInput::Verbatim,
+        (false, false) => CompactionInput::Fitted,
+    };
     Ok(SummaryRequest {
         messages,
         prompt: MessageRange {
             segment: cx.segment.index(),
             end: history.len() + 1,
-            omitted: omitted.into_iter().collect(),
+            omitted,
+            replaced,
         },
         max_tokens,
         input,
     })
+}
+
+fn size(message: &Value) -> u64 {
+    serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64)
 }
 
 fn summary(sampled: &Sampled) -> Option<String> {

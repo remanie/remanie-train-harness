@@ -5,7 +5,7 @@ Copyright 2023-2026 SpaceXAI, licensed under the Apache License, Version 2.0.
 The upstream source used by the harness is pinned at commit
 2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8.
 
-Retained material includes the compaction summary formatter, directory-listing
+Retained material includes the compaction summary formatter and lossy-input helpers, directory-listing
 core, todo and edit behavior, POSIX background/heredoc token helpers, terminal
 tool contracts, the per-path tool-call lock key, and prompt assets. The source has been adapted into a standalone
 eight-tool harness; the application, registry, remote tool runtime, and unused

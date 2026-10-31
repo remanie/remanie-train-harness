@@ -1,4 +1,6 @@
 // Adapted from Grok Build 2bdd1d6a. NOTICE names the source.
+use serde_json::{Value, json};
+
 pub fn format_compact_summary(summary: &str) -> String {
     let mut result = summary.trim().to_string();
 
@@ -33,6 +35,36 @@ pub fn format_compact_summary(summary: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+pub fn lossy_reply(reply: &Value) -> Value {
+    let mut content = reply["content"].as_str().unwrap_or_default().to_owned();
+    let names: Vec<&str> = reply["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call["function"]["name"].as_str())
+        .collect();
+    if !names.is_empty() {
+        content.push_str(&format!("\n[Called tools: {}]", names.join(", ")));
+    }
+    json!({"role": "assistant", "content": content})
+}
+
+pub fn truncate_text_to_bytes(text: &str, max_bytes: usize) -> Option<String> {
+    const MARKER_RESERVE: usize = 64;
+    if text.len() <= max_bytes {
+        return None;
+    }
+    let mut end = max_bytes.saturating_sub(MARKER_RESERVE);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "{}\n[... truncated {} bytes to fit the compaction window ...]",
+        &text[..end],
+        text.len() - end
+    ))
 }
 
 fn neutralize_compaction_control_tokens(text: &str) -> String {
@@ -144,6 +176,31 @@ mod tests {
         let result = format_compact_summary(raw);
         assert!(result.starts_with("Summary:\n1. Primary Request: ship 🚀 to 北京"));
         assert!(result.contains("9. Optional Next Step: 完成"));
+    }
+
+    #[test]
+    fn a_lossy_reply_names_its_tool_calls_and_drops_its_reasoning() {
+        let call = |name: &str| json!({"id": name, "type": "function", "function": {"name": name, "arguments": "{}"}});
+        let reply = json!({
+            "role": "assistant", "content": "I'll search.", "reasoning_content": "thinking",
+            "tool_calls": [call("grep"), call("read_file")]
+        });
+        assert_eq!(
+            lossy_reply(&reply),
+            json!({"role": "assistant", "content": "I'll search.\n[Called tools: grep, read_file]"})
+        );
+    }
+
+    #[test]
+    fn truncation_keeps_whole_characters() {
+        assert_eq!(truncate_text_to_bytes("short", 5), None);
+        assert_eq!(
+            truncate_text_to_bytes(&"→".repeat(40), 101),
+            Some(format!(
+                "{}\n[... truncated 84 bytes to fit the compaction window ...]",
+                "→".repeat(12)
+            ))
+        );
     }
 
     #[test]
