@@ -1,16 +1,18 @@
 Remanie training harness
 
-This project includes modified source and prompt assets from Grok Build,
-Copyright 2023-2026 SpaceXAI, licensed under the Apache License, Version 2.0.
-The upstream source used by the harness is pinned at commit
-2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8.
+The runtime bundle carries Grok Build's own binary, xai-grok-pager, built
+unmodified from https://github.com/xai-org/grok-build at commit
+2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8, the commit upstream.json pins.
+Grok Build is Copyright 2023-2026 SpaceXAI and licensed under the Apache
+License, Version 2.0. Its license, its third-party notices, and the license
+of the ripgrep release it embeds are in the bundle's licenses/grok-build
+directory.
 
-Retained material includes the compaction summary formatter, directory-listing
-core, todo and edit behavior, POSIX background/heredoc token helpers, terminal
-tool contracts, the per-path tool-call lock key, and prompt assets. The source has been adapted into a standalone
-eight-tool harness; the application, registry, remote tool runtime, and unused
-tools have been removed. See LICENSE for the Apache License text.
+The wrapper in this repository is licensed under the Apache License, Version
+2.0, in LICENSE. It contains no Grok Build source. assets/agent.md names
+Grok Build's tool ids, and the proxy quotes the opening of Grok Build's
+summary prompt to recognize compaction requests.
 
-THIRD-PARTY-NOTICES contains the license and attribution texts for the retained
-Rust dependencies. Packaged external executables and system libraries have
-separate notices in the runtime bundle's licenses directory.
+THIRD-PARTY-NOTICES contains the license and attribution texts for the
+wrapper's Rust dependencies. The bundled rg and system libraries have
+separate notices in the bundle's licenses directory.

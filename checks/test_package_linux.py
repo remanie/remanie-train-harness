@@ -100,6 +100,13 @@ class LauncherTest(unittest.TestCase):
             self.assertEqual(output, f"{bundle}/grok\n")
 
 
+class PinTest(unittest.TestCase):
+    def test_notice_names_the_commit_the_build_pins(self):
+        root = Path(__file__).resolve().parents[1]
+        commit = json.loads((root / "upstream.json").read_text())["commit"]
+        self.assertIn(commit, (root / "NOTICE").read_text())
+
+
 @unittest.skipUnless(os.environ.get("REMANIE_BUNDLE"), "set REMANIE_BUNDLE to a package_linux.py output")
 class PackagedBundleTest(unittest.TestCase):
     def test_bundle_carries_what_the_harbor_agent_reads(self):
