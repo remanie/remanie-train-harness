@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/xai-org/grok-build",
+  "commit": "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8",
+  "package": "xai-grok-pager-bin",
+  "binary": "xai-grok-pager",
+  "ripgrep": {
+    "x86_64": {
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "253ad0fd5fef0d64cba56c70dccdacc1916d4ed70ad057cc525fcdb0c3bbd2a7"
+    },
+    "aarch64": {
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.0.0/ripgrep-15.0.0-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "15f8cc2fab12d88491c54d49f38589922a9d6a7353c29b0a0856727bcdf80754"
+    }
+  }
+}

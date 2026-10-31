@@ -10,6 +10,7 @@ from pathlib import Path
 
 DEBIAN_DOCS = Path("/usr/share/doc")
 DEBIAN_LICENSES = Path("/usr/share/common-licenses")
+EXPORTS = {"remanie-train-harness": (("REMANIE_GROK", "grok"),)}
 
 
 def distro_notices(paths):
@@ -43,23 +44,24 @@ def distro_notices(paths):
     return notices
 
 
-def launcher_script(name: str, loader: str) -> str:
+def launcher_script(name: str, loader: str, exports=()) -> str:
     return (
         "#!/bin/sh\n"
         "here=${0%/*}\n"
-        f'exec "$here/lib/{loader}" --library-path "$here/lib" "$here/bin/{name}" "$@"\n'
+        + "".join(f'export {variable}="$here/{target}"\n' for variable, target in exports)
+        + f'exec "$here/lib/{loader}" --library-path "$here/lib" "$here/bin/{name}" "$@"\n'
     )
 
 
-def package(binary: Path, destination: Path) -> None:
+def package(binary: Path, grok: Path, destination: Path) -> None:
     if sys.platform != "linux" or not shutil.which("dpkg-query"):
         raise RuntimeError("Run packaging on Debian or Ubuntu on the same architecture as the build")
     rg = shutil.which("rg")
-    if not binary.is_file() or not rg:
-        raise RuntimeError("Provide the built runner and install ripgrep")
+    if not binary.is_file() or not (grok / "grok").is_file() or not rg:
+        raise RuntimeError("Provide the built runner, build_grok.py's output directory, and install ripgrep")
     executables = []
     redistributed = {Path(rg)}
-    for name, source in (("remanie-train-harness", binary), ("rg", Path(rg))):
+    for name, source in (("remanie-train-harness", binary), ("grok", grok / "grok"), ("rg", Path(rg))):
         dependencies = subprocess.check_output(["ldd", str(source)], text=True)
         if "not found" in dependencies:
             raise RuntimeError(f"Missing runtime library for {name}")
@@ -75,6 +77,9 @@ def package(binary: Path, destination: Path) -> None:
         if not source.is_file():
             raise RuntimeError(f"Missing required project notice: {source}")
         license_sources[name] = source
+    for source in sorted((grok / "licenses").rglob("*")):
+        if source.is_file():
+            license_sources[f"grok-build/{source.relative_to(grok / 'licenses')}"] = source
     contract = Path(__file__).resolve().parent / "assets/contract.json"
     if not contract.is_file():
         raise RuntimeError(f"Missing runner contract: {contract}")
@@ -92,7 +97,7 @@ def package(binary: Path, destination: Path) -> None:
                 raise RuntimeError(f"Conflicting library: {path.name}")
             shutil.copy2(path, library)
         launcher = destination / name
-        launcher.write_text(launcher_script(name, loader.name))
+        launcher.write_text(launcher_script(name, loader.name, EXPORTS.get(name, ())))
         launcher.chmod(0o755)
     shutil.copyfile(contract, destination / "contract.json")
     notices = destination / "licenses"
@@ -108,6 +113,6 @@ def package(binary: Path, destination: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("Usage: package_linux.py BUILT_BINARY NEW_RUNTIME_DIRECTORY")
-    package(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve())
+    if len(sys.argv) != 4:
+        raise SystemExit("Usage: package_linux.py BUILT_RUNNER GROK_BUILD_OUT NEW_RUNTIME_DIRECTORY")
+    package(*(Path(argument).resolve() for argument in sys.argv[1:]))

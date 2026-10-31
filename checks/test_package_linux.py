@@ -84,6 +84,21 @@ class LauncherTest(unittest.TestCase):
             ).stdout.splitlines()
             self.assertEqual(output, ["--library-path", f"{moved}/lib", f"{moved}/bin/rg", "--version", "a b"])
 
+    def test_runner_launcher_names_the_bundled_grok(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "lib").mkdir()
+            loader = bundle / "lib/ld-linux-x86-64.so.2"
+            loader.write_text('#!/bin/sh\nprintf "%s\\n" "$REMANIE_GROK"\n')
+            loader.chmod(0o755)
+            launcher = bundle / "remanie-train-harness"
+            launcher.write_text(package_linux.launcher_script(
+                "remanie-train-harness", loader.name, package_linux.EXPORTS["remanie-train-harness"],
+            ))
+            launcher.chmod(0o755)
+            output = subprocess.run([str(launcher)], cwd="/", capture_output=True, text=True, check=True).stdout
+            self.assertEqual(output, f"{bundle}/grok\n")
+
 
 @unittest.skipUnless(os.environ.get("REMANIE_BUNDLE"), "set REMANIE_BUNDLE to a package_linux.py output")
 class PackagedBundleTest(unittest.TestCase):
@@ -92,9 +107,17 @@ class PackagedBundleTest(unittest.TestCase):
         manifest = json.loads((root / "manifest.json").read_text())
         self.assertIn("contract.json", manifest["files"])
         self.assertEqual(json.loads((root / "contract.json").read_text())["exit_codes"], {"gradable": 0, "infrastructure": 70})
-        for name in ("remanie-train-harness", "rg"):
+        for name in ("remanie-train-harness", "grok", "rg"):
             self.assertTrue(os.access(root / name, os.X_OK), name)
         subprocess.run([str(root / "rg"), "--version"], cwd="/", check=True, capture_output=True)
+        commit = json.loads((Path(__file__).resolve().parents[1] / "upstream.json").read_text())["commit"]
+        with tempfile.TemporaryDirectory() as home:
+            version = subprocess.run(
+                [str(root / "grok"), "--version"], cwd="/", check=True, capture_output=True, text=True,
+                env={"PATH": os.environ["PATH"], "HOME": home, "GROK_HOME": home},
+            ).stdout
+        self.assertIn(f"({commit[:12]})", version)
+        self.assertIn("licenses/grok-build/LICENSE", manifest["files"])
 
 
 if __name__ == "__main__":
