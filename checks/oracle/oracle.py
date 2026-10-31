@@ -77,7 +77,7 @@ class Endpoint:
         self.queues = {name: [scripted(entry) for entry in entries] for name, entries in scenario["replies"].items()}
         self.window = scenario["job"].get("context_window_tokens")
         self.requests = []
-        self.titles = 0
+        self.titles = []
         self.server = serve(self.answer)
         self.url = f"http://127.0.0.1:{self.server.server_port}/v1"
 
@@ -94,7 +94,7 @@ class Endpoint:
             return 404, {"error": "not found"}, {}
         request_kind = kind(json.loads(body))
         if request_kind == "title":
-            self.titles += 1
+            self.titles.append(body.decode())
             return 200, TITLE_REPLY, {}
         self.requests.append((request_kind, body.decode()))
         queue = self.queues.get(request_kind, [])
@@ -355,7 +355,7 @@ def main():
     parser.add_argument("--grok", type=Path, required=True, help="the Grok Build binary (xai-grok-pager) built at NOTICE's commit")
     parser.add_argument("--runner", type=Path, required=True, help="the runner binary")
     parser.add_argument("--scenario", action="append", help="run only this scenario; repeatable")
-    parser.add_argument("--out", type=Path, help="write report.txt and each scenario's normalized requests and diffs here")
+    parser.add_argument("--out", type=Path, help="write report.txt and, per scenario, the normalized requests, the raw title calls and the diffs here")
     parser.add_argument("--scratch", type=Path, default=Path("/tmp/remanie-oracle"), help="emptied, then holds each run under runs/<scenario>/<agent>")
     args = parser.parse_args()
     names = args.scenario or sorted(path.stem for path in (ORACLE / "scenarios").glob("*.json"))
@@ -378,12 +378,13 @@ def main():
     reports, verdicts, all_diffs = [], {}, {}
     for name in names:
         scenario = {**json.loads((ORACLE / "scenarios" / f"{name}.json").read_text()), "name": name}
-        outcomes, pairs = {}, {}
+        outcomes, pairs, titles = {}, {}, {}
         for agent in AGENTS:
             outcomes[agent], endpoint = run(agent, binaries[agent], scenario, scratch)
             pairs[agent] = [(request_kind, *normalize(agent, raw)) for request_kind, raw in endpoint.requests]
+            titles[agent] = endpoint.titles
             if endpoint.titles:
-                outcomes[agent] += f", title calls not compared: {endpoint.titles}"
+                outcomes[agent] += f", title calls not compared: {len(endpoint.titles)}"
         verdicts[name], report, all_diffs[name] = compare(name, outcomes, pairs)
         reports.append(report + ("\n\n" + all_diffs[name][0] if all_diffs[name] else ""))
         if args.out:
@@ -392,6 +393,8 @@ def main():
             for agent in AGENTS:
                 lines = [json.dumps({"kind": request_kind, "body": body}, ensure_ascii=False) for request_kind, body, _ in pairs[agent]]
                 (directory / f"{agent}.jsonl").write_text("".join(line + "\n" for line in lines))
+                if titles[agent]:
+                    (directory / f"{agent}.titles.jsonl").write_text("".join(title + "\n" for title in titles[agent]))
             (directory / "diff.txt").write_text("\n\n".join(all_diffs[name]) + ("\n" if all_diffs[name] else ""))
     width = max(len(name) for name in names)
     summary = ["== summary", *(f"{name:<{width}}  {verdicts[name]}" for name in names)]
