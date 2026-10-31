@@ -1,0 +1,34 @@
+[package]
+name = "grok-shell-vendored"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "grok_shell"
+
+[dependencies]
+agent-client-protocol = { version = "0.10.4", features = ["unstable"] }
+anyhow = "1"
+async-openai = { version = "0.33.0", features = ["responses"] }
+async-trait = "0.1"
+chrono = "0.4"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false }
+strum = { version = "0.27", features = ["derive"] }
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+xai-chat-state = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }
+xai-compaction-transcript = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }
+xai-grok-compaction = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }
+xai-grok-sampler = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }
+xai-grok-sampling-types = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }
+xai-grok-telemetry = { package = "grok-telemetry-shim", path = "../grok-telemetry-shim" }
+xai-grok-tools = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }
+xai-token-estimation = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }
+xai-tool-runtime = { git = "https://github.com/xai-org/grok-build", rev = "2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8" }

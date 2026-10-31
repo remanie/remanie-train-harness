@@ -22,6 +22,17 @@ python3 checks/licenses.py --check
   check that the bundle carries contract.json and a working rg. That part
   needs Linux.
 
+python3 checks/vendor.py [--refresh GROK_BUILD_CLONE]
+  Fails when a file under vendor/grok-shell/src/session/ differs from the
+  Grok Build file it copies at NOTICE's commit, by git blob sha
+  (vendor/UPSTREAM.txt). With --refresh it copies the files again from a
+  clone and rewrites the manifest.
+
+python3 checks/lockdiff.py Cargo.lock GROK_BUILD_CLONE/Cargo.lock   (Python 3.11 or later)
+  Fails when Cargo.lock holds a crate at a version Grok Build's own lock
+  does not. A git dependency inherits upstream's manifests but not its
+  lock, so seed Cargo.lock from upstream's instead of running cargo update.
+
 python3 checks/make_trace_fixture.py target/debug/remanie-train-harness   (on Linux; the script prints the Docker one-liner for a Mac)
   Rewrites checks/fixtures/trace.jsonl and checks/fixtures/requests.jsonl
   from one run against a scripted endpoint: a 503 retry, three tool calls,

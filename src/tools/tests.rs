@@ -11,7 +11,10 @@ async fn fixture() -> (TempDir, ToolSession) {
 }
 
 async fn call(tools: &ToolSession, name: &str, args: Value) -> ToolOutput {
-    tools.call(name, &args.to_string()).await.unwrap()
+    tools
+        .call(name, &args.to_string(), "call-test")
+        .await
+        .unwrap()
 }
 
 async fn running_pid(tools: &ToolSession, dir: &TempDir) -> String {
@@ -112,7 +115,7 @@ async fn files_catalog_and_validation() {
             ToolErrorKind::Failed,
         ),
     ] {
-        let output = tools.call(name, args).await.unwrap();
+        let output = tools.call(name, args, "call-test").await.unwrap();
         assert_eq!(
             output.error,
             Some(kind),
@@ -251,7 +254,7 @@ async fn a_broken_tool_runtime_is_an_internal_error() {
         None,
         dir.path().join("no-such-rg"),
     );
-    let Err(error) = tools.call("grep", r#"{"pattern":"x"}"#).await else {
+    let Err(error) = tools.call("grep", r#"{"pattern":"x"}"#, "call-test").await else {
         panic!("a missing ripgrep reached the model");
     };
     assert!(error.0.starts_with("grep: ripgrep at "), "{error}");

@@ -42,6 +42,7 @@ pub enum CompactionInput {
     Verbatim,
     Fitted,
     Lossy,
+    TwoPass,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +85,14 @@ pub enum Event<'a> {
         class: Option<ToolErrorKind>,
         task_id: Option<TaskId>,
         latency_ms: u64,
+    },
+    CompactionRequest {
+        pass: &'a str,
+        messages: &'a [Value],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
     },
     Compaction {
         from_segment: u32,

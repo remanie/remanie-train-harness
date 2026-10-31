@@ -1,0 +1,7 @@
+# grok-build 2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8: vendored path, upstream path, upstream git blob sha
+vendor/grok-shell/src/session/two_pass.rs crates/codegen/xai-grok-shell/src/session/two_pass.rs bd3b48d7dbb37cb26fc77e9ffa894d65b284d668
+vendor/grok-shell/src/session/helpers/session_compact.rs crates/codegen/xai-grok-shell/src/session/helpers/session_compact.rs 3f88dad1dbc500ac0583a321dbf4d81ffd3805a1
+vendor/grok-shell/src/session/helpers/full_replace_compaction.rs crates/codegen/xai-grok-shell/src/session/helpers/full_replace_compaction.rs eb09ffbc84bd1a2d6818a71e9a49f2610ce7ff82
+vendor/grok-shell/src/session/helpers/prepared_compaction_history.rs crates/codegen/xai-grok-shell/src/session/helpers/prepared_compaction_history.rs c49dbc0f2c9b8f927ad10be69fce62d8c1bf65ce
+vendor/grok-shell/src/session/helpers/compaction_context.rs crates/codegen/xai-grok-shell/src/session/helpers/compaction_context.rs 7a40f87a99e6491963941b9204a96dc96f441572
+vendor/grok-shell/src/session/helpers/tool_input_parsing.rs crates/codegen/xai-grok-shell/src/session/helpers/tool_input_parsing.rs 255f2f3b64a4401a7546ee944db5245c1068f659

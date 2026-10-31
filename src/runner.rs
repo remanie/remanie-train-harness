@@ -6,18 +6,14 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::compaction::format_compact_summary;
 use crate::model::{Finish, ModelClient, Request, Sampled, SamplingParams, bearer_header};
 use crate::outcome::{CONTRACT, Cause, Misbehaviour, Outcome, Overflow, RunResult, Tally};
 use crate::tools::ToolSession;
-use crate::trace::{
-    CallKind, CompactionInput, Event, MAX_TRACE_BYTES, MessageRange, Segment, Trace,
-};
+use crate::trace::{CallKind, CompactionInput, Event, MAX_TRACE_BYTES, Segment, Trace};
 
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 128;
@@ -54,17 +50,16 @@ pub fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> Run
     let mut trace = None;
     let outcome = parse_input(stdin, &mut session_dir)
         .and_then(|(raw, input)| {
-            let authorization = input
+            let api_key = input
                 .api_key_env
                 .as_deref()
-                .map(|name| authorization(take_key(name), name))
+                .map(|name| api_key(take_key(name), name))
                 .transpose()?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| internal(format!("start runtime: {error}")))?;
-            let outcome =
-                runtime.block_on(attempt(&raw, &input, authorization, &mut trace, &mut tally));
+            let outcome = runtime.block_on(attempt(&raw, &input, api_key, &mut trace, &mut tally));
             // A tool thread stuck in a blocking call, such as opening a FIFO, must not delay the exit.
             runtime.shutdown_background();
             outcome
@@ -89,10 +84,15 @@ pub fn run(stdin: &[u8], take_key: impl FnOnce(&str) -> Option<OsString>) -> Run
 async fn attempt(
     raw: &Value,
     input: &Input,
-    authorization: Option<HeaderValue>,
+    api_key: Option<String>,
     trace: &mut Option<Trace>,
     tally: &mut Tally,
 ) -> Result<Outcome, Cause> {
+    let authorization = api_key
+        .as_deref()
+        .map(bearer_header)
+        .transpose()
+        .map_err(config)?;
     let url = reqwest::Url::parse(&format!(
         "{}/chat/completions",
         input.base_url.trim_end_matches('/')
@@ -100,7 +100,6 @@ async fn attempt(
     .map_err(|error| config(format!("invalid base_url: {error}")))?;
     let http = crate::model::http_client()?;
     let initial = initial_messages(&input.user_query, &input.workspace)?;
-    let summary_prompt = json!({"role": "user", "content": render("compaction", include_str!("../assets/compaction.jinja2"), json!({}))?});
     let trace = trace.insert(
         Trace::create(&input.session_dir, MAX_TRACE_BYTES)
             .map_err(|error| internal(format!("create trace.jsonl: {error}")))?,
@@ -113,6 +112,12 @@ async fn attempt(
         })?;
     let definitions = tools.definitions();
     trace.header(raw, &definitions);
+    let upstream = upstream_compaction(input, api_key, &initial, &definitions)?;
+    let prefix = initial[1]["content"]
+        .as_str()
+        .and_then(|text| text.split("\n\n<user_query>").next())
+        .unwrap_or_default()
+        .to_owned();
     let deadline = Instant::now() + Duration::from_secs(input.deadline_secs);
     let mut cx = Attempt {
         input,
@@ -129,10 +134,9 @@ async fn attempt(
         segment: Segment::new(0, initial.clone(), trace),
         trace,
         budget: ContextBudget::default(),
-        initial,
-        summary_prompt,
+        upstream,
+        prefix,
         tally,
-        compact_next: false,
     };
     for message in cx.segment.messages() {
         cx.budget.append(message);
@@ -209,12 +213,43 @@ fn parse_input(stdin: &[u8], session_dir: &mut Option<PathBuf>) -> Result<(Value
     Ok((raw, input))
 }
 
-fn authorization(key: Option<OsString>, name: &str) -> Result<HeaderValue, Cause> {
+fn api_key(key: Option<OsString>, name: &str) -> Result<String, Cause> {
     let key = key
         .ok_or_else(|| config(format!("environment variable {name} is not set")))?
         .into_string()
         .map_err(|_| config("API key must be UTF-8"))?;
-    bearer_header(&key).map_err(config)
+    bearer_header(&key).map_err(config)?;
+    Ok(key)
+}
+
+fn upstream_compaction(
+    input: &Input,
+    api_key: Option<String>,
+    initial: &[Value],
+    definitions: &[Value],
+) -> Result<Option<grok_shell::glue::Compaction>, Cause> {
+    if input.compaction.is_none() {
+        return Ok(None);
+    }
+    let window = input
+        .context_window_tokens
+        .ok_or_else(|| config("compaction needs context_window_tokens"))?;
+    grok_shell::glue::Compaction::new(
+        grok_shell::glue::Endpoint {
+            base_url: input.base_url.clone(),
+            api_key,
+            model: input.model.clone(),
+            max_completion_tokens: u32::try_from(input.sampling_params.max_tokens()).ok(),
+            temperature: input.sampling_params.number("temperature"),
+            top_p: input.sampling_params.number("top_p"),
+            context_window: window,
+        },
+        initial,
+        definitions,
+        input.session_dir.clone(),
+    )
+    .map(Some)
+    .map_err(internal)
 }
 
 fn render(name: &str, source: &str, context: Value) -> Result<String, Cause> {
@@ -285,7 +320,6 @@ struct ContextBudget {
 }
 
 const BYTES_PER_TOKEN: u64 = 4;
-const COMPACT_AT_PERCENT: u64 = 85;
 
 impl ContextBudget {
     fn counted(&mut self, tokens: u64) {
@@ -302,11 +336,6 @@ impl ContextBudget {
     fn estimate(&self) -> u64 {
         self.counted + self.appended_bytes / BYTES_PER_TOKEN
     }
-
-    fn estimate_with(mut self, message: &Value) -> u64 {
-        self.append(message);
-        self.estimate()
-    }
 }
 
 struct Attempt<'a> {
@@ -315,11 +344,10 @@ struct Attempt<'a> {
     tools: &'a ToolSession,
     trace: &'a mut Trace,
     segment: Segment,
-    initial: Vec<Value>,
-    summary_prompt: Value,
     budget: ContextBudget,
+    upstream: Option<grok_shell::glue::Compaction>,
+    prefix: String,
     tally: &'a mut Tally,
-    compact_next: bool,
 }
 
 async fn execute(cx: &mut Attempt<'_>) -> Outcome {
@@ -348,12 +376,15 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
     if cx.tally.turns == input.max_turns {
         return ControlFlow::Break(Outcome::MaxTurns);
     }
-    if cx.compact_next {
-        proceed(compact(cx).await)?;
-        cx.compact_next = false;
-    }
     let max_tokens = input.sampling_params.max_tokens();
-    if let Some(window) = input.context_window_tokens {
+    if cx.upstream.is_some() {
+        let inputs = cx.tools.compaction_inputs().await;
+        let compacted = match cx.upstream.as_mut() {
+            Some(upstream) => upstream.before_sample(&cx.prefix, inputs).await,
+            None => Ok(None),
+        };
+        replace_segment(cx, compacted);
+    } else if let Some(window) = input.context_window_tokens {
         let estimated = cx.budget.estimate();
         if estimated + max_tokens > window {
             return ControlFlow::Break(Outcome::ContextOverflow(Overflow::ContextWindow {
@@ -368,31 +399,30 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
         finish,
         usage,
         context_tokens,
-    } = loop {
-        let request = Request {
-            kind: CallKind::Turn,
-            turn: cx.tally.turns + 1,
-            prompt: cx.segment.range(),
-            messages: cx.segment.messages(),
-            max_tokens_override: None,
-        };
-        match cx.model.sample(request, cx.trace).await {
-            Err(Outcome::ContextOverflow(Overflow::EndpointRejected { .. }))
-                if input.compaction.is_some()
-                    && cx
-                        .segment
-                        .messages()
-                        .iter()
-                        .any(|message| message["role"] == "assistant") =>
-            {
-                proceed(compact(cx).await)?;
-            }
-            sampled => break proceed(sampled)?,
-        }
-    };
+    } = proceed(
+        cx.model
+            .sample(
+                Request {
+                    kind: CallKind::Turn,
+                    turn: cx.tally.turns + 1,
+                    prompt: cx.segment.range(),
+                    messages: cx.segment.messages(),
+                    max_tokens_override: None,
+                },
+                cx.trace,
+            )
+            .await,
+    )?;
     cx.tally.turns += 1;
     cx.tally.count_response(usage);
     let reply = read_reply(&message);
+    if let Some(upstream) = &cx.upstream {
+        proceed(
+            upstream
+                .push_reply(&message, context_tokens)
+                .map_err(|detail| Outcome::Infrastructure(internal(detail))),
+        )?;
+    }
     cx.segment.push(message, cx.trace);
     match context_tokens {
         Some(tokens) => cx.budget.counted(tokens),
@@ -453,7 +483,7 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
                 Some(lock) => Some(lock.lock().await),
                 None => None,
             };
-            let output = tools.call(&call.name, &call.arguments).await;
+            let output = tools.call(&call.name, &call.arguments, &call.id).await;
             (index, output, started.elapsed())
         })
         .collect();
@@ -469,6 +499,9 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
     }
     for (call, (output, latency)) in reply.calls.iter().zip(outputs.into_iter().flatten()) {
         cx.tally.tool_calls.count(output.error);
+        if let Some(upstream) = &cx.upstream {
+            upstream.push_tool_result(&call.id, &output.content);
+        }
         let message = json!({"role": "tool", "tool_call_id": call.id, "content": output.content});
         cx.budget.append(&message);
         cx.segment.push(message, cx.trace);
@@ -480,165 +513,53 @@ async fn turn(cx: &mut Attempt<'_>) -> ControlFlow<Outcome> {
             latency_ms: latency.as_millis() as u64,
         });
     }
-    let estimate = cx.budget.estimate();
-    let window = input.context_window_tokens;
-    cx.compact_next = input.compaction.as_ref().is_some_and(|compaction| {
-        let reached = match (compaction.threshold_tokens, window) {
-            (Some(threshold), _) => estimate >= threshold,
-            (None, Some(window)) => estimate * 100 >= window * COMPACT_AT_PERCENT,
-            (None, None) => false,
+    if cx.upstream.is_some() {
+        let inputs = cx.tools.compaction_inputs().await;
+        let compacted = match cx.upstream.as_mut() {
+            Some(upstream) => upstream.after_tools(&cx.prefix, inputs).await,
+            None => Ok(None),
         };
-        let summary = cx.budget.estimate_with(&cx.summary_prompt) + compaction.max_tokens;
-        reached || window.is_some_and(|window| (estimate + max_tokens).max(summary) > window)
-    });
+        replace_segment(cx, compacted);
+    }
     ControlFlow::Continue(())
 }
 
-async fn compact(cx: &mut Attempt<'_>) -> Result<(), Outcome> {
-    let Some(compaction) = &cx.input.compaction else {
-        return Ok(());
+fn replace_segment(cx: &mut Attempt<'_>, compacted: Result<Option<Vec<Value>>, String>) {
+    let Some(upstream) = cx.upstream.as_mut() else {
+        return;
     };
-    let mut request = summary_request(cx, compaction, false)?;
-    let mut lossy = summary_request(cx, compaction, true)
-        .ok()
-        .filter(|lossy| lossy.messages.len() < request.messages.len());
-    cx.segment.push(cx.summary_prompt.clone(), cx.trace);
-    let sampled = loop {
-        let sampled = cx
-            .model
-            .sample(
-                Request {
-                    kind: CallKind::Compaction,
-                    turn: cx.tally.turns,
-                    prompt: request.prompt.clone(),
-                    messages: &request.messages,
-                    max_tokens_override: Some(request.max_tokens),
-                },
-                cx.trace,
-            )
-            .await;
-        match sampled {
-            Err(rejected @ Outcome::ContextOverflow(Overflow::EndpointRejected { .. })) => {
-                request = lossy.take().ok_or(rejected)?;
-            }
-            sampled => break sampled?,
-        }
+    let mut last = None;
+    for request in std::mem::take(&mut upstream.sent) {
+        cx.trace.record(&Event::CompactionRequest {
+            pass: request.pass,
+            messages: &request.messages,
+            summary: request.reply.as_deref().ok(),
+            error: request.reply.as_ref().err().map(String::as_str),
+        });
+        last = Some(request.pass);
+    }
+    // Upstream logs a failed compaction and samples on uncompacted (turn.rs:2872-2879).
+    let Ok(Some(history)) = compacted else {
+        return;
     };
-    cx.tally.count_response(sampled.usage);
-    let summary = summary(&sampled);
-    cx.segment.push(sampled.message, cx.trace);
-    let summary = summary.ok_or(Outcome::InvalidResponse(Misbehaviour::InvalidSummary))?;
-    let mut state = cx.tools.state().await;
-    state["summary"] = summary.into();
-    let continuation = render(
-        "continuation",
-        include_str!("../assets/continuation.jinja2"),
-        state,
-    )
-    .map_err(Outcome::Infrastructure)?;
     let from = cx.segment.index();
     cx.trace.record(&Event::Compaction {
         from_segment: from,
         to_segment: from + 1,
         summary_call: cx.model.calls(),
-        input: request.input,
+        input: match last {
+            Some("two_pass_2") => CompactionInput::TwoPass,
+            Some("verbatim_fitted") => CompactionInput::Fitted,
+            Some("lossy") => CompactionInput::Lossy,
+            _ => CompactionInput::Verbatim,
+        },
     });
-    let mut messages = cx.initial.clone();
-    messages.push(json!({"role": "user", "content": continuation}));
-    cx.segment = Segment::new(from + 1, messages, cx.trace);
+    cx.segment = Segment::new(from + 1, history, cx.trace);
     cx.budget = ContextBudget::default();
     for message in cx.segment.messages() {
         cx.budget.append(message);
     }
     cx.tally.compactions += 1;
-    Ok(())
-}
-
-struct SummaryRequest {
-    messages: Vec<Value>,
-    prompt: MessageRange,
-    max_tokens: u64,
-    input: CompactionInput,
-}
-
-const LOSSY_INPUT_PERCENT: u64 = 70;
-
-fn summary_request(
-    cx: &Attempt<'_>,
-    compaction: &Compaction,
-    lossy: bool,
-) -> Result<SummaryRequest, Outcome> {
-    let history = cx.segment.messages();
-    let reply_at = |from: usize| {
-        history
-            .iter()
-            .enumerate()
-            .skip(from)
-            .find(|(_, message)| message["role"] == "assistant")
-            .map(|(index, _)| index)
-    };
-    let full = cx.budget.estimate_with(&cx.summary_prompt);
-    let mut estimated = full;
-    let mut max_tokens = compaction.max_tokens;
-    let first = reply_at(0).unwrap_or(history.len());
-    let mut keep_from = first;
-    if let Some(window) = cx.input.context_window_tokens {
-        let ceiling = window - window / 20;
-        let budget = if lossy {
-            window * LOSSY_INPUT_PERCENT / 100
-        } else {
-            ceiling.saturating_sub(max_tokens)
-        };
-        let mut dropped_bytes = 0;
-        while estimated > budget {
-            let Some(next) = reply_at(keep_from + 1) else {
-                break;
-            };
-            dropped_bytes += history[keep_from..next]
-                .iter()
-                .map(|message| serde_json::to_vec(message).map_or(0, |bytes| bytes.len() as u64))
-                .sum::<u64>();
-            estimated = full.saturating_sub(dropped_bytes / BYTES_PER_TOKEN);
-            keep_from = next;
-        }
-        let room = ceiling.saturating_sub(estimated);
-        if room == 0 {
-            return Err(Outcome::ContextOverflow(Overflow::ContextWindow {
-                estimated_prompt_tokens: estimated,
-                max_tokens,
-                context_window_tokens: window,
-            }));
-        }
-        max_tokens = max_tokens.min(room);
-    }
-    let omitted = (keep_from > first).then_some([first, keep_from]);
-    let input = match (omitted, lossy) {
-        (None, _) => CompactionInput::Verbatim,
-        (Some(_), false) => CompactionInput::Fitted,
-        (Some(_), true) => CompactionInput::Lossy,
-    };
-    let mut messages = history[..first].to_vec();
-    messages.extend_from_slice(&history[keep_from..]);
-    messages.push(cx.summary_prompt.clone());
-    Ok(SummaryRequest {
-        messages,
-        prompt: MessageRange {
-            segment: cx.segment.index(),
-            end: history.len() + 1,
-            omitted: omitted.into_iter().collect(),
-        },
-        max_tokens,
-        input,
-    })
-}
-
-fn summary(sampled: &Sampled) -> Option<String> {
-    let reply = read_reply(&sampled.message).ok()?;
-    if !matches!(sampled.finish, Finish::Stop | Finish::Length) || !reply.calls.is_empty() {
-        return None;
-    }
-    let summary = format_compact_summary(&reply.content?);
-    (!summary.is_empty() && summary != "Summary:").then_some(summary)
 }
 
 struct Reply {

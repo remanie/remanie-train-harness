@@ -27,6 +27,18 @@ const TOOL_NAMES: [&str; 8] = [
     "todo_write",
 ];
 
+// grok-build-concise's toolset (xai-grok-agent config.rs:290-310), with grok-computer's output and kill tools in place of the subagent-aware ones.
+const UPSTREAM_TOOLS: [&str; 8] = [
+    "GrokBuildConcise:run_terminal_cmd",
+    "GrokBuildConcise:read_file",
+    "GrokBuildConcise:search_replace",
+    "GrokBuild:list_dir",
+    "GrokBuild:grep",
+    "GrokBuild:kill_terminal_command",
+    "GrokBuild:todo_write",
+    "GrokBuild:get_terminal_command_output",
+];
+
 const READ_ONLY: [&str; 4] = [
     "get_terminal_command_output",
     "read_file",
@@ -35,6 +47,7 @@ const READ_ONLY: [&str; 4] = [
 ];
 
 pub struct ToolSession {
+    upstream: grok_shell::glue::Tools,
     terminal: TerminalSession,
     files: FileTools,
     catalog: BTreeMap<String, Value>,
@@ -113,7 +126,11 @@ impl ToolSession {
                 Ok((name.clone(), validator))
             })
             .collect::<Result<_>>()?;
+        let upstream = grok_shell::glue::Tools::new(cwd.clone(), log_root.clone(), &UPSTREAM_TOOLS)
+            .await
+            .map_err(|error| anyhow!("upstream toolset: {error}"))?;
         Ok(Self {
+            upstream,
             terminal: TerminalSession::new(cwd.clone(), log_root).await?,
             files: FileTools::new(
                 cwd,
@@ -139,7 +156,25 @@ impl ToolSession {
             .collect()
     }
 
-    pub async fn call(&self, name: &str, arguments: &str) -> Result<ToolOutput, InternalError> {
+    pub async fn call(
+        &self,
+        name: &str,
+        arguments: &str,
+        call_id: &str,
+    ) -> Result<ToolOutput, InternalError> {
+        if name == "read_file" {
+            use grok_shell::glue::ToolResult;
+            let (content, error) = match self.upstream.call(name, arguments, call_id).await {
+                ToolResult::Ok(text) => (text, None),
+                ToolResult::ParseError(text) => (text, Some(ToolErrorKind::InvalidArguments)),
+                ToolResult::Failed(text) => (text, Some(ToolErrorKind::Failed)),
+            };
+            return Ok(ToolOutput {
+                content,
+                error,
+                task_id: None,
+            });
+        }
         let Some(validator) = self.validators.get(name) else {
             return Ok(ToolOutput::failed(
                 ToolErrorKind::UnknownTool,
@@ -235,6 +270,52 @@ impl ToolSession {
             "completed": count("completed"),
             "cancelled": count("cancelled"),
         })
+    }
+
+    pub async fn compaction_inputs(&self) -> xai_chat_state::compaction_utils::CompactionInputs {
+        use xai_chat_state::compaction_utils::{
+            CompactionInputs, CompactionStateContext, TodoSummary, TodoSummaryStatus,
+        };
+        let todos = self
+            .files
+            .snapshot()
+            .await
+            .into_iter()
+            .filter_map(|todo| {
+                let status = match todo["status"].as_str()? {
+                    "pending" => TodoSummaryStatus::Pending,
+                    "in_progress" => TodoSummaryStatus::InProgress,
+                    "completed" => TodoSummaryStatus::Completed,
+                    "cancelled" => TodoSummaryStatus::Cancelled,
+                    _ => return None,
+                };
+                Some(TodoSummary {
+                    id: todo["id"].as_str()?.to_owned(),
+                    content: todo["content"].as_str().unwrap_or_default().to_owned(),
+                    status,
+                })
+            })
+            .collect();
+        let tasks = self.terminal.background_tasks();
+        let running_tasks = tasks
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|task| task["completed"] == false)
+            .map(|task| {
+                CompactionStateContext::task_summary(
+                    task["task_id"].as_str().unwrap_or_default().to_owned(),
+                    task["command"].as_str().unwrap_or_default().to_owned(),
+                    "running",
+                    Some("run_terminal_cmd".to_owned()),
+                )
+            })
+            .collect();
+        CompactionInputs {
+            running_tasks,
+            todos,
+            ..Default::default()
+        }
     }
 
     pub fn detach(self) -> Vec<LeftRunning> {

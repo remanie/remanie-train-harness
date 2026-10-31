@@ -1,4 +1,3 @@
-mod compaction;
 mod model;
 mod outcome;
 mod runner;

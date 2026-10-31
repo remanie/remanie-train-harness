@@ -57,6 +57,13 @@ impl SamplingParams {
     pub fn max_tokens(&self) -> u64 {
         self.max_tokens
     }
+
+    pub fn number(&self, key: &str) -> Option<f32> {
+        self.params
+            .get(key)
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+    }
 }
 
 #[derive(Serialize)]
