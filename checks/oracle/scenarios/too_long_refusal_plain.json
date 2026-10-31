@@ -1,5 +1,5 @@
 {
-  "about": "The same refusal without x-grok-context-window, as a generic OpenAI-compatible server sends it.",
+  "about": "The same refusal without x-grok-context-window, as a generic OpenAI-compatible server sends it. Grok Build stops with the endpoint's error.",
   "user_query": "Run echo one, then echo two, then report.",
   "job": {
     "sampling_params": {
@@ -8,10 +8,7 @@
     },
     "max_turns": 6,
     "deadline_secs": 120,
-    "context_window_tokens": 131072,
-    "compaction": {
-      "max_tokens": 4096
-    }
+    "context_window_tokens": 131072
   },
   "replies": {
     "turn": [

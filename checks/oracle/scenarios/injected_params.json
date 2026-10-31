@@ -1,0 +1,96 @@
+{
+  "about": "compact_verbatim with OpenRouter's provider routing and a reasoning budget in sampling_params. Grok Build sets neither key, so the runner's proxy appends both to every forwarded body, turn and compaction alike, and nothing else may differ.",
+  "user_query": "Run echo one, then echo two, then report.",
+  "job": {
+    "sampling_params": {
+      "max_tokens": 512,
+      "temperature": 1.0,
+      "provider": {
+        "order": [
+          "oracle"
+        ],
+        "allow_fallbacks": false
+      },
+      "reasoning": {
+        "max_tokens": 1024
+      }
+    },
+    "max_turns": 6,
+    "deadline_secs": 120,
+    "context_window_tokens": 131072
+  },
+  "injected": [
+    "provider",
+    "reasoning"
+  ],
+  "replies": {
+    "turn": [
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-one",
+              "name": "run_terminal_cmd",
+              "arguments": {
+                "command": "echo one",
+                "description": "Print one."
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [
+          60000,
+          40,
+          0
+        ]
+      },
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-two",
+              "name": "run_terminal_cmd",
+              "arguments": {
+                "command": "echo two",
+                "description": "Print two."
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [
+          112000,
+          40,
+          59000
+        ]
+      },
+      {
+        "message": {
+          "content": "Both commands ran: one, then two."
+        },
+        "finish_reason": "stop",
+        "usage": [
+          3000,
+          12,
+          0
+        ]
+      }
+    ],
+    "compaction": [
+      {
+        "message": {
+          "content": "<summary>\n1. Primary Request and Intent: The user asked to run `echo one`, then `echo two`, and then report what happened.\n2. Key Technical Concepts: Bash commands run through run_terminal_cmd in the workspace.\n3. Files and Code Sections: None.\n4. Errors and Fixes: None.\n5. Problem Solving: Both commands exited with status 0 and printed the expected words.\n6. All User Messages: \"Run echo one, then echo two, then report.\"\n7. Pending Tasks: Report the results to the user.\n8. Current Work: `echo one` printed one and `echo two` printed two, both with exit status 0.\n9. Optional Next Step: Tell the user that both commands ran, quoting \"then report\".\n</summary>"
+        },
+        "finish_reason": "stop",
+        "usage": [
+          113000,
+          30,
+          0
+        ]
+      }
+    ]
+  }
+}

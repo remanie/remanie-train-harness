@@ -1,5 +1,5 @@
 {
-  "about": "The endpoint refuses the second turn request for its length and names a 40000-token window in x-grok-context-window, the header Grok Build reads before compacting on a refusal. Both should compact and send the turn again.",
+  "about": "The endpoint refuses the second turn request for its length and names a 40000-token window in x-grok-context-window, the header Grok Build reads before compacting on a refusal. Grok Build compacts and sends the turn again, so the proxy has to pass the header through.",
   "user_query": "Run echo one, then echo two, then report.",
   "job": {
     "sampling_params": {
@@ -8,10 +8,7 @@
     },
     "max_turns": 6,
     "deadline_secs": 120,
-    "context_window_tokens": 131072,
-    "compaction": {
-      "max_tokens": 4096
-    }
+    "context_window_tokens": 131072
   },
   "replies": {
     "turn": [

@@ -1,5 +1,5 @@
 {
-  "about": "Compacts once at the 85 percent threshold. The reported usage leaves the summary request over 95 percent of the window minus compaction.max_tokens, so the runner drops the first turn to fit; the conversation's bytes are small, so Grok Build's own estimate finds room.",
+  "about": "Compacts once at the 85 percent threshold after the second reply reports 120,000 of 131,072 tokens. The conversation's own bytes are small, so Grok Build's two-pass summary requests need no trimming.",
   "user_query": "Read table.txt, then run echo done, then report.",
   "files": {
     "table.txt": {
@@ -14,10 +14,7 @@
     },
     "max_turns": 6,
     "deadline_secs": 120,
-    "context_window_tokens": 131072,
-    "compaction": {
-      "max_tokens": 4096
-    }
+    "context_window_tokens": 131072
   },
   "replies": {
     "turn": [

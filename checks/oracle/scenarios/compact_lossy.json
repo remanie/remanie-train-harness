@@ -1,5 +1,5 @@
 {
-  "about": "The only turn reads a file whose text alone is larger than the window, so the summary request cannot fit even with every earlier turn dropped.",
+  "about": "The only turn reads a file whose text alone is larger than the 16,000-token window, so Grok Build has to cut the tool result to fit its summary request.",
   "user_query": "Read big.txt and report its last line.",
   "files": {
     "big.txt": {
@@ -14,10 +14,7 @@
     },
     "max_turns": 6,
     "deadline_secs": 120,
-    "context_window_tokens": 16000,
-    "compaction": {
-      "max_tokens": 4096
-    }
+    "context_window_tokens": 16000
   },
   "replies": {
     "turn": [
