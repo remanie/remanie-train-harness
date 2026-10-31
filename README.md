@@ -1,10 +1,14 @@
 # remanie-train-harness
 
-`remanie-train-harness` is the agent runtime a model trains through on Harbor tasks. One process runs one attempt inside the task sandbox. It reads one JSON object on stdin, sends every model call to one OpenAI-compatible `/v1/chat/completions` endpoint, runs the tool calls, and exits with a code that tells Harbor whether to grade the sandbox. In training the endpoint is Miles' session server, which records token ids and log-probs. The runner never sees them and never computes a reward.
+`remanie-train-harness` runs one Harbor trial attempt on Grok Build. It starts Grok Build's own binary, `xai-grok-pager` built from the commit `upstream.json` pins, in headless mode with the agent file `assets/agent.md`, and puts a local proxy between Grok Build and the model endpoint. It reads one JSON object on stdin, writes `trace.jsonl` and `result.json` in `session_dir`, and exits with a code that tells Harbor whether to grade the sandbox. In training the endpoint is Miles' session server, which records token ids and log-probs. The runner never sees them and never computes a reward.
 
-Each request carries the two-sentence system prompt from `assets/system_prompt.jinja2`, the first user message from `assets/user_query.jinja2` (Grok Build's `<user_info>` block with the OS, the shell, the workspace path and the date, then the task wrapped once in `<user_query>` tags), and the eight tool definitions from `assets/tools.json`. Turn requests send `tool_choice: "auto"`, and compaction requests send `tool_choice: "none"`. The endpoint applies the chat template and parses the tool calls. Until a compaction, the history only grows. The runner appends each assistant message exactly as the endpoint returned it, runs its tool calls at the same time, and appends one tool message per call in the order the calls are listed. Grok Build appends them in the order they finish, but Qwen3's chat template drops `tool_call_id`, so the model can tell which result answers which call only by position. Calls in one reply that name the same file in `file_path`, `path`, or `target_file` run one at a time, in the order listed, if any of them writes. Compaction runs only when the input sets `compaction`. The runner records every message, model call, and tool call in `trace.jsonl` during the attempt.
+## What differs from Grok Build
 
-It has no interactive mode, no permission prompts, and no workspace confinement. The sandbox isolates the task.
+The agent loop, the system prompt, the tools' code, compaction, retries and background tasks are Grok Build's. Three things differ.
+
+- **The eight tools.** `assets/agent.md` gives Grok Build exactly eight tools and no injected defaults: `run_terminal_cmd`, `read_file` and `search_replace` from the `grok-build-concise` agent, `list_dir`, `grep` and `todo_write` from Grok Build's shared set, and `kill_terminal_command` and `get_terminal_command_output` from its `grok-computer` set, in the `grok-build-concise` order.
+- **No outside context.** The agent file turns off AGENTS.md, skill discovery and inherited skills. `GROK_MEMORY=0`, `GROK_WORKFLOWS=0` and `GROK_TURN_SUMMARY=0` turn off memory, workflows, turn summaries and title refreshes. Grok Build has no setting for its other system reminders, so the reminders about finished background commands and a changed date still reach the model. The `<rules>` block in the first user message, the post-compaction reminder and the `compaction/segment_*.md` files are Grok Build's own.
+- **Standalone input and output.** The runner takes the JSON input below instead of Grok Build's CLI and config, keeps Grok Build's state in `session_dir/grok-home`, and writes the trace and result below. Grok Build sends a session-title request at the start of every session and has no setting that turns it off. The proxy answers it itself, never forwards it, and traces it as kind `title`. The proxy also answers `GET /v1/models` with a one-model list and every other request that is not a chat completion with 404, so nothing but Grok Build's model calls reaches the endpoint.
 
 ## Input
 
@@ -12,130 +16,115 @@ It has no interactive mode, no permission prompts, and no workspace confinement.
 
 | Field | Required | Meaning |
 |---|---|---|
-| `base_url` | yes | `http` or `https` URL whose path ends in `/v1`, with no credentials, query, or fragment. |
-| `model` | yes | Model name sent with every request. |
-| `api_key_env` | no | Environment variable that holds the key. The runner reads it and removes it before any tool starts. When it is null or absent, requests carry no `Authorization` header. |
-| `user_query` | yes | The task text. |
-| `workspace` | yes | Existing absolute directory. Commands start here. |
-| `session_dir` | yes | Absolute path that must not exist yet. Its parent must exist. It receives `trace.jsonl` and `result.json`. |
-| `sampling_params` | yes | Forwarded verbatim. Must contain `max_tokens`, 1 to 4294967295. Must not set `model`, `messages`, `tools`, `tool_choice`, or `stream`. |
-| `max_turns` | yes | Turn requests allowed, 1 to 512. Compaction requests do not count. |
-| `deadline_secs` | yes | Wall-clock limit, 1 to 86400. Set it below Harbor's agent timeout. |
-| `context_window_tokens` | no | The model's context size. After the first reply, the runner ends the attempt as `context_overflow` before sending a turn request that cannot fit. Before the first reply, such a request ends the attempt as `infrastructure` with cause `config`. A compaction request is sized to fit instead, as described below. |
-| `compaction` | no | `{max_tokens, threshold_tokens}`. `threshold_tokens` is optional, and without it `context_window_tokens` is required. When `compaction` is null or absent, the runner never compacts. |
+| `base_url` | yes | `http` or `https` URL whose path ends in `/v1`, with no credentials, query, or fragment. The proxy sends Grok Build's chat completions to `<base_url>/chat/completions`. |
+| `model` | yes | Model name. The runner configures it for every Grok Build model role, and Grok Build sends it with every request. |
+| `api_key_env` | no | Environment variable that holds the endpoint key. The proxy sends `Authorization: Bearer <key>` on every forwarded request, and Grok Build never sees the key. When it is null or absent, requests carry no `Authorization` header. |
+| `user_query` | yes | The task. |
+| `workspace` | yes | Existing absolute directory. Grok Build works there. |
+| `session_dir` | yes | Absolute path that must not exist yet. Its parent must exist. It receives `trace.jsonl`, `result.json`, Grok Build's log `grok.log`, and Grok Build's home `grok-home/`. |
+| `sampling_params` | yes | Must contain `max_tokens`, 1 to 4294967295, which becomes Grok Build's `max_completion_tokens`. An optional `temperature` becomes Grok Build's `temperature`. The proxy appends every key that a forwarded body lacks, such as OpenRouter's `provider` and `reasoning`, and never replaces a key Grok Build set. Must not set `model`, `messages`, `tools`, `tool_choice`, `stream`, `stream_options`, or `max_completion_tokens`. |
+| `max_turns` | yes | Grok Build's `--max-turns`, 1 to 512. |
+| `deadline_secs` | yes | Wall-clock limit from the runner's start, 1 to 86400. Set it below Harbor's agent timeout. |
+| `context_window_tokens` | yes | Grok Build's `context_window` for the model. |
+| `compaction` | no | `{threshold_percent}`, 1 to 100, which becomes Grok Build's `auto_compact_threshold_percent`. It is 85 when absent. Grok Build has no setting that turns auto-compaction off. |
 
-The runner estimates a turn request's prompt tokens as the endpoint's last `usage.total_tokens` plus a quarter of the bytes of the tool messages appended since. The request fits when the estimate plus `sampling_params.max_tokens` is at most `context_window_tokens`. With compaction on, the runner compacts before a turn request once the estimate reaches `threshold_tokens`, or 85% of `context_window_tokens` when `threshold_tokens` is absent. It also compacts once the estimate plus `sampling_params.max_tokens` exceeds `context_window_tokens`, or once the estimate plus the summary prompt's estimate plus `compaction.max_tokens` does. When the endpoint refuses a turn request for its length and the segment holds a reply, the runner compacts and sends the turn again, as Grok Build does.
+## How the runner starts Grok Build
 
-For the compaction request, the runner appends Grok Build's summary prompt from `assets/compaction.jinja2` as a user message and sends `compaction.max_tokens` in place of `sampling_params.max_tokens`. With `context_window_tokens` set, the request must fit 95% of the window. When the history, the summary prompt, and `compaction.max_tokens` do not fit, the runner drops the oldest turns from the request until they do. A turn is an assistant message and the tool messages that answer it. A compaction request always keeps the messages before the first reply (the system prompt, the task, and in later segments the continuation message) and the last turn. When the kept messages leave less room than `compaction.max_tokens`, the runner caps `max_tokens` at the room left. When no room is left, the attempt ends as `context_overflow` with cause `context_window`, and the summary prompt is neither appended nor sent. When the endpoint refuses the request for its length, the runner resends it once with the oldest turns dropped until the history and the summary prompt fit 70% of the window. It resends only when that drops more turns than the refused request did. Otherwise, or when the endpoint refuses the resend too, the attempt ends as `context_overflow` with cause `endpoint_rejected`. The runner's history keeps every message, and the `model_call` event names the ones its request dropped. The `compaction` event's `input` is `verbatim` when the accepted request dropped nothing, `fitted` when it dropped turns to fit 95% of the window, and `lossy` when it was the resend.
+The runner binds the proxy on `127.0.0.1`, writes `grok-home/config.toml` and `grok-home/agent.md`, checks that `grok --version` names the pinned commit, and runs, in `workspace`:
 
-The reply's `<summary>` block becomes a `Summary:` heading. A summary cut off at `max_tokens` is kept, as Grok Build keeps it. The next segment holds the system prompt, the task, and one user message from `assets/continuation.jinja2`. That message holds Grok Build's preamble saying the session continues, followed by the summary. When background tasks are still running or todos are open, the message ends with a `<system-reminder>` that lists them. No earlier turn is kept. The estimate then restarts at a quarter of the new segment's bytes.
+```sh
+grok -p=<user_query> -m <model> --cwd <workspace> --output-format json --always-approve --no-auto-update \
+  --agent <session_dir>/grok-home/agent.md --max-turns <max_turns> --session-id <session id>
+```
 
-The `verbatim`, `fitted`, and `lossy` requests follow the shape of Grok Build's compaction input ladder. Grok Build's `fit_conversation_to_budget` keeps the system message but can drop the task. When the last turn alone does not fit, it shortens that turn's text instead of capping `max_tokens`. Grok Build's lossy step also strips tool calls, tool results, and reasoning, where the runner sends the kept turns intact. Grok Build subtracts the tool definitions' tokens from its fitted and lossy budgets; the runner's estimate already counts them through `usage.total_tokens`.
+The attached `-p=` form keeps a task that starts with a dash from parsing as a flag. The session id is the version 5 UUID of `session_dir` in the URL namespace. `config.toml` names the model for every role with the proxy as `base_url`, `api_backend = "chat_completions"`, the context window, `max_completion_tokens`, `temperature`, and the compaction threshold, and turns off auto-update, telemetry and codebase upload.
+
+Grok Build inherits the runner's environment without the key, without any `GROK_*` or `XAI_*` variable, and with these set: `GROK_HOME`, `GROK_LOG_FILE`, Grok Build's eight service URLs pointing at the proxy, the switches in `src/grok.rs` that turn off telemetry, feedback, trace upload, auto-update, prompt suggestions, turn summaries, memory and workflows, a placeholder key, and `127.0.0.1,localhost` added to `NO_PROXY`. Grok Build's stdin is `/dev/null`, and its stderr is the runner's.
+
+At the deadline, on SIGTERM or SIGINT, or when the endpoint gives no HTTP response to the first request, the runner sends SIGTERM to Grok Build's process group and SIGKILL five seconds later. Grok Build's commands run in sessions of their own, so the runner is their subreaper and kills every process left under it once Grok Build is gone. On a run that ends on its own, the runner kills nothing. Grok Build waits up to 600 s for its background commands after the last turn and kills those still running when it exits.
 
 ## Exit codes and result
 
 | Exit | Meaning |
 |---|---|
 | 0 | Gradable. The sandbox state is the policy's product. |
-| 70 | Infrastructure failure. Do not grade. |
+| 70 | The attempt must not be graded. |
 | anything else | The process died, for example a panic (101) or a signal. Do not grade. |
 
 `contract.json` lists each outcome and the `cause.kind` values it can carry.
 
 | `outcome` | Exit | When |
 |---|---|---|
-| `completed` | 0 | The model replied without tool calls. |
-| `max_turns` | 0 | The runner sent `max_turns` turn requests. The last turn's tools ran. |
-| `max_tokens` | 0 | The reply ended with `finish_reason: "length"`. |
-| `context_overflow` | 0 | After the first reply, the next request does not fit `context_window_tokens` (`context_window`) or exceeds 16 MiB (`request_size`), or the endpoint refuses it for its length (`endpoint_rejected`). |
-| `invalid_response` | 0 | `empty_turn`, `malformed_message`, `malformed_tool_call`, `duplicate_call_id` within one reply, `unexpected_finish`, or `invalid_summary`. |
-| `deadline` | 0 | `deadline_secs` passed. `cause.request_in_flight` says whether a model request was abandoned. |
-| `cancelled` | 0 | The runner received SIGTERM or SIGINT. |
-| `infrastructure` | 70 | `config`, `endpoint_unavailable`, `endpoint_status`, `connection_lost`, `endpoint_response`, `tool_runtime`, or `internal`. |
+| `completed` | 0 | Grok Build exited 0 with its JSON result. |
+| `max_turns` | 0 | Grok Build stopped at `--max-turns`. It printed its JSON result and exited 1. |
+| `cancelled` | 0 | The runner stopped Grok Build at the deadline (`deadline`) or on SIGTERM or SIGINT (`signal`, with `signal`). |
+| `error` | 0 | Grok Build failed after the endpoint answered a model request. `cause.message` is Grok Build's own error text, or says how it exited without one. |
+| `endpoint_unavailable` | 70 | The endpoint gave no HTTP response to the first request (`unreachable`, with the proxy's `detail`), or Grok Build failed before any request got a 2xx answer (`refused`, with the last `status` and Grok Build's `message`). |
+| `infrastructure` | 70 | `config` (the input or the key's variable), `grok_binary` (`REMANIE_GROK` unset, not runnable, or not the pinned commit), `grok_startup` (Grok Build failed before sending a model request), `proxy_bind`, or `internal`. |
 
-Before the first reply, a request that does not fit ends the attempt as `infrastructure` with cause `config`, because the job settings are wrong. A reply with `finish_reason: "abort"` or `"error"` ends the attempt as `infrastructure` with cause `endpoint_response`, and the runner does not resend the request.
+Once the runner has created `session_dir`, it writes `<session_dir>/result.json` atomically and prints the same object on stdout. Its fields:
 
-The runner resends a request with identical bytes only when the endpoint did not process it. It keeps resending while the next wait, at most 30 s, ends before `deadline_secs`.
-
-Once the runner has created `session_dir`, it writes `<session_dir>/result.json` atomically on every exit it controls. It prints the same object on stdout. Its fields are `contract`, `outcome`, `cause`, `gradable`, `final_answer`, `turns`, `compactions`, `model_calls`, `usage`, `tool_calls`, `background_tasks_left_running`, `trace_truncated`, and `wall_time_ms`. `usage` holds `prompt_tokens`, `completion_tokens`, `cached_tokens`, and `complete`, which is false when any response lacked usage. `tool_calls` holds `total`, `ok`, `failed`, `invalid_arguments`, and `unknown_tool`. Each `background_tasks_left_running` entry holds `task_id`, `pid`, `command`, and `output_file`.
-
-On exit 0 background tasks keep running so the verifier can reach them. On exit 70 the runner kills them. When writing `result.json` fails after a gradable outcome, the runner exits 70 with them still running.
+| Field | Meaning |
+|---|---|
+| `contract` | 2. |
+| `outcome`, `cause`, `gradable` | As above. Only `completed` and `max_turns` have no `cause`. |
+| `final_answer` | The `text` of Grok Build's JSON result, which joins all the assistant text Grok Build streamed in the run. Empty without a result. |
+| `turns`, `compactions` | Turn and compaction requests the endpoint answered with a 2xx status and a complete body. |
+| `model_calls` | Requests the proxy forwarded, retries included. The title request is not one. |
+| `usage` | `prompt_tokens`, `completion_tokens` and `cached_tokens` summed over the 2xx responses, and `complete`, false when any of them lacked usage or was cut off. |
+| `wall_time_ms` | From the runner's start. |
+| `grok_exit` | `{"code": n}` or `{"signal": n}`, or null when Grok Build never ran. |
+| `grok_session_dir` | Grok Build's session directory relative to `session_dir`, such as `grok-home/sessions/<cwd>/<session id>`, or null. It holds Grok Build's `chat_history.jsonl`, `events.jsonl` and `compaction/` segments. |
 
 ## Trace
 
-`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the start. Each message appears once per segment, and a `model_call` names a message range instead of copying the history. Under the new segment, a compaction writes the system prompt, the task, and the continuation message. `checks/fixtures/` holds a trace recorded from one run against a scripted endpoint and the request bodies it sent; CI re-records it and fails when the bodies differ. remanie-tooling's `research/agents/remanie_train/remanie_trace.py` reads the file and rebuilds the body of any accepted request from the `header`, a message range, and the omitted ranges.
+`<session_dir>/trace.jsonl` is append-only, one JSON object per line, and each line carries `t_ms` since the runner's start. The runner stops tracing after a failed write, so a trace without a closing `result` line is incomplete. `checks/fixtures/` holds a trace recorded on Linux from one run against a scripted endpoint and the request bodies that endpoint received, with the date set to 2026-01-01. CI re-records it and fails when the bodies differ. remanie-tooling's trace reader tests read both files.
 
 | `event` | Written | Fields |
 |---|---|---|
-| `header` | once, first | `contract`, `started_at_unix_ms`, `config` (the input object), `tools` |
-| `message` | when a message is appended | `segment`, `index`, `message` |
-| `tool_call` | after each tool message | `call_id`, `name`, `class` (`ok`, `unknown_tool`, `invalid_arguments`, or `failed`), `task_id`, `latency_ms` |
-| `model_call` | per accepted response | `call`, `turn`, `kind` (`turn` or `compaction`), `prompt` (`segment`, `end`, and, when a compaction request dropped messages, `omitted`, their half-open index ranges), `max_tokens_override` (compaction calls only), `attempts`, `latency_ms`, `response` verbatim |
-| `endpoint_error` | per failed attempt | `call`, `turn`, `attempt`, `failure` (`connect`, `lost`, `status`, or `response`) with that failure's fields, `retry_in_ms` |
-| `compaction` | per compaction | `from_segment`, `to_segment`, `summary_call`, `input` (`verbatim`, `fitted`, or `lossy`) |
+| `header` | once, first | `contract`, `started_at_unix_ms`, `config` (the input object), `agent_file` (the text of `assets/agent.md`), `grok_version` |
+| `request` | per chat-completions request Grok Build sends | `call` (1, 2, ... in arrival order), `kind` (`turn`, `compaction` or `title`), `body` (the JSON object forwarded, injected keys included), `injected` (the keys the proxy appended) |
+| `response` | per request, once its answer is complete | `call`, `status` (null when the endpoint gave no HTTP response), `body`, `raw_sse`, `error` |
 | `result` | once, last | the `result.json` object |
 
-When a write fails or the trace would pass 256 MiB, the runner stops tracing, finishes the attempt, and sets `trace_truncated`.
+A request whose tools include `session_title` is a `title`, one whose last message is a user message holding Grok Build's summary prompt is a `compaction`, and any other is a `turn`. The oracle uses the same rule. For a 2xx event stream, `body` is the chat completion rebuilt from the chunks, with text joined, tool calls merged by index and the last `usage`, and `raw_sse` holds the stream as received. For a 2xx JSON answer, `body` is that object. For any other status, `body` is the response text. `error` appears when the endpoint gave no HTTP response, the stream broke, or Grok Build closed the connection first. A title request's response is the proxy's own.
 
-## Tools
-
-`assets/tools.json` holds Grok Build's tool descriptions without their usage notes. Its parameter names, types, descriptions, required lists, defaults, and bounds are Grok Build's too, except that `read_file`'s `format` accepts only `image` or `text` and defaults to `image`. An unknown tool name, arguments that are not JSON or fail the schema, a bound the runner checks, and a tool's own error go back to the model as the tool message. They do not end the attempt.
-
-| Tool | Enforced limits |
-|---|---|
-| `run_terminal_cmd` | Runs `/bin/bash --noprofile --norc -c` in `workspace` with the runner's environment, after setting 13 variables such as `TERM=dumb` and `PAGER=cat`. `block_until_ms` defaults to 30000 and is capped at 36,000,000. A command still running after `block_until_ms` becomes a background task with an id the runner assigns, such as `task-1`. If `deadline_secs` passes while the tool waits, the attempt ends as `deadline` and the runner kills the command. An unwaited `&` is refused. To run a command in the background, pass `block_until_ms` 0. The reply shows at most 20,000 bytes of output, taken from its start and end. Each command logs to `.remanie-terminal/<pid>-<n>/task-N.log` under the sandbox's temp dir, or under `/var/tmp` when `workspace` is or holds the temp dir. The log keeps every byte with no size cap, so a command that never stops writing can fill the sandbox's disk. A command runs at most 36,000 s. |
-| `get_terminal_command_output` | 1 to 20 task ids. `timeout_ms` at most 3,600,000, and 0 or no `timeout_ms` returns a snapshot. Up to 40,000 bytes per task. |
-| `kill_terminal_command` | Sends SIGTERM to every process in one task's session, then SIGKILL after 1 s, and waits up to 5 s for the task to exit. |
-| `read_file` | At most 1000 lines and about 100,000 bytes per call. When a full 1000-line window leaves lines unread, the output ends with a note naming the next `offset`. A window over about 100,000 bytes is a tool error. A read stops after 30 s. A PDF read returns `Vision is not available in this environment.` unless `format` is `text`. A read of a PNG, JPEG, GIF, or WebP file, recognized by its first bytes as in Grok Build, returns the same text as a successful read. When `format` is `text`, the tool reads a PDF of at most 50 MiB through Poppler and stops after 60 s. A PDF over 10 pages needs `pages`, at most 20 per call. |
-| `search_replace` | `old_string` must match exactly once, overlapping matches included, unless `replace_all`. The tool edits UTF-8 files up to 50 MiB, writes in place, and keeps the file's line endings. |
-| `list_dir` | Hides ignored and dot files. Scans up to 100,000 entries and stops the listing at about 10,000 bytes. |
-| `grep` | Runs `rg`. `head_limit` defaults to 200 lines, at most 2000. The tool keeps at most 40,000 bytes of `rg` output and then at most `head_limit` lines, and a result cut at `head_limit` ends with an "at least" count of the lines `rg` printed. `rg` cuts lines at 1000 columns and skips files over 5 MiB. A search stops after 20 s. When `rg` cannot read a file but finds matches, the tool returns the matches followed by the first three of `rg`'s error messages and a count of the rest. |
-| `todo_write` | `merge` defaults to `true` and updates by `id`. Each `id` may appear once per call. The list survives a compaction, and the continuation message shows the open todos. |
-
-Paths may be absolute and may point outside `workspace`. `~` expands to the sandbox's `$HOME`.
-
-## Build and test
-
-`rust-toolchain.toml` pins Rust 1.94.0 with rustfmt and clippy. Install ripgrep. The tools run `rg` from `PATH`, or from the path in `RG_BIN_PATH` when it is set.
-
-```sh
-cargo build --release --locked
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-```
-
-The Rust tests run on Linux and macOS. The runtime bundle is Linux-only; on macOS, build it in a Debian container. [checks/README.txt](checks/README.txt) lists every check.
-
-## Build the bundle
+## Bundle
 
 On Debian or Ubuntu, with the CPU architecture of the machines that will run it, run from the repository root:
 
 ```sh
 cargo build --release --locked
-python3 package_linux.py target/release/remanie-train-harness runtime
+python3 build_grok.py
+python3 package_linux.py target/release/remanie-train-harness target/grok-build/out runtime
 ```
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the x86_64 bundle as the release asset `remanie-train-harness-<tag>-linux-x86_64.tar.gz` beside its `.sha256`. The archive holds `runtime/`.
+`build_grok.py` fetches `upstream.json`'s commit of Grok Build into `target/grok-build/src` and runs `cargo build --release --locked -p xai-grok-pager-bin` there, so upstream's `Cargo.lock` and `rust-toolchain.toml` apply. It fetches the protoc that upstream's DotSlash file `bin/protoc` pins and the ripgrep 15.0.0 release that upstream's build scripts embed, checks each against its sha256, and passes them as `PROTOC`, `GROK_TOOLS_BUNDLE_RG_PATH` and `GROK_SHELL_BUNDLE_RG_PATH`. It needs `git`, a C compiler and network access. On aarch64, set `RUSTFLAGS="-C force-unwind-tables=yes"`, because upstream's `.cargo/config.toml` targets Neoverse V2 there. Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes the x86_64 bundle as `remanie-train-harness-<tag>-linux-x86_64.tar.gz` beside its `.sha256`.
 
-The output directory must be new. It holds the runner, `rg`, their Linux loader and shared libraries, the license notices, `contract.json`, and `manifest.json` with the architecture and each file's sha256.
+The output directory must be new. It holds `remanie-train-harness`, `grok` and `rg`, each a launcher that runs the binary in `bin/` with the bundle's own loader and libraries from `lib/`, the license notices in `licenses/` (Grok Build's in `licenses/grok-build/`), `contract.json`, and `manifest.json` with the architecture and each file's sha256. The `remanie-train-harness` launcher sets `REMANIE_GROK` to the bundle's `grok`. Outside a bundle, set `REMANIE_GROK` to a Grok Build binary built at the pinned commit.
 
-## Running under Harbor
+## Checks
 
-The runner knows nothing about Harbor. The Harbor agent that installs a bundle in a task sandbox, runs one attempt and converts the trace to an ATIF trajectory is `research/agents/remanie_train/` in remanie-tooling, which pins the release it runs.
+`checks/oracle/oracle.py` runs each scenario in `checks/oracle/scenarios/` twice against a scripted endpoint, once through Grok Build run directly with the oracle's own `config.toml` and `assets/agent.md`, and once through the runner. It fails a scenario unless every chat-completions body the endpoint received is byte-identical apart from the scenario's injected `sampling_params`, the runner's `config.toml` matches the oracle's own, the trace holds what the endpoint received, every forwarded request carries the endpoint key, and the title request stayed in the runner. `checks/oracle/baseline/` holds its last run. [checks/README.txt](checks/README.txt) lists every check and how to run it.
+
+```sh
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+```
+
+`rust-toolchain.toml` pins Rust 1.94.0 with rustfmt and clippy.
 
 ## What the sandbox must provide
 
 - Linux on the bundle's CPU architecture.
 - `/bin/bash` and `setsid`.
-- `rg`, which the Harbor bundle carries.
 - Network access to `base_url`.
-- `pdfinfo` and `pdftotext` from Poppler, only for reading a PDF as text.
 
 ## Known limits
 
-- Code in the sandbox can read the key from the runner's process through `/proc`. Use a key with a spending cap, or an endpoint that needs none.
-- The file tools and commands can reach any path the sandbox user can.
+- Code in the sandbox can read the key from the runner's process through `/proc`, and can send requests through the proxy, which adds the key. Use a key with a spending cap, or an endpoint that needs none.
+- Grok Build's tools reach any path the sandbox user can.
 - Harbor's local Docker environment does not enforce a task's disk quota.
-- A model response over 16 MiB ends the attempt with exit 70.
+- On macOS the runner cannot be a subreaper, so processes Grok Build's commands start can outlive a stopped attempt there.
 
-This project derives from Grok Build. [NOTICE](NOTICE) names the source and the retained code.
+[NOTICE](NOTICE) names Grok Build's license and the pinned commit.

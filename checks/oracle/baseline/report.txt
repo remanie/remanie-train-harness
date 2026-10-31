@@ -1,0 +1,86 @@
+grok: grok 1.0.45 (2bdd1d6a6369)
+runner source: 4ab458e9 Run Grok Build's own binary behind a recording proxy
+host: darwin
+compared: the bytes of every chat-completions body the endpoint received; the runner's may add only the scenario's injected keys before the closing brace
+also checked: the runner's config.toml against the oracle's, its trace against what the endpoint received, the endpoint key, and that title calls stay in the runner
+
+== compact_fitted: identical
+grok: exit 0, end_turn; 5 requests, 1 title call
+runner: exit 0, completed, turns 3, compactions 2, model calls 5; 5 requests forwarded, title calls answered by the proxy
+
+   #  grok        runner      result
+   1  turn        turn        same bytes
+   2  turn        turn        same bytes
+   3  compaction  compaction  same bytes
+   4  compaction  compaction  same bytes
+   5  turn        turn        same bytes
+
+== compact_lossy: identical
+grok: exit 0, end_turn; 3 requests, 1 title call
+runner: exit 0, completed, turns 2, compactions 1, model calls 3; 3 requests forwarded, title calls answered by the proxy
+
+   #  grok        runner      result
+   1  turn        turn        same bytes
+   2  compaction  compaction  same bytes
+   3  turn        turn        same bytes
+
+== compact_verbatim: identical
+grok: exit 0, end_turn; 5 requests, 1 title call
+runner: exit 0, completed, turns 3, compactions 2, model calls 5; 5 requests forwarded, title calls answered by the proxy
+
+   #  grok        runner      result
+   1  turn        turn        same bytes
+   2  turn        turn        same bytes
+   3  compaction  compaction  same bytes
+   4  compaction  compaction  same bytes
+   5  turn        turn        same bytes
+
+== injected_params: identical
+grok: exit 0, end_turn; 5 requests, 1 title call
+runner: exit 0, completed, turns 3, compactions 2, model calls 5; 5 requests forwarded, title calls answered by the proxy
+
+   #  grok        runner      result
+   1  turn        turn        same bytes, injected provider, reasoning
+   2  turn        turn        same bytes, injected provider, reasoning
+   3  compaction  compaction  same bytes, injected provider, reasoning
+   4  compaction  compaction  same bytes, injected provider, reasoning
+   5  turn        turn        same bytes, injected provider, reasoning
+
+== too_long_refusal: identical
+grok: exit 0, end_turn; 7 requests, 1 title call
+runner: exit 0, completed, turns 3, compactions 3, model calls 7; 7 requests forwarded, title calls answered by the proxy
+
+   #  grok        runner      result
+   1  turn        turn        same bytes
+   2  turn        turn        same bytes
+   3  compaction  compaction  same bytes
+   4  compaction  compaction  same bytes
+   5  compaction  compaction  same bytes
+   6  turn        turn        same bytes
+   7  turn        turn        same bytes
+
+== too_long_refusal_plain: identical
+grok: exit 1, Internal error: { "message": "API error (status 400 Bad Request): invalid_request_error: This model's maximum context length is 40000 tokens. However, your messages resulted in 41100 tokens. Please reduce the length of the messages.", "http_status": 400, "promptUsage": { "inputTokens": 41000, "outpu; 2 requests, 1 title call
+runner: exit 0, error (grok), turns 1, compactions 0, model calls 2; 2 requests forwarded, title calls answered by the proxy
+
+   #  grok        runner      result
+   1  turn        turn        same bytes
+   2  turn        turn        same bytes
+
+== two_calls: identical
+grok: exit 0, end_turn; 3 requests, 1 title call
+runner: exit 0, completed, turns 3, compactions 0, model calls 3; 3 requests forwarded, title calls answered by the proxy
+
+   #  grok        runner      result
+   1  turn        turn        same bytes
+   2  turn        turn        same bytes
+   3  turn        turn        same bytes
+
+== summary
+compact_fitted          identical
+compact_lossy           identical
+compact_verbatim        identical
+injected_params         identical
+too_long_refusal        identical
+too_long_refusal_plain  identical
+two_calls               identical

@@ -16,7 +16,8 @@ jobs:
       - run: rustup toolchain install
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - run: python3 package_linux.py target/release/remanie-train-harness runtime
+      - run: python3 build_grok.py
+      - run: python3 package_linux.py target/release/remanie-train-harness target/grok-build/out runtime
       - name: Archive the bundle with its checksum
         run: |
           name="remanie-train-harness-${GITHUB_REF_NAME}-linux-$(uname -m).tar.gz"

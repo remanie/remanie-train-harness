@@ -1,0 +1,43 @@
+{
+  "about": "A plain multi-turn run. The first reply calls two tools at once: a slow shell command listed first and a file read listed second, so appending results in completion order reverses them.",
+  "user_query": "Check that the shell works, read notes.txt, then capitalize alpha in it.",
+  "files": {"notes.txt": "alpha\nbeta\n"},
+  "job": {
+    "sampling_params": {"max_tokens": 512, "temperature": 1.0},
+    "max_turns": 6,
+    "deadline_secs": 120,
+    "context_window_tokens": 131072
+  },
+  "replies": {
+    "turn": [
+      {
+        "message": {
+          "content": null,
+          "reasoning_content": "Check the shell and read the notes in one step.",
+          "tool_calls": [
+            {"id": "call-slow", "name": "run_terminal_cmd", "arguments": {"command": "sleep 1; echo slow", "description": "Check that the shell runs."}},
+            {"id": "call-read", "name": "read_file", "arguments": {"target_file": "notes.txt"}}
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [3000, 40, 0]
+      },
+      {
+        "message": {
+          "content": null,
+          "reasoning_content": "Capitalize alpha.",
+          "tool_calls": [
+            {"id": "call-edit", "name": "search_replace", "arguments": {"file_path": "notes.txt", "old_string": "alpha", "new_string": "ALPHA"}}
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [3300, 30, 2900]
+      },
+      {
+        "message": {"content": "The shell works and notes.txt now starts with ALPHA."},
+        "finish_reason": "stop",
+        "usage": [3500, 15, 3200]
+      }
+    ]
+  }
+}

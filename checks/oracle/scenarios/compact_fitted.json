@@ -1,0 +1,88 @@
+{
+  "about": "Compacts once at the 85 percent threshold after the second reply reports 120,000 of 131,072 tokens. The conversation's own bytes are small, so Grok Build's two-pass summary requests need no trimming.",
+  "user_query": "Read table.txt, then run echo done, then report.",
+  "files": {
+    "table.txt": {
+      "line": "row {n:03d}: the quick brown fox jumps over the lazy dog\n",
+      "count": 100
+    }
+  },
+  "job": {
+    "sampling_params": {
+      "max_tokens": 512,
+      "temperature": 1.0
+    },
+    "max_turns": 6,
+    "deadline_secs": 120,
+    "context_window_tokens": 131072
+  },
+  "replies": {
+    "turn": [
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-read",
+              "name": "read_file",
+              "arguments": {
+                "target_file": "table.txt"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [
+          60000,
+          40,
+          0
+        ]
+      },
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-done",
+              "name": "run_terminal_cmd",
+              "arguments": {
+                "command": "echo done",
+                "description": "Print done."
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [
+          120000,
+          40,
+          59000
+        ]
+      },
+      {
+        "message": {
+          "content": "table.txt has 100 rows and echo printed done."
+        },
+        "finish_reason": "stop",
+        "usage": [
+          3000,
+          14,
+          0
+        ]
+      }
+    ],
+    "compaction": [
+      {
+        "message": {
+          "content": "<summary>\n1. Primary Request and Intent: The user asked to read table.txt, run `echo done`, and report.\n2. Key Technical Concepts: read_file and run_terminal_cmd in the workspace.\n3. Files and Code Sections: table.txt holds 100 rows numbered row 001 to row 100, each repeating one sentence.\n4. Errors and Fixes: None.\n5. Problem Solving: The file was read in one call and `echo done` exited 0.\n6. All User Messages: \"Read table.txt, then run echo done, then report.\"\n7. Pending Tasks: Report the results to the user.\n8. Current Work: Both tool calls finished; nothing else is running.\n9. Optional Next Step: Tell the user what table.txt holds and that echo printed done.\n</summary>"
+        },
+        "finish_reason": "stop",
+        "usage": [
+          119000,
+          160,
+          0
+        ]
+      }
+    ]
+  }
+}

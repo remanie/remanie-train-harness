@@ -24,12 +24,20 @@ jobs:
       - run: cargo fetch --locked
       - run: python3 checks/licenses.py --check
       - run: cargo build --release --locked
-      - run: python3 package_linux.py target/release/remanie-train-harness runtime
+      - uses: actions/cache@v4.3.0
+        id: grok
+        with:
+          path: target/grok-build/out
+          key: grok-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('upstream.json', 'build_grok.py') }}
+      - if: steps.grok.outputs.cache-hit != 'true'
+        run: python3 build_grok.py
+      - run: python3 package_linux.py target/release/remanie-train-harness target/grok-build/out runtime
       - run: python3 -m pip install pytest==9.2.0
       - run: |
-          python3 checks/make_trace_fixture.py target/release/remanie-train-harness
+          python3 checks/make_trace_fixture.py target/release/remanie-train-harness --grok target/grok-build/out/grok
           git diff --exit-code checks/fixtures/requests.jsonl
       - run: python3 -m pytest checks/ -q
         env:
           REMANIE_BUNDLE: runtime
+          REMANIE_RUNNER: target/release/remanie-train-harness
       - run: git ls-files -z '*.py' | xargs -0 python3 -m py_compile

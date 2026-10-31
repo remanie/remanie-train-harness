@@ -1,0 +1,97 @@
+{
+  "about": "The endpoint refuses the second turn request for its length and names a 40000-token window in x-grok-context-window, the header Grok Build reads before compacting on a refusal. Grok Build compacts and sends the turn again, so the proxy has to pass the header through.",
+  "user_query": "Run echo one, then echo two, then report.",
+  "job": {
+    "sampling_params": {
+      "max_tokens": 512,
+      "temperature": 1.0
+    },
+    "max_turns": 6,
+    "deadline_secs": 120,
+    "context_window_tokens": 131072
+  },
+  "replies": {
+    "turn": [
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-one",
+              "name": "run_terminal_cmd",
+              "arguments": {
+                "command": "echo one",
+                "description": "Print one."
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [
+          41000,
+          40,
+          0
+        ]
+      },
+      {
+        "status": 400,
+        "body": {
+          "error": {
+            "message": "This model's maximum context length is 40000 tokens. However, your messages resulted in 41100 tokens. Please reduce the length of the messages.",
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "context_length_exceeded"
+          }
+        },
+        "headers": {
+          "x-grok-context-window": "40000"
+        }
+      },
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-two",
+              "name": "run_terminal_cmd",
+              "arguments": {
+                "command": "echo two",
+                "description": "Print two."
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls",
+        "usage": [
+          3000,
+          40,
+          0
+        ]
+      },
+      {
+        "message": {
+          "content": "Both commands ran: one, then two."
+        },
+        "finish_reason": "stop",
+        "usage": [
+          3200,
+          12,
+          2900
+        ]
+      }
+    ],
+    "compaction": [
+      {
+        "message": {
+          "content": "<summary>\n1. Primary Request and Intent: The user asked to run `echo one`, then `echo two`, and then report.\n2. Key Technical Concepts: Bash commands through run_terminal_cmd in the workspace.\n3. Files and Code Sections: None.\n4. Errors and Fixes: None.\n5. Problem Solving: `echo one` exited 0 and printed one; `echo two` has not run yet.\n6. All User Messages: \"Run echo one, then echo two, then report.\"\n7. Pending Tasks: Run `echo two`, then report both results.\n8. Current Work: `echo one` finished; the next step is `echo two`.\n9. Optional Next Step: Run `echo two`, as in \"then echo two\".\n</summary>"
+        },
+        "finish_reason": "stop",
+        "usage": [
+          41000,
+          160,
+          0
+        ]
+      }
+    ]
+  }
+}
