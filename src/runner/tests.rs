@@ -1145,6 +1145,38 @@ async fn a_last_turn_that_does_not_fit_without_its_tool_results_is_shortened() {
 }
 
 #[tokio::test]
+async fn a_lossy_summary_request_drops_the_oldest_turns_to_fit_70_percent() {
+    let plan = "The model explains at length what it plans to do next and why. ".repeat(750);
+    let mut f = fixture(vec![
+        reply(
+            json!({"role": "assistant", "content": plan, "tool_calls": [list_dir("list")]}),
+            "tool_calls",
+            12_200,
+        ),
+        tool_reply(vec![read_big_file("read")], 12_300),
+        summary_reply(),
+        final_reply(),
+    ])
+    .await;
+    write_big_file(&f);
+    f.config["context_window_tokens"] = json!(16_384);
+    f.config["compaction"] = json!({"max_tokens": 2048});
+    let result = f.run().await;
+    assert_eq!(result["outcome"], "completed", "{result}");
+    let history = f.segment(0);
+    let flattened = json!({"role": "assistant", "content": "\n[Called tools: read_file]"});
+    assert_eq!(
+        f.requests().await[2]["messages"],
+        json!([history[0], history[1], flattened, history[6]])
+    );
+    assert_eq!(
+        f.events("model_call")[2]["prompt"],
+        json!({"segment": 0, "end": 7, "omitted": [[2, 4], [5, 6]], "replaced": [[4, flattened]]})
+    );
+    assert_eq!(rebuilt_requests(&f.trace()), f.raw_requests().await);
+}
+
+#[tokio::test]
 async fn a_summary_request_refused_for_its_length_is_sent_again_lossy() {
     let compacting = |f: &mut Fixture| {
         f.config["context_window_tokens"] = json!(32_768);
