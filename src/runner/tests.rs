@@ -1063,8 +1063,8 @@ async fn a_summary_request_whose_last_turn_does_not_fit_leaves_out_the_tool_resu
     assert_eq!(result["compactions"], 1);
     let history = f.segment(0);
     assert_eq!(history.len(), 9);
-    for result in &history[5..7] {
-        let length = result["content"].as_str().unwrap().len();
+    for log in &history[5..7] {
+        let length = log["content"].as_str().unwrap().len();
         assert!((35_000..=40_000).contains(&length), "{length}");
     }
     let requests = f.requests().await;
